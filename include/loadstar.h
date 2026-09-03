@@ -22,10 +22,45 @@ typedef enum LsStatus {
    */
   LsStatus_BufferTooSmall = 3,
   /**
+   * No route exists (or an endpoint is off the map). Not an error; the out handle is null.
+   */
+  LsStatus_NoPath = 4,
+  /**
    * Internal panic caught at the boundary. The context may be inconsistent; the host is intact.
    */
   LsStatus_Panic = 100,
 } LsStatus;
+
+/**
+ * Cardinal directions. The discriminant is the edge-mask bit index.
+ */
+enum LsDir
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint8_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  LsDir_South = 0,
+  LsDir_North = 1,
+  LsDir_East = 2,
+  LsDir_West = 3,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum LsDir LsDir;
+#else
+typedef uint8_t LsDir;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Opaque: a map plus everything consistent with it (spec §4). Exported to C as `LsContext`.
+ */
+typedef struct LsContext LsContext;
+
+/**
+ * Opaque: a path result, a sequence of node ids (spec §8). Exported to C as `LsPath`.
+ */
+typedef struct LsPath LsPath;
 
 /**
  * A position or displacement. `#[repr(C)]` so the FFI layer can pass it by value unchanged.
@@ -35,6 +70,8 @@ typedef struct LsVec3 {
   float y;
   float z;
 } LsVec3;
+
+#define LsDir_ALL { LsDir_South, LsDir_North, LsDir_East, LsDir_West, }
 
 #ifdef __cplusplus
 extern "C" {
@@ -51,6 +88,60 @@ uint32_t ls_abi_version(void);
 enum LsStatus ls_vec3_add(struct LsVec3 a,
                           struct LsVec3 b,
                           struct LsVec3 *out);
+
+/**
+ * Create a tile context from per-cell walkability (spec §6.1 tier 1).
+ *
+ * `walkable` holds `width * height * layers` bytes, layer-major then row-major
+ * (`index = layer * width * height + row * width + col`); nonzero = walkable.
+ * On success `*out` receives a handle that must be released with [`ls_context_destroy`].
+ */
+enum LsStatus ls_tile_context_create(uint32_t width,
+                                     uint32_t height,
+                                     uint32_t layers,
+                                     const uint8_t *walkable,
+                                     uintptr_t walkable_len,
+                                     struct LsContext **out);
+
+/**
+ * Release a context and everything it owns. Null is a no-op.
+ */
+void ls_context_destroy(struct LsContext *ctx);
+
+/**
+ * Center position of a node. `InvalidArgument` if `node` is out of range.
+ */
+enum LsStatus ls_node_position(const struct LsContext *ctx, uint32_t node, struct LsVec3 *out);
+
+/**
+ * Find a path between the nodes containing `start` and `goal`.
+ *
+ * On `Ok`, `*out` receives a path handle (release with [`ls_path_free`]).
+ * On `NoPath`, `*out` is set to null and nothing needs freeing.
+ */
+enum LsStatus ls_find_path(const struct LsContext *ctx,
+                           struct LsVec3 start,
+                           struct LsVec3 goal,
+                           struct LsPath **out);
+
+/**
+ * Number of nodes in a path (both endpoints included). Zero for a null handle.
+ */
+uintptr_t ls_path_len(const struct LsPath *path);
+
+/**
+ * Copy the path's node ids into `out` (capacity `capacity`). `*written` receives the
+ * count actually needed; if it exceeds `capacity`, nothing is copied and `BufferTooSmall` is returned.
+ */
+enum LsStatus ls_path_nodes(const struct LsPath *path,
+                            uint32_t *out,
+                            uintptr_t capacity,
+                            uintptr_t *written);
+
+/**
+ * Release a path. Null is a no-op.
+ */
+void ls_path_free(struct LsPath *path);
 
 #ifdef __cplusplus
 }  // extern "C"

@@ -288,6 +288,7 @@ Composability is safe because the library never mutates between the mod's calls:
 - **Versioning**: `ls_abi_version()` checked by companions at load.
 - **Bindings**: `cbindgen` → C header (Unreal/C++, LuaJIT FFI); `csbindgen` or `interoptopus` → C# P/Invoke. IL2CPP note: no callbacks in the ABI means no `[MonoPInvokeCallback]` hazards at all.
 - **Builds**: `x86_64-pc-windows-msvc` and `i686-pc-windows-msvc` from day one (CSTW is a 32-bit .NET Framework 4.7.2 process); Linux targets when a consumer needs them.
+- **Lessons from the walking skeleton (2026-09)**: all exports are cdecl, and on 32-bit hosts bindings must declare it (`CallingConvention.Cdecl`; .NET defaults to stdcall on x86). The native library is `loadstar.dll`; no managed assembly may be named `Loadstar.dll` — Windows filenames are case-insensitive and the two clobber each other. The .NET companion is therefore `Loadstar.Net.dll`.
 
 ---
 

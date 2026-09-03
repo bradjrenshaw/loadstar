@@ -11,9 +11,15 @@ Design: [`docs/spec.md`](docs/spec.md). Distilled from the Wayfinder/CSTW experi
 ```
 crates/loadstar-core/   pure Rust, #![forbid(unsafe_code)], all logic and tests
 crates/loadstar-ffi/    cdylib "loadstar", extern "C" translation layer, the only unsafe
-bindings/csharp/        .NET companion (P/Invoke + idiomatic wrapper + default formatters)
+bindings/csharp/        Loadstar.Net (P/Invoke + idiomatic wrapper) and Loadstar.Smoke (x86 net472 harness)
 docs/                   spec and design notes
+include/                generated C header
 ```
+
+Deployment note: the native library is `loadstar.dll`. Never ship a managed assembly named
+`Loadstar.dll` next to it — Windows filenames are case-insensitive and one will clobber the
+other (the companion is therefore `Loadstar.Net.dll`). All exports are **cdecl**; on 32-bit
+hosts, bindings must say so explicitly (`CallingConvention.Cdecl` in .NET).
 
 ## Building
 
