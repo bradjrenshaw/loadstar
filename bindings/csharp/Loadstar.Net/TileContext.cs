@@ -124,15 +124,63 @@ public sealed class TileContext : IDisposable
     public void SetLinkEnabled(ulong id, bool enabled) =>
         Native.ls_link_set_enabled(_handle, id, enabled).ThrowIfError(nameof(Native.ls_link_set_enabled));
 
-    // --- Paths ---
+    // --- Node groups (blocking overlay) ---
+
+    public uint NodeGroups(uint node)
+    {
+        Native.ls_node_get_groups(_handle, node, out var mask).ThrowIfError(nameof(Native.ls_node_get_groups));
+        return mask;
+    }
+
+    public void SetNodeGroups(uint node, uint mask) =>
+        Native.ls_node_set_groups(_handle, node, mask).ThrowIfError(nameof(Native.ls_node_set_groups));
+
+    public void AddNodeGroups(uint node, uint mask) =>
+        Native.ls_node_add_groups(_handle, node, mask).ThrowIfError(nameof(Native.ls_node_add_groups));
+
+    public void RemoveNodeGroups(uint node, uint mask) =>
+        Native.ls_node_remove_groups(_handle, node, mask).ThrowIfError(nameof(Native.ls_node_remove_groups));
+
+    /// <summary>Clear <paramref name="mask"/> bits from every node.</summary>
+    public void ClearGroups(uint mask) =>
+        Native.ls_groups_clear(_handle, mask).ThrowIfError(nameof(Native.ls_groups_clear));
+
+    // --- Paths and reachability ---
 
     /// <summary>Path from the node containing <paramref name="start"/> to the one containing
     /// <paramref name="goal"/>, or null if no route exists.</summary>
-    public Path? FindPath(Vec3 start, Vec3 goal)
+    public Path? FindPath(Vec3 start, Vec3 goal, PathOptions options = default)
     {
-        var status = Native.ls_find_path(_handle, start, goal, out var path);
+        var status = Native.ls_find_path(_handle, start, goal, options, out var path);
+        return ReadPath(status, path, nameof(Native.ls_find_path));
+    }
+
+    /// <summary>Path to the cheapest of <paramref name="targets"/> (node ids), interpreted per
+    /// <see cref="PathOptions.GoalMode"/>; null if none is reachable.</summary>
+    public Path? FindPathToNodes(Vec3 start, uint[] targets, PathOptions options = default)
+    {
+        var status = Native.ls_find_path_to_nodes(_handle, start, targets, (UIntPtr)targets.Length, options, out var path);
+        return ReadPath(status, path, nameof(Native.ls_find_path_to_nodes));
+    }
+
+    /// <summary>Reachability from <paramref name="start"/>, indexed by node id; null if the start
+    /// is off-grid and cannot be snapped.</summary>
+    public bool[]? ReachableNodes(Vec3 start, PathOptions options = default)
+    {
+        var status = Native.ls_reachable_nodes(_handle, start, options, null, UIntPtr.Zero, out var needed);
         if (status == Status.NoPath) return null;
-        status.ThrowIfError(nameof(Native.ls_find_path));
+        var bytes = new byte[(int)(ulong)needed];
+        Native.ls_reachable_nodes(_handle, start, options, bytes, (UIntPtr)bytes.Length, out _)
+            .ThrowIfError(nameof(Native.ls_reachable_nodes));
+        var result = new bool[bytes.Length];
+        for (int i = 0; i < bytes.Length; i++) result[i] = bytes[i] != 0;
+        return result;
+    }
+
+    private static Path? ReadPath(Status status, PathHandle path, string call)
+    {
+        if (status == Status.NoPath) return null;
+        status.ThrowIfError(call);
 
         using (path)
         {

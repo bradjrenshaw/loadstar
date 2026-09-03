@@ -223,7 +223,7 @@ ls_find_path(ctx, start_pos, goal, profile_id, blocked_mask, opts)
   - `ls_node_position(ctx, node) → Vec3` (tile center / triangle centroid), and a batch nodes→waypoints call;
   - `ls_path_segments(path_id) → Segment[]` where `Segment = MOVE { direction: enum, count: u32 } | LINK { link_id: u64 }` — cardinal compression for grids, broken at link traversals ("north 5, take teleporter, east 3" *as data*; words are the companion's job). Raw node paths carry the same link-transition flags;
   - funnel/string-pulling for meshes (v2).
-- **Goal semantics per entity**: `PATHFIND_ADJACENT` set (NPCs) → goal candidates = `neighbors(projected set) \ projected set`, with the entity's own blocking groups still blocked and the candidate-goal fallback choosing the cheapest reachable candidate. Clear (exits) → goal = the projected set itself, with the entity's own groups dropped from the blocked mask (walk-onto). Both behaviors and the start-snapping/exact-waypoint details are ports of hard-won Wayfinder fixes — encoded once, in node-space, map-type-agnostic.
+- **Goal semantics per entity**: `PATHFIND_ADJACENT` set (NPCs) → goal candidates = `neighbors(projected set) \ projected set`, with the entity's own blocking groups still blocked and the candidate-goal fallback choosing the cheapest reachable candidate. Clear (exits) → goal = the projected set itself, and those target nodes are exempt from blocking (walk-onto) — more precise than dropping the entity's whole group, and equivalent in intent. Both behaviors and the start-snapping/exact-waypoint details are ports of hard-won Wayfinder fixes — encoded once, in node-space, map-type-agnostic.
 
 ### Reachability
 

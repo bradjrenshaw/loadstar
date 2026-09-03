@@ -87,6 +87,31 @@ public struct PathLink
     private uint _reserved;
 }
 
+/// <summary>Mirrors <c>LsGoalMode</c>.</summary>
+public enum GoalMode : uint
+{
+    /// <summary>Arrive on a target; targets are exempt from blocking.</summary>
+    Onto = 0,
+    /// <summary>Arrive one ordinary step away from a target; targets stay blocked.</summary>
+    Adjacent = 1,
+}
+
+/// <summary>Mirrors <c>LsPathOptions</c>. <c>default</c> = nothing blocked, no snapping, Onto.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct PathOptions
+{
+    /// <summary>Nodes carrying any of these groups are impassable.</summary>
+    public uint BlockedMask;
+    /// <summary>Ring radius for start snapping when the start has no edges; 0 disables.</summary>
+    public uint SnapRadius;
+    public GoalMode GoalMode;
+
+    public PathOptions(uint blockedMask, uint snapRadius = 0, GoalMode goalMode = GoalMode.Onto)
+    {
+        BlockedMask = blockedMask; SnapRadius = snapRadius; GoalMode = goalMode;
+    }
+}
+
 public sealed class LoadstarException : Exception
 {
     public Status Status { get; }
@@ -163,8 +188,17 @@ internal static class Native
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_link_remove(ContextHandle context, ulong id);
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_link_set_enabled(ContextHandle context, ulong id, [MarshalAs(UnmanagedType.U1)] bool enabled);
 
-    // Paths
-    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_find_path(ContextHandle context, Vec3 start, Vec3 goal, out PathHandle path);
+    // Node groups
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_node_get_groups(ContextHandle context, uint node, out uint mask);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_node_set_groups(ContextHandle context, uint node, uint mask);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_node_add_groups(ContextHandle context, uint node, uint mask);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_node_remove_groups(ContextHandle context, uint node, uint mask);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_groups_clear(ContextHandle context, uint mask);
+
+    // Paths and reachability
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_find_path(ContextHandle context, Vec3 start, Vec3 goal, PathOptions options, out PathHandle path);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_find_path_to_nodes(ContextHandle context, Vec3 start, uint[]? targets, UIntPtr targetsLen, PathOptions options, out PathHandle path);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_reachable_nodes(ContextHandle context, Vec3 start, PathOptions options, [Out] byte[]? buffer, UIntPtr capacity, out UIntPtr written);
     [DllImport(Lib, CallingConvention = Cc)] public static extern UIntPtr ls_path_len(PathHandle path);
     [DllImport(Lib, CallingConvention = Cc)] public static extern float ls_path_cost(PathHandle path);
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_path_nodes(PathHandle path, [Out] uint[] buffer, UIntPtr capacity, out UIntPtr written);

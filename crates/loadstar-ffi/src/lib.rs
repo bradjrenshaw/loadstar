@@ -9,7 +9,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use loadstar_core::context::TileContext;
+use loadstar_core::context::{GoalMode as CoreGoalMode, PathOptions as CorePathOptions, TileContext};
 use loadstar_core::graph::LinkId;
 use loadstar_core::tile::{Dir, EdgeOverride, GridError, Link, TileGrid};
 pub use loadstar_core::geometry::Vec3;
@@ -78,6 +78,39 @@ pub struct PathLink {
     pub index: u32,
     /// Keeps the struct 16 bytes on every ABI regardless of how `u64` is aligned.
     pub _reserved: u32,
+}
+
+/// How target nodes are treated as a destination (spec §8).
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GoalMode {
+    /// Arrive on a target. Targets are exempt from blocking.
+    Onto = 0,
+    /// Arrive next to a target (one ordinary step away). Targets stay blocked.
+    Adjacent = 1,
+}
+
+/// Per-query options. A zeroed struct means: nothing blocked, no snapping, `Onto`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PathOptions {
+    /// Nodes carrying any of these groups are impassable.
+    pub blocked_mask: u32,
+    /// Ring radius for start snapping when the start has no edges. 0 disables.
+    pub snap_radius: u32,
+    /// A `GoalMode` discriminant.
+    pub goal_mode: u32,
+}
+
+impl PathOptions {
+    fn to_core(self) -> Option<CorePathOptions> {
+        let goal_mode = match self.goal_mode {
+            0 => CoreGoalMode::Onto,
+            1 => CoreGoalMode::Adjacent,
+            _ => return None,
+        };
+        Some(CorePathOptions { blocked_mask: self.blocked_mask, snap_radius: self.snap_radius, goal_mode })
+    }
 }
 
 /// Run an ABI body, converting any panic into [`Status::Panic`] instead of unwinding into the host.
@@ -300,15 +333,68 @@ pub extern "C" fn ls_node_from_position(ctx: *const Context, pos: Vec3, out: *mu
 // Edges and links (mutations)
 // ---------------------------------------------------------------------------
 
-fn with_grid(ctx: *mut Context, f: impl FnOnce(&mut TileGrid) -> Result<(), GridError>) -> Status {
+fn with_ctx_mut(ctx: *mut Context, f: impl FnOnce(&mut TileContext) -> Status) -> Status {
     guard(|| {
         if ctx.is_null() {
             return Status::NullPointer;
         }
         // SAFETY: non-null checked; a live context handle, and the caller (per the thread
         // contract) is the only user of this context during the call.
-        let ctx = unsafe { &mut *ctx };
-        status_of(f(ctx.0.grid_mut()))
+        f(&mut unsafe { &mut *ctx }.0)
+    })
+}
+
+fn with_grid(ctx: *mut Context, f: impl FnOnce(&mut TileGrid) -> Result<(), GridError>) -> Status {
+    with_ctx_mut(ctx, |c| status_of(f(c.grid_mut())))
+}
+
+// ---------------------------------------------------------------------------
+// Node groups (blocking overlay)
+// ---------------------------------------------------------------------------
+
+/// Group bitmask of a node. `InvalidArgument` if out of range.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_node_get_groups(ctx: *const Context, node: u32, out: *mut u32) -> Status {
+    guard(|| {
+        if ctx.is_null() || out.is_null() {
+            return Status::NullPointer;
+        }
+        // SAFETY: non-null checked; a live context handle.
+        match unsafe { &*ctx }.0.groups(node) {
+            // SAFETY: `out` non-null checked; caller guarantees it is writable.
+            Some(mask) => unsafe {
+                *out = mask;
+                Status::Ok
+            },
+            None => Status::InvalidArgument,
+        }
+    })
+}
+
+/// Replace a node's groups.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_node_set_groups(ctx: *mut Context, node: u32, mask: u32) -> Status {
+    with_ctx_mut(ctx, |c| if c.set_groups(node, mask) { Status::Ok } else { Status::InvalidArgument })
+}
+
+/// OR `mask` into a node's groups.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_node_add_groups(ctx: *mut Context, node: u32, mask: u32) -> Status {
+    with_ctx_mut(ctx, |c| if c.add_groups(node, mask) { Status::Ok } else { Status::InvalidArgument })
+}
+
+/// Clear `mask` bits from a node's groups.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_node_remove_groups(ctx: *mut Context, node: u32, mask: u32) -> Status {
+    with_ctx_mut(ctx, |c| if c.remove_groups(node, mask) { Status::Ok } else { Status::InvalidArgument })
+}
+
+/// Clear `mask` bits from every node.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_groups_clear(ctx: *mut Context, mask: u32) -> Status {
+    with_ctx_mut(ctx, |c| {
+        c.clear_groups(mask);
+        Status::Ok
     })
 }
 
@@ -375,29 +461,85 @@ pub extern "C" fn ls_link_set_enabled(ctx: *mut Context, id: u64, enabled: bool)
 // Paths
 // ---------------------------------------------------------------------------
 
-/// Find a path between the nodes containing `start` and `goal`.
+fn finish_path(result: Option<loadstar_core::graph::Path>, out: *mut *mut Path) -> Status {
+    match result {
+        // SAFETY: callers check `out` for null; caller guarantees it is writable.
+        Some(path) => unsafe {
+            *out = Box::into_raw(Box::new(Path(path)));
+            Status::Ok
+        },
+        None => unsafe {
+            *out = std::ptr::null_mut();
+            Status::NoPath
+        },
+    }
+}
+
+/// Find a path from the node containing `start` to the node containing `goal`.
 ///
 /// On `Ok`, `*out` receives a path handle (release with [`ls_path_free`]).
 /// On `NoPath`, `*out` is set to null and nothing needs freeing.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_find_path(ctx: *const Context, start: Vec3, goal: Vec3, out: *mut *mut Path) -> Status {
+pub extern "C" fn ls_find_path(ctx: *const Context, start: Vec3, goal: Vec3, opts: PathOptions, out: *mut *mut Path) -> Status {
     guard(|| {
         if ctx.is_null() || out.is_null() {
             return Status::NullPointer;
         }
+        let Some(opts) = opts.to_core() else { return Status::InvalidArgument };
+        // SAFETY: non-null checked; a live context handle.
+        finish_path(unsafe { &*ctx }.0.find_path(start, goal, opts), out)
+    })
+}
+
+/// Find a path from the node containing `start` to the cheapest of `targets` (node ids),
+/// interpreted per `opts.goal_mode`. Same result convention as [`ls_find_path`].
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_find_path_to_nodes(
+    ctx: *const Context,
+    start: Vec3,
+    targets: *const u32,
+    targets_len: usize,
+    opts: PathOptions,
+    out: *mut *mut Path,
+) -> Status {
+    guard(|| {
+        if ctx.is_null() || out.is_null() || (targets.is_null() && targets_len > 0) {
+            return Status::NullPointer;
+        }
+        let Some(opts) = opts.to_core() else { return Status::InvalidArgument };
+        // SAFETY: non-null checked; caller guarantees `targets` is readable for `targets_len`.
+        let targets: &[u32] = if targets_len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(targets, targets_len) } };
         // SAFETY: non-null checked; a live context handle.
         let ctx = unsafe { &*ctx };
-        match ctx.0.find_path(start, goal) {
-            // SAFETY: `out` non-null checked; caller guarantees it is writable.
-            Some(path) => unsafe {
-                *out = Box::into_raw(Box::new(Path(path)));
-                Status::Ok
-            },
-            None => unsafe {
-                *out = std::ptr::null_mut();
-                Status::NoPath
-            },
+        let n = ctx.0.grid().width() as usize * ctx.0.grid().height() as usize * ctx.0.grid().layers() as usize;
+        if targets.iter().any(|&t| t as usize >= n) {
+            return Status::InvalidArgument;
         }
+        finish_path(ctx.0.find_path_to_nodes(start, targets, opts), out)
+    })
+}
+
+/// Reachability from the node containing `start`: one byte per node (nonzero = reachable),
+/// same buffer convention as [`ls_path_nodes`]. `opts.goal_mode` is ignored.
+/// `NoPath` if `start` is off-grid and cannot be snapped.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_reachable_nodes(
+    ctx: *const Context,
+    start: Vec3,
+    opts: PathOptions,
+    out: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> Status {
+    guard(|| {
+        if ctx.is_null() {
+            return Status::NullPointer;
+        }
+        let Some(opts) = opts.to_core() else { return Status::InvalidArgument };
+        // SAFETY: non-null checked; a live context handle.
+        let Some(reached) = unsafe { &*ctx }.0.reachable(start, opts) else { return Status::NoPath };
+        let bytes: Vec<u8> = reached.iter().map(|&r| r as u8).collect();
+        copy_out(&bytes, out, capacity, written)
     })
 }
 
@@ -497,6 +639,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<LinkDesc>(), 40);
         assert_eq!(std::mem::size_of::<PathLink>(), 16);
         assert_eq!(std::mem::size_of::<Status>(), 4);
+        assert_eq!(std::mem::size_of::<PathOptions>(), 12);
     }
 
     #[test]
@@ -517,6 +660,8 @@ mod tests {
         assert_eq!(guard(|| panic!("boom")), Status::Panic);
     }
 
+    const DEFAULT_OPTS: PathOptions = PathOptions { blocked_mask: 0, snap_radius: 0, goal_mode: 0 };
+
     fn cell(col: f32, row: f32) -> Vec3 {
         Vec3::new(col + 0.5, 0.0, row + 0.5)
     }
@@ -530,7 +675,7 @@ mod tests {
         assert!(!ctx.is_null());
 
         let mut path = std::ptr::null_mut();
-        assert_eq!(ls_find_path(ctx, cell(0.0, 0.0), cell(2.0, 2.0), &mut path), Status::Ok);
+        assert_eq!(ls_find_path(ctx, cell(0.0, 0.0), cell(2.0, 2.0), DEFAULT_OPTS, &mut path), Status::Ok);
         assert_eq!(ls_path_len(path), 5);
         assert_eq!(ls_path_cost(path), 4.0);
 
@@ -580,13 +725,13 @@ mod tests {
 
         let upper = |col: f32| Vec3::new(col + 0.5, 1.0, 0.5);
         let mut path = std::ptr::null_mut();
-        assert_eq!(ls_find_path(ctx, cell(0.0, 0.0), upper(3.0), &mut path), Status::Ok);
+        assert_eq!(ls_find_path(ctx, cell(0.0, 0.0), upper(3.0), DEFAULT_OPTS, &mut path), Status::Ok);
         assert_eq!(ls_path_len(path), 4);
         ls_path_free(path);
 
         // Close the ramp edge; the layers disconnect.
         assert_eq!(ls_tile_set_edge(ctx, 1, Dir::East as u8, false), Status::Ok);
-        assert_eq!(ls_find_path(ctx, cell(0.0, 0.0), upper(3.0), &mut path), Status::NoPath);
+        assert_eq!(ls_find_path(ctx, cell(0.0, 0.0), upper(3.0), DEFAULT_OPTS, &mut path), Status::NoPath);
 
         // A teleporter link bridges them instead, starting disabled.
         let link = LinkDesc {
@@ -597,9 +742,9 @@ mod tests {
             flags: LinkFlags::Bidirectional as u32 | LinkFlags::StartDisabled as u32,
         };
         assert_eq!(ls_link_add(ctx, link), Status::Ok);
-        assert_eq!(ls_find_path(ctx, cell(0.0, 0.0), upper(3.0), &mut path), Status::NoPath);
+        assert_eq!(ls_find_path(ctx, cell(0.0, 0.0), upper(3.0), DEFAULT_OPTS, &mut path), Status::NoPath);
         assert_eq!(ls_link_set_enabled(ctx, 9001, true), Status::Ok);
-        assert_eq!(ls_find_path(ctx, upper(3.0), cell(0.0, 0.0), &mut path), Status::Ok);
+        assert_eq!(ls_find_path(ctx, upper(3.0), cell(0.0, 0.0), DEFAULT_OPTS, &mut path), Status::Ok);
         assert_eq!(ls_path_len(path), 2);
         let mut links = [PathLink { link_id: 0, index: 0, _reserved: 0 }; 2];
         let mut n = 0;
@@ -621,8 +766,47 @@ mod tests {
         let mut ctx = std::ptr::null_mut();
         assert_eq!(ls_tile_context_create(3, 1, 1, cells.as_ptr(), cells.len(), &mut ctx), Status::Ok);
         let mut path: *mut Path = std::ptr::dangling_mut();
-        assert_eq!(ls_find_path(ctx, cell(0.0, 0.0), cell(2.0, 0.0), &mut path), Status::NoPath);
+        assert_eq!(ls_find_path(ctx, cell(0.0, 0.0), cell(2.0, 0.0), DEFAULT_OPTS, &mut path), Status::NoPath);
         assert!(path.is_null());
+        ls_context_destroy(ctx);
+    }
+
+    #[test]
+    fn groups_goal_modes_and_reachability_through_the_abi() {
+        const NPC: u32 = 1;
+        // 5x3 open corridor; NPC at (2,1).
+        let mut ctx = std::ptr::null_mut();
+        assert_eq!(ls_tile_context_create(5, 3, 1, [1u8; 15].as_ptr(), 15, &mut ctx), Status::Ok);
+        let npc = 7;
+        assert_eq!(ls_node_add_groups(ctx, npc, NPC), Status::Ok);
+        let mut mask = 0;
+        assert_eq!(ls_node_get_groups(ctx, npc, &mut mask), Status::Ok);
+        assert_eq!(mask, NPC);
+        assert_eq!(ls_node_get_groups(ctx, 99, &mut mask), Status::InvalidArgument);
+
+        let blocked = PathOptions { blocked_mask: NPC, snap_radius: 0, goal_mode: 0 };
+        let mut path = std::ptr::null_mut();
+        assert_eq!(ls_find_path(ctx, cell(0.0, 1.0), cell(4.0, 1.0), blocked, &mut path), Status::Ok);
+        assert_eq!(ls_path_len(path), 7, "detours around the NPC");
+        ls_path_free(path);
+
+        let adjacent = PathOptions { blocked_mask: NPC, snap_radius: 0, goal_mode: 1 };
+        assert_eq!(ls_find_path_to_nodes(ctx, cell(0.0, 1.0), &npc, 1, adjacent, &mut path), Status::Ok);
+        assert_eq!(ls_path_len(path), 2, "stops next to the NPC: (0,1) -> (1,1)");
+        ls_path_free(path);
+        assert_eq!(ls_find_path_to_nodes(ctx, cell(0.0, 1.0), &99, 1, adjacent, &mut path), Status::InvalidArgument);
+        let bad_mode = PathOptions { blocked_mask: 0, snap_radius: 0, goal_mode: 7 };
+        assert_eq!(ls_find_path(ctx, cell(0.0, 1.0), cell(4.0, 1.0), bad_mode, &mut path), Status::InvalidArgument);
+
+        let mut reach = [0u8; 15];
+        let mut n = 0;
+        assert_eq!(ls_reachable_nodes(ctx, cell(0.0, 0.0), blocked, reach.as_mut_ptr(), 15, &mut n), Status::Ok);
+        assert_eq!(n, 15);
+        assert_eq!(reach[npc as usize], 0);
+        assert_eq!(reach[14], 1, "corridor around the NPC is open");
+        assert_eq!(ls_groups_clear(ctx, NPC), Status::Ok);
+        assert_eq!(ls_node_get_groups(ctx, npc, &mut mask), Status::Ok);
+        assert_eq!(mask, 0);
         ls_context_destroy(ctx);
     }
 

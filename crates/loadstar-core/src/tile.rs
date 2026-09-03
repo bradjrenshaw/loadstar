@@ -225,7 +225,70 @@ impl TileGrid {
         self.node_id(nc, nr, layer)
     }
 
+    /// Nearest node to `from` (same layer, Manhattan rings up to `max_radius`) satisfying
+    /// `pred`; `from` itself if it qualifies. Ties resolve to the lowest node id, so results
+    /// are deterministic. Used for start snapping (spec §8).
+    pub fn nearest_node(&self, from: NodeId, max_radius: u32, pred: impl Fn(NodeId) -> bool) -> Option<NodeId> {
+        if pred(from) {
+            return Some(from);
+        }
+        let (fc, fr, layer) = self.node_coords(from)?;
+        for radius in 1..=max_radius as i64 {
+            let mut best: Option<NodeId> = None;
+            for dc in -radius..=radius {
+                let dr_abs = radius - dc.abs();
+                for dr in if dr_abs == 0 { vec![0] } else { vec![-dr_abs, dr_abs] } {
+                    let (c, r) = (fc as i64 + dc, fr as i64 + dr);
+                    if c < 0 || r < 0 {
+                        continue;
+                    }
+                    if let Some(node) = self.node_id(c as u32, r as u32, layer)
+                        && pred(node)
+                    {
+                        best = Some(best.map_or(node, |b| b.min(node)));
+                    }
+                }
+            }
+            if best.is_some() {
+                return best;
+            }
+        }
+        None
+    }
+
+    /// Nodes from which one ordinary (non-link) step enters any of `targets`, excluding the
+    /// targets themselves — the "stand next to it" goal candidates (spec §8). Sorted, deduplicated.
+    pub fn adjacent_candidates(&self, targets: &[NodeId]) -> Vec<NodeId> {
+        let target_set: std::collections::HashSet<NodeId> = targets.iter().copied().collect();
+        let mut out = Vec::new();
+        let mut scratch = Vec::with_capacity(8);
+        for &t in targets {
+            for dir in Dir::ALL {
+                let Some((c, r)) = self.adjacent(t, dir) else { continue };
+                for layer in 0..self.layers {
+                    let Some(candidate) = self.node_id(c, r, layer) else { continue };
+                    if target_set.contains(&candidate) {
+                        continue;
+                    }
+                    scratch.clear();
+                    self.neighbors(candidate, &mut scratch);
+                    if scratch.iter().any(|e| e.link.is_none() && e.to == t) {
+                        out.push(candidate);
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     // --- Edges -------------------------------------------------------------------------
+
+    /// Whether any edge leaves this node — i.e. it is somewhere an agent can actually stand.
+    pub fn has_edges(&self, node: NodeId) -> bool {
+        self.edges.get(node as usize).is_some_and(|&m| m != 0) || self.link_index.contains_key(&node)
+    }
 
     pub fn can_move(&self, node: NodeId, dir: Dir) -> bool {
         self.edges.get(node as usize).is_some_and(|m| m & dir.bit() != 0)
@@ -541,6 +604,42 @@ mod tests {
         assert_eq!(p.nodes, vec![5, 4, 3, 2, 1, 0, 19]);
         assert_eq!(p.cost, 5.0);
         assert_eq!(p.links, vec![(6, 7)]);
+    }
+
+    #[test]
+    fn nearest_node_searches_rings_deterministically() {
+        let g = open(5, 5, 1);
+        let center = g.node_id(2, 2, 0).unwrap();
+        assert_eq!(g.nearest_node(center, 3, |_| true), Some(center));
+        // Ring 1 has four cells; the lowest id is the north neighbour (row 1).
+        assert_eq!(g.nearest_node(center, 3, |n| n != center), g.node_id(2, 1, 0));
+        // Only the far corner qualifies: found at radius 4, not within 3.
+        let corner = g.node_id(4, 4, 0).unwrap();
+        assert_eq!(g.nearest_node(center, 3, |n| n == corner), None);
+        assert_eq!(g.nearest_node(center, 4, |n| n == corner), Some(corner));
+    }
+
+    #[test]
+    fn adjacent_candidates_follow_real_edges_only() {
+        // 3x3 open grid; NPC occupies the center. Candidates are its four neighbours...
+        let mut g = open(3, 3, 1);
+        let center = g.node_id(1, 1, 0).unwrap();
+        assert_eq!(g.adjacent_candidates(&[center]), vec![1, 3, 5, 7]);
+        // ...unless the edge into it is closed (a counter between you and the shopkeeper),
+        assert_eq!(g.set_edge(1, Dir::South, false), Ok(()));
+        assert_eq!(g.adjacent_candidates(&[center]), vec![3, 5, 7]);
+        // ...and a teleporter landing on it does not count as adjacency.
+        g.add_link(1, Link { from: 8, to: center, cost: 1.0, bidirectional: false, enabled: true }).unwrap();
+        assert_eq!(g.adjacent_candidates(&[center]), vec![3, 5, 7]);
+        // A 2-cell target excludes its own cells from the candidates (1 is still cut off by the closed edge).
+        assert_eq!(g.adjacent_candidates(&[3, 4]), vec![0, 5, 6, 7]);
+    }
+
+    #[test]
+    fn has_edges_distinguishes_walls_from_floor() {
+        let g = walled();
+        assert!(g.has_edges(g.node_id(0, 0, 0).unwrap()));
+        assert!(!g.has_edges(g.node_id(2, 0, 0).unwrap()));
     }
 
     #[test]

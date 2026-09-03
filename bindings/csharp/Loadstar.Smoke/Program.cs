@@ -53,6 +53,44 @@ using (var ctx = TileContext.FromWalkable(W, H, 1, cells))
     Expect(ctx.FindPath(Vec3.Cell(0, 0), Vec3.Cell(9, 0))!.Nodes.Length == 28, "removed teleporter changes nothing");
 }
 
+// --- Blocking groups, goal modes, snapping, reachability on a 5x3 open corridor. ---
+{
+    const uint NPC = 1u << 0, EXIT = 1u << 1;
+    using var ctx = TileContext.FromWalkable(5, 3, 1, Enumerable.Repeat((byte)1, 15).ToArray());
+    var npc = ctx.NodeId(2, 1);
+    ctx.AddNodeGroups(npc, NPC);
+    Expect(ctx.NodeGroups(npc) == NPC, "node group round-trips");
+
+    Expect(ctx.FindPath(Vec3.Cell(0, 1), Vec3.Cell(4, 1))!.Nodes.Length == 5, "no blocking → straight through the NPC");
+    var around = ctx.FindPath(Vec3.Cell(0, 1), Vec3.Cell(4, 1), new PathOptions(blockedMask: NPC))!;
+    Expect(around.Nodes.Length == 7 && !around.Nodes.Contains(npc), "blocked NPC group → detour");
+
+    var exit = ctx.NodeId(4, 1);
+    ctx.AddNodeGroups(exit, EXIT);
+    var onto = ctx.FindPath(Vec3.Cell(0, 1), Vec3.Cell(4, 1), new PathOptions(blockedMask: NPC | EXIT))!;
+    Expect(onto.Nodes.Last() == exit, "Onto: path ends on the blocked exit itself");
+
+    var talk = ctx.FindPathToNodes(Vec3.Cell(0, 1), new[] { npc }, new PathOptions(blockedMask: NPC, goalMode: GoalMode.Adjacent))!;
+    var (lc, lr, _) = ctx.NodeCoords(talk.Nodes.Last());
+    Expect(!talk.Nodes.Contains(npc) && Math.Abs((int)lc - 2) + Math.Abs((int)lr - 1) == 1, $"Adjacent: stops next to the NPC at ({lc},{lr})");
+
+    var reach = ctx.ReachableNodes(Vec3.Cell(0, 0), new PathOptions(blockedMask: NPC))!;
+    Expect(reach.Length == 15 && !reach[npc] && reach[exit], "reachability excludes the NPC cell, includes the far side");
+
+    ctx.ClearGroups(NPC | EXIT);
+    Expect(ctx.NodeGroups(npc) == 0 && ctx.NodeGroups(exit) == 0, "ClearGroups wipes every node");
+}
+
+{
+    // Start inside a solid cell snaps to the nearest floor when asked.
+    var solid = Enumerable.Repeat((byte)1, 15).ToArray();
+    solid[7] = 0;
+    using var ctx = TileContext.FromWalkable(5, 3, 1, solid);
+    Expect(ctx.FindPath(Vec3.Cell(2, 1), Vec3.Cell(4, 1)) == null, "no snapping by default → null");
+    var snapped = ctx.FindPath(Vec3.Cell(2, 1), Vec3.Cell(4, 1), new PathOptions(blockedMask: 0, snapRadius: 1))!;
+    Expect(snapped.Nodes[0] != 7 && snapped.Nodes.Last() == ctx.NodeId(4, 1), "snapRadius 1 → path starts on the adjacent floor cell");
+}
+
 // --- Tier 2: explicit masks + a ramp override between two layers. ---
 {
     const uint W2 = 4, L = 2;

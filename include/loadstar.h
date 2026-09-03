@@ -96,6 +96,24 @@ typedef struct LsLinkDesc {
 } LsLinkDesc;
 
 /**
+ * Per-query options. A zeroed struct means: nothing blocked, no snapping, `Onto`.
+ */
+typedef struct LsPathOptions {
+  /**
+   * Nodes carrying any of these groups are impassable.
+   */
+  uint32_t blocked_mask;
+  /**
+   * Ring radius for start snapping when the start has no edges. 0 disables.
+   */
+  uint32_t snap_radius;
+  /**
+   * A `GoalMode` discriminant.
+   */
+  uint32_t goal_mode;
+} LsPathOptions;
+
+/**
  * A link traversal within a path: the node at `index` was reached by taking `link_id`.
  */
 typedef struct LsPathLink {
@@ -190,6 +208,31 @@ enum LsStatus ls_node_position(const struct LsContext *ctx, uint32_t node, struc
 enum LsStatus ls_node_from_position(const struct LsContext *ctx, struct LsVec3 pos, uint32_t *out);
 
 /**
+ * Group bitmask of a node. `InvalidArgument` if out of range.
+ */
+enum LsStatus ls_node_get_groups(const struct LsContext *ctx, uint32_t node, uint32_t *out);
+
+/**
+ * Replace a node's groups.
+ */
+enum LsStatus ls_node_set_groups(struct LsContext *ctx, uint32_t node, uint32_t mask);
+
+/**
+ * OR `mask` into a node's groups.
+ */
+enum LsStatus ls_node_add_groups(struct LsContext *ctx, uint32_t node, uint32_t mask);
+
+/**
+ * Clear `mask` bits from a node's groups.
+ */
+enum LsStatus ls_node_remove_groups(struct LsContext *ctx, uint32_t node, uint32_t mask);
+
+/**
+ * Clear `mask` bits from every node.
+ */
+enum LsStatus ls_groups_clear(struct LsContext *ctx, uint32_t mask);
+
+/**
  * Open or close one directed edge (`node` leaving in `dir`). The reverse edge is untouched.
  */
 enum LsStatus ls_tile_set_edge(struct LsContext *ctx, uint32_t node, uint8_t dir, bool passable);
@@ -224,7 +267,7 @@ enum LsStatus ls_link_remove(struct LsContext *ctx, uint64_t id);
 enum LsStatus ls_link_set_enabled(struct LsContext *ctx, uint64_t id, bool enabled);
 
 /**
- * Find a path between the nodes containing `start` and `goal`.
+ * Find a path from the node containing `start` to the node containing `goal`.
  *
  * On `Ok`, `*out` receives a path handle (release with [`ls_path_free`]).
  * On `NoPath`, `*out` is set to null and nothing needs freeing.
@@ -232,7 +275,31 @@ enum LsStatus ls_link_set_enabled(struct LsContext *ctx, uint64_t id, bool enabl
 enum LsStatus ls_find_path(const struct LsContext *ctx,
                            struct LsVec3 start,
                            struct LsVec3 goal,
+                           struct LsPathOptions opts,
                            struct LsPath **out);
+
+/**
+ * Find a path from the node containing `start` to the cheapest of `targets` (node ids),
+ * interpreted per `opts.goal_mode`. Same result convention as [`ls_find_path`].
+ */
+enum LsStatus ls_find_path_to_nodes(const struct LsContext *ctx,
+                                    struct LsVec3 start,
+                                    const uint32_t *targets,
+                                    uintptr_t targets_len,
+                                    struct LsPathOptions opts,
+                                    struct LsPath **out);
+
+/**
+ * Reachability from the node containing `start`: one byte per node (nonzero = reachable),
+ * same buffer convention as [`ls_path_nodes`]. `opts.goal_mode` is ignored.
+ * `NoPath` if `start` is off-grid and cannot be snapped.
+ */
+enum LsStatus ls_reachable_nodes(const struct LsContext *ctx,
+                                 struct LsVec3 start,
+                                 struct LsPathOptions opts,
+                                 uint8_t *out,
+                                 uintptr_t capacity,
+                                 uintptr_t *written);
 
 /**
  * Number of nodes in a path (both endpoints included). Zero for a null handle.
