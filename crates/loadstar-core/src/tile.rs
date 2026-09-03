@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use crate::geometry::Vec3;
+use crate::geometry::{Bounds, Vec3};
 use crate::graph::{Edge, Graph, LinkId, NodeId};
 
 /// Cardinal directions. The discriminant is the edge-mask bit index.
@@ -225,6 +225,56 @@ impl TileGrid {
         self.node_id(nc, nr, layer)
     }
 
+    /// The projection seam (spec §2, §5): every node this geometry occupies, clipped to the
+    /// grid. Sorted and deduplicated. Empty if the bounds lie entirely off-grid.
+    pub fn project(&self, bounds: &Bounds) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        match *bounds {
+            Bounds::Point(p) => out.extend(self.node_from_position(p)),
+            Bounds::TileRect { col, row, width, height, layer } => {
+                let layers: Vec<u32> = match layer {
+                    Some(l) => vec![l],
+                    None => (0..self.layers).collect(),
+                };
+                for l in layers {
+                    for r in row..row.saturating_add(height).min(self.height) {
+                        for c in col..col.saturating_add(width).min(self.width) {
+                            out.extend(self.node_id(c, r, l));
+                        }
+                    }
+                }
+            }
+            Bounds::Box { center, extents } => {
+                let (c0, c1) = cell_span(center.x - extents.x, center.x + extents.x);
+                let (r0, r1) = cell_span(center.z - extents.z, center.z + extents.z);
+                let (l0, l1) = cell_span(center.y - extents.y, center.y + extents.y);
+                for l in l0..=l1 {
+                    for r in r0..=r1 {
+                        for c in c0..=c1 {
+                            out.extend(self.node_id(c, r, l));
+                        }
+                    }
+                }
+            }
+            Bounds::Sphere { center, radius } => {
+                let (c0, c1) = cell_span(center.x - radius, center.x + radius);
+                let (r0, r1) = cell_span(center.z - radius, center.z + radius);
+                let l = center.y.max(0.0) as u32;
+                for r in r0..=r1 {
+                    for c in c0..=c1 {
+                        let (dx, dz) = (c as f32 + 0.5 - center.x, r as f32 + 0.5 - center.z);
+                        if dx * dx + dz * dz <= radius * radius {
+                            out.extend(self.node_id(c, r, l));
+                        }
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Nearest node to `from` (same layer, Manhattan rings up to `max_radius`) satisfying
     /// `pred`; `from` itself if it qualifies. Ties resolve to the lowest node id, so results
     /// are deterministic. Used for start snapping (spec §8).
@@ -391,6 +441,15 @@ impl TileGrid {
         entrances.dedup();
         self.link_entrances = entrances;
     }
+}
+
+/// Inclusive range of cell indices overlapped by the continuous interval `[min, max]`,
+/// clamped at zero. A cell is `[i, i + 1)`, so an interval ending exactly on a boundary does
+/// not touch the next cell.
+fn cell_span(min: f32, max: f32) -> (u32, u32) {
+    let first = min.max(0.0).floor() as u32;
+    let last = (max - 1e-4).max(0.0).floor() as u32;
+    (first, last.max(first))
 }
 
 fn check_cost(cost: f32) -> Result<(), GridError> {
@@ -633,6 +692,29 @@ mod tests {
         assert_eq!(g.adjacent_candidates(&[center]), vec![3, 5, 7]);
         // A 2-cell target excludes its own cells from the candidates (1 is still cut off by the closed edge).
         assert_eq!(g.adjacent_candidates(&[3, 4]), vec![0, 5, 6, 7]);
+    }
+
+    #[test]
+    fn projection_clips_and_covers_each_bounds_kind() {
+        let g = open(4, 4, 2);
+        assert_eq!(g.project(&Bounds::Point(Vec3::new(1.5, 1.0, 2.5))), vec![g.node_id(1, 2, 1).unwrap()]);
+        assert_eq!(g.project(&Bounds::Point(Vec3::new(9.0, 0.0, 0.0))), vec![]);
+
+        let rect = Bounds::TileRect { col: 2, row: 3, width: 3, height: 3, layer: Some(0) };
+        assert_eq!(g.project(&rect), vec![g.node_id(2, 3, 0).unwrap(), g.node_id(3, 3, 0).unwrap()], "clipped at the edge");
+        let all = Bounds::TileRect { col: 0, row: 0, width: 1, height: 1, layer: None };
+        assert_eq!(g.project(&all), vec![0, 16], "one cell on both layers");
+
+        // A box centered at (1.5, 0, 1.5) with half-size 1 spans cells 0..=2 in both axes.
+        let bx = Bounds::Box { center: Vec3::new(1.5, 0.0, 1.5), extents: Vec3::new(1.0, 0.0, 1.0) };
+        assert_eq!(g.project(&bx).len(), 9);
+        // Half-size 0.5 ends exactly on cell boundaries: only the center cell.
+        let tight = Bounds::Box { center: Vec3::new(1.5, 0.0, 1.5), extents: Vec3::new(0.5, 0.0, 0.5) };
+        assert_eq!(g.project(&tight), vec![g.node_id(1, 1, 0).unwrap()]);
+
+        // Radius 1 around a cell center covers the plus shape, not the diagonals.
+        let sp = Bounds::Sphere { center: Vec3::new(1.5, 0.0, 1.5), radius: 1.0 };
+        assert_eq!(g.project(&sp), vec![1, 4, 5, 6, 9]);
     }
 
     #[test]

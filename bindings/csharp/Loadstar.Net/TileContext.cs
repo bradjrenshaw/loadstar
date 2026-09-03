@@ -28,6 +28,11 @@ public static class Library
     {
         if (status != Status.Ok) throw new LoadstarException(status, call);
     }
+
+    internal static void ThrowIfNot(this Status status, Status a, Status b, string call)
+    {
+        if (status != a && status != b) throw new LoadstarException(status, call);
+    }
 }
 
 /// <summary>A path result: node ids plus which arrivals happened via a link (spec §8).</summary>
@@ -144,6 +149,64 @@ public sealed class TileContext : IDisposable
     /// <summary>Clear <paramref name="mask"/> bits from every node.</summary>
     public void ClearGroups(uint mask) =>
         Native.ls_groups_clear(_handle, mask).ThrowIfError(nameof(Native.ls_groups_clear));
+
+    // --- Entities ---
+
+    /// <summary>Insert or replace one entity by id.</summary>
+    public void UpsertEntity(in EntityDesc entity) =>
+        Native.ls_entity_upsert(_handle, entity).ThrowIfError(nameof(Native.ls_entity_upsert));
+
+    public void RemoveEntity(ulong id) =>
+        Native.ls_entity_remove(_handle, id).ThrowIfError(nameof(Native.ls_entity_remove));
+
+    /// <summary>
+    /// Declarative snapshot sync: send everything you see each frame; the library diffs,
+    /// re-projects only what changed, and removes entities absent from the snapshot.
+    /// </summary>
+    public SyncStats SyncEntities(EntityDesc[] entities)
+    {
+        Native.ls_entities_sync(_handle, entities.Length == 0 ? null : entities, (UIntPtr)entities.Length, out var stats)
+            .ThrowIfError(nameof(Native.ls_entities_sync));
+        return stats;
+    }
+
+    public int EntityCount => (int)(ulong)Native.ls_entity_count(_handle);
+
+    /// <summary>Nodes the entity occupies; empty if it lies off-grid.</summary>
+    public uint[] EntityNodes(ulong id)
+    {
+        Native.ls_entity_nodes(_handle, id, null, UIntPtr.Zero, out var needed)
+            .ThrowIfNot(Status.BufferTooSmall, Status.Ok, nameof(Native.ls_entity_nodes));
+        var nodes = new uint[(int)(ulong)needed];
+        if (nodes.Length > 0)
+            Native.ls_entity_nodes(_handle, id, nodes, (UIntPtr)nodes.Length, out _).ThrowIfError(nameof(Native.ls_entity_nodes));
+        return nodes;
+    }
+
+    /// <summary>Closest point of the entity's bounds to <paramref name="from"/> (pure geometry).</summary>
+    public Vec3 EntityNearestPoint(ulong id, Vec3 from)
+    {
+        Native.ls_entity_nearest_point(_handle, id, from, out var p).ThrowIfError(nameof(Native.ls_entity_nearest_point));
+        return p;
+    }
+
+    /// <summary>Path to an entity; goal mode comes from its <see cref="EntityFlags.PathfindAdjacent"/> flag.
+    /// Null if unreachable.</summary>
+    public Path? FindPathToEntity(Vec3 start, ulong id, PathOptions options = default)
+    {
+        var status = Native.ls_find_path_to_entity(_handle, start, id, options, out var path);
+        return ReadPath(status, path, nameof(Native.ls_find_path_to_entity));
+    }
+
+    /// <summary>Whether any of the entity's nodes, or any node one step from them, is reachable
+    /// from <paramref name="start"/>. Runs a fresh flood fill each call.</summary>
+    public bool EntityReachable(Vec3 start, ulong id, PathOptions options = default)
+    {
+        var status = Native.ls_entity_reachable(_handle, start, id, options, out var reachable);
+        if (status == Status.NoPath) return false;
+        status.ThrowIfError(nameof(Native.ls_entity_reachable));
+        return reachable;
+    }
 
     // --- Paths and reachability ---
 

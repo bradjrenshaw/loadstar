@@ -10,6 +10,8 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use loadstar_core::context::{GoalMode as CoreGoalMode, PathOptions as CorePathOptions, TileContext};
+use loadstar_core::entities::{Entity, SyncStats as CoreSyncStats};
+use loadstar_core::geometry::Bounds;
 use loadstar_core::graph::LinkId;
 use loadstar_core::tile::{Dir, EdgeOverride, GridError, Link, TileGrid};
 pub use loadstar_core::geometry::Vec3;
@@ -110,6 +112,110 @@ impl PathOptions {
             _ => return None,
         };
         Some(CorePathOptions { blocked_mask: self.blocked_mask, snap_radius: self.snap_radius, goal_mode })
+    }
+}
+
+/// Shape of a [`BoundsDesc`] (spec §5 "Bounds").
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundsKind {
+    /// `a` = position.
+    Point = 0,
+    /// `a.x` = col, `a.z` = row, `b.x` = width, `b.z` = height (cells); `layer`, or
+    /// `UINT32_MAX` for every layer.
+    TileRect = 1,
+    /// `a` = center, `b` = half-extents.
+    Box = 2,
+    /// `a` = center, `b.x` = radius.
+    Sphere = 3,
+}
+
+/// Fixed-size bounds record, 40 bytes. `layer` is only read for `TileRect`; `ref_id` is
+/// reserved for registered polygons.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BoundsDesc {
+    pub kind: u32,
+    pub layer: u32,
+    pub ref_id: u32,
+    pub _reserved: u32,
+    pub a: Vec3,
+    pub b: Vec3,
+}
+
+impl BoundsDesc {
+    fn to_core(self) -> Option<Bounds> {
+        Some(match self.kind {
+            0 => Bounds::Point(self.a),
+            1 => Bounds::TileRect {
+                col: self.a.x as u32,
+                row: self.a.z as u32,
+                width: self.b.x as u32,
+                height: self.b.z as u32,
+                layer: if self.layer == u32::MAX { None } else { Some(self.layer) },
+            },
+            2 => Bounds::Box { center: self.a, extents: self.b },
+            3 => Bounds::Sphere { center: self.a, radius: self.b.x },
+            _ => return None,
+        })
+    }
+}
+
+/// Conventional entity flag bits (spec §5). Every other bit is mod-defined.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntityFlags {
+    None = 0,
+    /// Excluded by the default tracker filter. Convention only.
+    Hidden = 1,
+    /// Paths stop next to this entity instead of on it (NPCs vs. exits).
+    PathfindAdjacent = 2,
+}
+
+/// An entity record (spec §5), 64 bytes. All numeric; labels live mod-side keyed by `id`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct EntityDesc {
+    /// Mod-derived unique id. Never interpreted by the core.
+    pub id: u64,
+    /// Mod-defined; the core only groups by equality.
+    pub category: u16,
+    pub _reserved: u16,
+    /// Blocking-group bitmask projected onto the entity's nodes. 0 = doesn't block.
+    pub blocking: u32,
+    /// Bitwise OR of `EntityFlags` and mod-defined bits.
+    pub flags: u32,
+    /// Explicit browse order within a category.
+    pub sort_key: u32,
+    pub bounds: BoundsDesc,
+}
+
+impl EntityDesc {
+    fn to_core(self) -> Option<Entity> {
+        Some(Entity {
+            id: self.id,
+            category: self.category,
+            bounds: self.bounds.to_core()?,
+            blocking: self.blocking,
+            flags: self.flags,
+            sort_key: self.sort_key,
+        })
+    }
+}
+
+/// Result of [`ls_entities_sync`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SyncStats {
+    pub added: u32,
+    pub updated: u32,
+    pub removed: u32,
+    pub _reserved: u32,
+}
+
+impl From<CoreSyncStats> for SyncStats {
+    fn from(s: CoreSyncStats) -> Self {
+        SyncStats { added: s.added, updated: s.updated, removed: s.removed, _reserved: 0 }
     }
 }
 
@@ -458,6 +564,149 @@ pub extern "C" fn ls_link_set_enabled(ctx: *mut Context, id: u64, enabled: bool)
 }
 
 // ---------------------------------------------------------------------------
+// Entities
+// ---------------------------------------------------------------------------
+
+/// Insert or replace one entity by id. `InvalidArgument` for an unknown bounds kind.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_entity_upsert(ctx: *mut Context, entity: *const EntityDesc) -> Status {
+    with_ctx_mut(ctx, |c| {
+        if entity.is_null() {
+            return Status::NullPointer;
+        }
+        // SAFETY: non-null checked; caller guarantees `entity` points to a readable EntityDesc.
+        match unsafe { *entity }.to_core() {
+            Some(e) => {
+                c.upsert_entity(e);
+                Status::Ok
+            }
+            None => Status::InvalidArgument,
+        }
+    })
+}
+
+/// Remove an entity. `InvalidArgument` if the id is unknown.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_entity_remove(ctx: *mut Context, id: u64) -> Status {
+    with_ctx_mut(ctx, |c| if c.remove_entity(id) { Status::Ok } else { Status::InvalidArgument })
+}
+
+/// Declarative snapshot sync (spec §5): upsert every record, remove every entity absent
+/// from the snapshot. The core diffs, so re-sending unchanged records costs nothing.
+/// `stats` may be null. Rejects the whole snapshot on any invalid bounds kind.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_entities_sync(
+    ctx: *mut Context,
+    entities: *const EntityDesc,
+    entities_len: usize,
+    stats: *mut SyncStats,
+) -> Status {
+    with_ctx_mut(ctx, |c| {
+        if entities.is_null() && entities_len > 0 {
+            return Status::NullPointer;
+        }
+        // SAFETY: non-null checked; caller guarantees `entities` is readable for `entities_len`.
+        let descs: &[EntityDesc] = if entities_len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(entities, entities_len) } };
+        let mut converted = Vec::with_capacity(descs.len());
+        for d in descs {
+            let Some(e) = d.to_core() else { return Status::InvalidArgument };
+            converted.push(e);
+        }
+        let result: SyncStats = c.sync_entities(&converted).into();
+        if !stats.is_null() {
+            // SAFETY: non-null checked; caller guarantees `stats` is writable.
+            unsafe { *stats = result };
+        }
+        Status::Ok
+    })
+}
+
+/// Number of entities in the registry.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_entity_count(ctx: *const Context) -> usize {
+    if ctx.is_null() {
+        return 0;
+    }
+    // SAFETY: non-null checked; a live context handle.
+    unsafe { &*ctx }.0.entity_count()
+}
+
+/// Nodes an entity occupies (its bounds projected through the grid). Same buffer convention
+/// as [`ls_path_nodes`]. `InvalidArgument` for an unknown id; an off-grid entity writes zero.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_entity_nodes(ctx: *const Context, id: u64, out: *mut u32, capacity: usize, written: *mut usize) -> Status {
+    guard(|| {
+        if ctx.is_null() {
+            return Status::NullPointer;
+        }
+        // SAFETY: non-null checked; a live context handle.
+        match unsafe { &*ctx }.0.entity_nodes(id) {
+            Some(nodes) => copy_out(nodes, out, capacity, written),
+            None => Status::InvalidArgument,
+        }
+    })
+}
+
+/// Closest point of an entity's bounds to `from` — pure geometry, no map involved.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_entity_nearest_point(ctx: *const Context, id: u64, from: Vec3, out: *mut Vec3) -> Status {
+    guard(|| {
+        if ctx.is_null() || out.is_null() {
+            return Status::NullPointer;
+        }
+        // SAFETY: non-null checked; a live context handle.
+        match unsafe { &*ctx }.0.entity_nearest_point(id, from) {
+            // SAFETY: `out` non-null checked; caller guarantees it is writable.
+            Some(p) => unsafe {
+                *out = p;
+                Status::Ok
+            },
+            None => Status::InvalidArgument,
+        }
+    })
+}
+
+/// Path to an entity. Goal mode comes from the entity's `PathfindAdjacent` flag, not `opts`.
+/// `InvalidArgument` for an unknown id; otherwise the [`ls_find_path`] result convention.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_find_path_to_entity(ctx: *const Context, start: Vec3, id: u64, opts: PathOptions, out: *mut *mut Path) -> Status {
+    guard(|| {
+        if ctx.is_null() || out.is_null() {
+            return Status::NullPointer;
+        }
+        let Some(opts) = opts.to_core() else { return Status::InvalidArgument };
+        // SAFETY: non-null checked; a live context handle.
+        let ctx = unsafe { &*ctx };
+        if ctx.0.entity(id).is_none() {
+            return Status::InvalidArgument;
+        }
+        finish_path(ctx.0.find_path_to_entity(start, id, opts), out)
+    })
+}
+
+/// Whether an entity is reachable from `start`: any of its nodes, or any node one step away
+/// from them, is reachable under `opts.blocked_mask`. Runs a fresh flood fill each call.
+/// `NoPath` if `start` is off-grid; `InvalidArgument` for an unknown id.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_entity_reachable(ctx: *const Context, start: Vec3, id: u64, opts: PathOptions, out: *mut bool) -> Status {
+    guard(|| {
+        if ctx.is_null() || out.is_null() {
+            return Status::NullPointer;
+        }
+        let Some(opts) = opts.to_core() else { return Status::InvalidArgument };
+        // SAFETY: non-null checked; a live context handle.
+        let ctx = unsafe { &*ctx };
+        if ctx.0.entity(id).is_none() {
+            return Status::InvalidArgument;
+        }
+        let Some(reached) = ctx.0.reachable(start, opts) else { return Status::NoPath };
+        // SAFETY: `out` non-null checked; caller guarantees it is writable.
+        unsafe { *out = ctx.0.entity_reachable(&reached, id).unwrap_or(false) };
+        Status::Ok
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Paths
 // ---------------------------------------------------------------------------
 
@@ -640,6 +889,9 @@ mod tests {
         assert_eq!(std::mem::size_of::<PathLink>(), 16);
         assert_eq!(std::mem::size_of::<Status>(), 4);
         assert_eq!(std::mem::size_of::<PathOptions>(), 12);
+        assert_eq!(std::mem::size_of::<BoundsDesc>(), 40);
+        assert_eq!(std::mem::size_of::<EntityDesc>(), 64);
+        assert_eq!(std::mem::size_of::<SyncStats>(), 16);
     }
 
     #[test]
@@ -807,6 +1059,76 @@ mod tests {
         assert_eq!(ls_groups_clear(ctx, NPC), Status::Ok);
         assert_eq!(ls_node_get_groups(ctx, npc, &mut mask), Status::Ok);
         assert_eq!(mask, 0);
+        ls_context_destroy(ctx);
+    }
+
+    fn tile_rect(col: u32, row: u32, w: u32, h: u32) -> BoundsDesc {
+        BoundsDesc {
+            kind: BoundsKind::TileRect as u32,
+            layer: 0,
+            ref_id: 0,
+            _reserved: 0,
+            a: Vec3::new(col as f32, 0.0, row as f32),
+            b: Vec3::new(w as f32, 0.0, h as f32),
+        }
+    }
+
+    fn entity(id: u64, bounds: BoundsDesc, blocking: u32, flags: u32) -> EntityDesc {
+        EntityDesc { id, category: 1, _reserved: 0, blocking, flags, sort_key: 0, bounds }
+    }
+
+    #[test]
+    fn entities_through_the_abi() {
+        const NPC: u32 = 1;
+        let mut ctx = std::ptr::null_mut();
+        assert_eq!(ls_tile_context_create(5, 3, 1, [1u8; 15].as_ptr(), 15, &mut ctx), Status::Ok);
+
+        let npc = entity(10, tile_rect(2, 1, 1, 1), NPC, EntityFlags::PathfindAdjacent as u32);
+        let chest = entity(20, tile_rect(4, 2, 1, 1), 0, 0);
+        let snapshot = [npc, chest];
+        let mut stats = SyncStats::default();
+        assert_eq!(ls_entities_sync(ctx, snapshot.as_ptr(), 2, &mut stats), Status::Ok);
+        assert_eq!(stats, SyncStats { added: 2, updated: 0, removed: 0, _reserved: 0 });
+        assert_eq!(ls_entity_count(ctx), 2);
+
+        let mut mask = 0;
+        assert_eq!(ls_node_get_groups(ctx, 7, &mut mask), Status::Ok);
+        assert_eq!(mask, NPC, "projection populated the blocking overlay");
+
+        let mut nodes = [0u32; 4];
+        let mut n = 0;
+        assert_eq!(ls_entity_nodes(ctx, 10, nodes.as_mut_ptr(), 4, &mut n), Status::Ok);
+        assert_eq!(&nodes[..n], &[7]);
+        assert_eq!(ls_entity_nodes(ctx, 99, nodes.as_mut_ptr(), 4, &mut n), Status::InvalidArgument);
+
+        let opts = PathOptions { blocked_mask: NPC, snap_radius: 0, goal_mode: 0 };
+        let mut path = std::ptr::null_mut();
+        assert_eq!(ls_find_path_to_entity(ctx, cell(0.0, 1.0), 10, opts, &mut path), Status::Ok);
+        assert_eq!(ls_path_len(path), 2, "adjacent flag: stops next to the NPC");
+        ls_path_free(path);
+        assert_eq!(ls_find_path_to_entity(ctx, cell(0.0, 1.0), 99, opts, &mut path), Status::InvalidArgument);
+
+        let mut reachable = false;
+        assert_eq!(ls_entity_reachable(ctx, cell(0.0, 1.0), 20, opts, &mut reachable), Status::Ok);
+        assert!(reachable);
+
+        let mut p = Vec3::default();
+        assert_eq!(ls_entity_nearest_point(ctx, 20, cell(0.0, 0.0), &mut p), Status::Ok);
+        assert_eq!(p, Vec3::new(4.0, 0.0, 2.0));
+
+        // Moving the NPC by upsert frees the old cell; removing the chest shrinks the registry.
+        let moved = entity(10, tile_rect(2, 0, 1, 1), NPC, EntityFlags::PathfindAdjacent as u32);
+        assert_eq!(ls_entity_upsert(ctx, &moved), Status::Ok);
+        assert_eq!(ls_node_get_groups(ctx, 7, &mut mask), Status::Ok);
+        assert_eq!(mask, 0);
+        assert_eq!(ls_entity_remove(ctx, 20), Status::Ok);
+        assert_eq!(ls_entity_remove(ctx, 20), Status::InvalidArgument);
+        assert_eq!(ls_entity_count(ctx), 1);
+
+        let bad = entity(30, BoundsDesc { kind: 9, ..tile_rect(0, 0, 1, 1) }, 0, 0);
+        assert_eq!(ls_entity_upsert(ctx, &bad), Status::InvalidArgument);
+        assert_eq!(ls_entities_sync(ctx, std::ptr::null(), 0, std::ptr::null_mut()), Status::Ok, "empty snapshot clears");
+        assert_eq!(ls_entity_count(ctx), 0);
         ls_context_destroy(ctx);
     }
 

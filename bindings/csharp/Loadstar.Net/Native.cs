@@ -112,6 +112,79 @@ public struct PathOptions
     }
 }
 
+/// <summary>Mirrors <c>LsBoundsKind</c>.</summary>
+public enum BoundsKind : uint
+{
+    Point = 0,
+    TileRect = 1,
+    Box = 2,
+    Sphere = 3,
+}
+
+/// <summary>Mirrors <c>LsBoundsDesc</c> (40 bytes). Build with the static factories.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct Bounds
+{
+    public const uint AllLayers = uint.MaxValue;
+
+    public BoundsKind Kind;
+    public uint Layer;
+    public uint RefId;
+    private uint _reserved;
+    public Vec3 A;
+    public Vec3 B;
+
+    public static Bounds Point(Vec3 position) => new() { Kind = BoundsKind.Point, A = position };
+
+    public static Bounds TileRect(uint col, uint row, uint width = 1, uint height = 1, uint layer = 0) => new()
+    {
+        Kind = BoundsKind.TileRect, Layer = layer, A = new Vec3(col, 0, row), B = new Vec3(width, 0, height),
+    };
+
+    public static Bounds Box(Vec3 center, Vec3 halfExtents) => new() { Kind = BoundsKind.Box, A = center, B = halfExtents };
+
+    public static Bounds Sphere(Vec3 center, float radius) => new() { Kind = BoundsKind.Sphere, A = center, B = new Vec3(radius, 0, 0) };
+}
+
+/// <summary>Mirrors <c>LsEntityFlags</c>. Other bits are yours to define.</summary>
+[Flags]
+public enum EntityFlags : uint
+{
+    None = 0,
+    /// <summary>Excluded by the default tracker filter. Convention only.</summary>
+    Hidden = 1,
+    /// <summary>Paths stop next to this entity instead of on it (NPCs vs. exits).</summary>
+    PathfindAdjacent = 2,
+}
+
+/// <summary>Mirrors <c>LsEntityDesc</c> (64 bytes). All numeric — keep labels in your own table keyed by <see cref="Id"/>.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct EntityDesc
+{
+    public ulong Id;
+    public ushort Category;
+    private ushort _reserved;
+    public uint Blocking;
+    public EntityFlags Flags;
+    public uint SortKey;
+    public Bounds Bounds;
+
+    public EntityDesc(ulong id, ushort category, Bounds bounds, uint blocking = 0, EntityFlags flags = EntityFlags.None, uint sortKey = 0)
+    {
+        Id = id; Category = category; _reserved = 0; Blocking = blocking; Flags = flags; SortKey = sortKey; Bounds = bounds;
+    }
+}
+
+/// <summary>Mirrors <c>LsSyncStats</c>.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct SyncStats
+{
+    public uint Added, Updated, Removed;
+    private uint _reserved;
+
+    public override string ToString() => $"+{Added} ~{Updated} -{Removed}";
+}
+
 public sealed class LoadstarException : Exception
 {
     public Status Status { get; }
@@ -194,6 +267,16 @@ internal static class Native
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_node_add_groups(ContextHandle context, uint node, uint mask);
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_node_remove_groups(ContextHandle context, uint node, uint mask);
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_groups_clear(ContextHandle context, uint mask);
+
+    // Entities
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_entity_upsert(ContextHandle context, in EntityDesc entity);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_entity_remove(ContextHandle context, ulong id);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_entities_sync(ContextHandle context, EntityDesc[]? entities, UIntPtr entitiesLen, out SyncStats stats);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern UIntPtr ls_entity_count(ContextHandle context);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_entity_nodes(ContextHandle context, ulong id, [Out] uint[]? buffer, UIntPtr capacity, out UIntPtr written);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_entity_nearest_point(ContextHandle context, ulong id, Vec3 from, out Vec3 point);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_find_path_to_entity(ContextHandle context, Vec3 start, ulong id, PathOptions options, out PathHandle path);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_entity_reachable(ContextHandle context, Vec3 start, ulong id, PathOptions options, [MarshalAs(UnmanagedType.U1)] out bool reachable);
 
     // Paths and reachability
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_find_path(ContextHandle context, Vec3 start, Vec3 goal, PathOptions options, out PathHandle path);

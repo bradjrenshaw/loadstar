@@ -12,8 +12,9 @@ Library.CheckAbi();
 Console.WriteLine($"ABI version {Library.AbiVersion} OK");
 
 Expect(Marshal.SizeOf(typeof(Vec3)) == 12 && Marshal.SizeOf(typeof(TileEdgeOverride)) == 16
-    && Marshal.SizeOf(typeof(LinkDesc)) == 40 && Marshal.SizeOf(typeof(PathLink)) == 16,
-    "marshaled struct sizes match the ABI (12/16/40/16)");
+    && Marshal.SizeOf(typeof(LinkDesc)) == 40 && Marshal.SizeOf(typeof(PathLink)) == 16
+    && Marshal.SizeOf(typeof(Bounds)) == 40 && Marshal.SizeOf(typeof(EntityDesc)) == 64 && Marshal.SizeOf(typeof(SyncStats)) == 16,
+    "marshaled struct sizes match the ABI");
 
 var sum = Library.Add(new Vec3(1, 2, 3), new Vec3(10, 20, 30));
 Expect(sum.X == 11 && sum.Y == 22 && sum.Z == 33, $"vec3 add by value: {sum}");
@@ -89,6 +90,43 @@ using (var ctx = TileContext.FromWalkable(W, H, 1, cells))
     Expect(ctx.FindPath(Vec3.Cell(2, 1), Vec3.Cell(4, 1)) == null, "no snapping by default → null");
     var snapped = ctx.FindPath(Vec3.Cell(2, 1), Vec3.Cell(4, 1), new PathOptions(blockedMask: 0, snapRadius: 1))!;
     Expect(snapped.Nodes[0] != 7 && snapped.Nodes.Last() == ctx.NodeId(4, 1), "snapRadius 1 → path starts on the adjacent floor cell");
+}
+
+// --- Entities: snapshot sync, projection into blocking groups, paths and reachability. ---
+{
+    const uint NPC = 1u << 0, EXIT = 1u << 1;
+    const ushort CatNpc = 1, CatExit = 2, CatChest = 3;
+    using var ctx = TileContext.FromWalkable(5, 3, 1, Enumerable.Repeat((byte)1, 15).ToArray());
+
+    var npc = new EntityDesc(10, CatNpc, Bounds.TileRect(2, 1), blocking: NPC, flags: EntityFlags.PathfindAdjacent);
+    var exit = new EntityDesc(20, CatExit, Bounds.TileRect(4, 0, height: 3), blocking: EXIT);
+    var chest = new EntityDesc(30, CatChest, Bounds.Point(Vec3.Cell(0, 2)));
+    var stats = ctx.SyncEntities(new[] { npc, exit, chest });
+    Expect(stats.Added == 3 && stats.Updated == 0 && stats.Removed == 0 && ctx.EntityCount == 3, $"snapshot sync: {stats}, {ctx.EntityCount} entities");
+    Expect(ctx.NodeGroups(ctx.NodeId(2, 1)) == NPC && ctx.NodeGroups(ctx.NodeId(4, 2)) == EXIT, "projections populated the blocking overlay");
+    Expect(ctx.EntityNodes(20).Length == 3 && ctx.EntityNodes(30).Length == 1, "1x3 exit → 3 nodes, point chest → 1 node");
+
+    stats = ctx.SyncEntities(new[] { npc, exit, chest });
+    Expect(stats.Added == 0 && stats.Updated == 0 && stats.Removed == 0, "unchanged re-send is free");
+
+    var opts = new PathOptions(blockedMask: NPC | EXIT);
+    var talk = ctx.FindPathToEntity(Vec3.Cell(0, 1), 10, opts)!;
+    Expect(!talk.Nodes.Contains(ctx.NodeId(2, 1)) && talk.Nodes.Length == 2, "PathfindAdjacent entity: stop beside the NPC");
+    var leave = ctx.FindPathToEntity(Vec3.Cell(0, 1), 20, opts)!;
+    var (ec, _, _) = ctx.NodeCoords(leave.Nodes.Last());
+    Expect(ec == 4 && !leave.Nodes.Contains(ctx.NodeId(2, 1)), "walk-onto entity: ends on the exit, detouring the NPC");
+    Expect(ctx.EntityNearestPoint(20, Vec3.Cell(0, 1)).X == 4 && ctx.EntityNearestPoint(20, Vec3.Cell(0, 1)).Z == 1.5f, "nearest point on the exit's west face");
+    Expect(ctx.EntityReachable(Vec3.Cell(0, 1), 30, opts), "chest is reachable");
+
+    // NPC wanders one tile: its old cell frees up; dropping the chest removes it.
+    npc.Bounds = Bounds.TileRect(2, 0);
+    stats = ctx.SyncEntities(new[] { npc, exit });
+    Expect(stats.Updated == 1 && stats.Removed == 1 && ctx.EntityCount == 2, $"move + drop: {stats}");
+    Expect(ctx.NodeGroups(ctx.NodeId(2, 1)) == 0 && ctx.NodeGroups(ctx.NodeId(2, 0)) == NPC, "blocking overlay followed the NPC");
+    Expect(ctx.FindPath(Vec3.Cell(0, 1), Vec3.Cell(3, 1), opts)!.Nodes.Length == 4, "old NPC cell is walkable again");
+
+    try { ctx.EntityNodes(30); Expect(false, "removed entity should throw"); }
+    catch (LoadstarException e) { Expect(e.Status == Status.InvalidArgument, $"removed entity → {e.Status}"); }
 }
 
 // --- Tier 2: explicit masks + a ramp override between two layers. ---

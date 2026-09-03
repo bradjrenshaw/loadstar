@@ -96,6 +96,57 @@ typedef struct LsLinkDesc {
 } LsLinkDesc;
 
 /**
+ * Fixed-size bounds record, 40 bytes. `layer` is only read for `TileRect`; `ref_id` is
+ * reserved for registered polygons.
+ */
+typedef struct LsBoundsDesc {
+  uint32_t kind;
+  uint32_t layer;
+  uint32_t ref_id;
+  uint32_t _reserved;
+  struct LsVec3 a;
+  struct LsVec3 b;
+} LsBoundsDesc;
+
+/**
+ * An entity record (spec §5), 64 bytes. All numeric; labels live mod-side keyed by `id`.
+ */
+typedef struct LsEntityDesc {
+  /**
+   * Mod-derived unique id. Never interpreted by the core.
+   */
+  uint64_t id;
+  /**
+   * Mod-defined; the core only groups by equality.
+   */
+  uint16_t category;
+  uint16_t _reserved;
+  /**
+   * Blocking-group bitmask projected onto the entity's nodes. 0 = doesn't block.
+   */
+  uint32_t blocking;
+  /**
+   * Bitwise OR of `EntityFlags` and mod-defined bits.
+   */
+  uint32_t flags;
+  /**
+   * Explicit browse order within a category.
+   */
+  uint32_t sort_key;
+  struct LsBoundsDesc bounds;
+} LsEntityDesc;
+
+/**
+ * Result of [`ls_entities_sync`].
+ */
+typedef struct LsSyncStats {
+  uint32_t added;
+  uint32_t updated;
+  uint32_t removed;
+  uint32_t _reserved;
+} LsSyncStats;
+
+/**
  * Per-query options. A zeroed struct means: nothing blocked, no snapping, `Onto`.
  */
 typedef struct LsPathOptions {
@@ -265,6 +316,70 @@ enum LsStatus ls_link_remove(struct LsContext *ctx, uint64_t id);
  * Enable or disable a link without removing it (unpowered teleporter, locked door).
  */
 enum LsStatus ls_link_set_enabled(struct LsContext *ctx, uint64_t id, bool enabled);
+
+/**
+ * Insert or replace one entity by id. `InvalidArgument` for an unknown bounds kind.
+ */
+enum LsStatus ls_entity_upsert(struct LsContext *ctx, const struct LsEntityDesc *entity);
+
+/**
+ * Remove an entity. `InvalidArgument` if the id is unknown.
+ */
+enum LsStatus ls_entity_remove(struct LsContext *ctx, uint64_t id);
+
+/**
+ * Declarative snapshot sync (spec §5): upsert every record, remove every entity absent
+ * from the snapshot. The core diffs, so re-sending unchanged records costs nothing.
+ * `stats` may be null. Rejects the whole snapshot on any invalid bounds kind.
+ */
+enum LsStatus ls_entities_sync(struct LsContext *ctx,
+                               const struct LsEntityDesc *entities,
+                               uintptr_t entities_len,
+                               struct LsSyncStats *stats);
+
+/**
+ * Number of entities in the registry.
+ */
+uintptr_t ls_entity_count(const struct LsContext *ctx);
+
+/**
+ * Nodes an entity occupies (its bounds projected through the grid). Same buffer convention
+ * as [`ls_path_nodes`]. `InvalidArgument` for an unknown id; an off-grid entity writes zero.
+ */
+enum LsStatus ls_entity_nodes(const struct LsContext *ctx,
+                              uint64_t id,
+                              uint32_t *out,
+                              uintptr_t capacity,
+                              uintptr_t *written);
+
+/**
+ * Closest point of an entity's bounds to `from` — pure geometry, no map involved.
+ */
+enum LsStatus ls_entity_nearest_point(const struct LsContext *ctx,
+                                      uint64_t id,
+                                      struct LsVec3 from,
+                                      struct LsVec3 *out);
+
+/**
+ * Path to an entity. Goal mode comes from the entity's `PathfindAdjacent` flag, not `opts`.
+ * `InvalidArgument` for an unknown id; otherwise the [`ls_find_path`] result convention.
+ */
+enum LsStatus ls_find_path_to_entity(const struct LsContext *ctx,
+                                     struct LsVec3 start,
+                                     uint64_t id,
+                                     struct LsPathOptions opts,
+                                     struct LsPath **out);
+
+/**
+ * Whether an entity is reachable from `start`: any of its nodes, or any node one step away
+ * from them, is reachable under `opts.blocked_mask`. Runs a fresh flood fill each call.
+ * `NoPath` if `start` is off-grid; `InvalidArgument` for an unknown id.
+ */
+enum LsStatus ls_entity_reachable(const struct LsContext *ctx,
+                                  struct LsVec3 start,
+                                  uint64_t id,
+                                  struct LsPathOptions opts,
+                                  bool *out);
 
 /**
  * Find a path from the node containing `start` to the node containing `goal`.
