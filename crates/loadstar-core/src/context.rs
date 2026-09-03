@@ -3,7 +3,7 @@
 //! caches attach here as they are built.
 
 use crate::geometry::Vec3;
-use crate::graph::{NodeId, astar};
+use crate::graph::{Path, astar};
 use crate::tile::TileGrid;
 
 pub struct TileContext {
@@ -23,9 +23,9 @@ impl TileContext {
         &mut self.grid
     }
 
-    /// Path between the nodes containing `start` and `goal`, as node ids (spec §8).
+    /// Path between the nodes containing `start` and `goal` (spec §8).
     /// `None` if either position is off-grid or no route exists.
-    pub fn find_path(&self, start: Vec3, goal: Vec3) -> Option<Vec<NodeId>> {
+    pub fn find_path(&self, start: Vec3, goal: Vec3) -> Option<Path> {
         let s = self.grid.node_from_position(start)?;
         let g = self.grid.node_from_position(goal)?;
         astar(&self.grid, s, g)

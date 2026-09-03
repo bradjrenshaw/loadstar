@@ -58,7 +58,7 @@ typedef uint8_t LsDir;
 typedef struct LsContext LsContext;
 
 /**
- * Opaque: a path result, a sequence of node ids (spec §8). Exported to C as `LsPath`.
+ * Opaque: a path result (spec §8). Exported to C as `LsPath`.
  */
 typedef struct LsPath LsPath;
 
@@ -70,6 +70,42 @@ typedef struct LsVec3 {
   float y;
   float z;
 } LsVec3;
+
+/**
+ * One entry of the tier-2 edge override table (spec §6.1). `dir` is a `Dir` discriminant (0–3).
+ */
+typedef struct LsTileEdgeOverride {
+  uint32_t node;
+  uint8_t dir;
+  uint32_t target_layer;
+  float cost;
+} LsTileEdgeOverride;
+
+/**
+ * A link to add (spec §6.3). Endpoints are positions and are snapped to their containing nodes.
+ */
+typedef struct LsLinkDesc {
+  uint64_t id;
+  struct LsVec3 from;
+  struct LsVec3 to;
+  float cost;
+  /**
+   * Bitwise OR of `LinkFlags`.
+   */
+  uint32_t flags;
+} LsLinkDesc;
+
+/**
+ * A link traversal within a path: the node at `index` was reached by taking `link_id`.
+ */
+typedef struct LsPathLink {
+  uint64_t link_id;
+  uint32_t index;
+  /**
+   * Keeps the struct 16 bytes on every ABI regardless of how `u64` is aligned.
+   */
+  uint32_t _reserved;
+} LsPathLink;
 
 #define LsDir_ALL { LsDir_South, LsDir_North, LsDir_East, LsDir_West, }
 
@@ -104,14 +140,88 @@ enum LsStatus ls_tile_context_create(uint32_t width,
                                      struct LsContext **out);
 
 /**
+ * Create a tile context from explicit directed edge masks (spec §6.1 tier 2).
+ *
+ * `masks` holds one byte per node in the same layout as `ls_tile_context_create`; bit `d`
+ * set means the node may be left in direction `d` (0 = south/+row, 1 = north/-row,
+ * 2 = east/+col, 3 = west/-col). `overrides` (may be null when `overrides_len` is 0)
+ * lists the edges that change layer or cost.
+ */
+enum LsStatus ls_tile_context_create_edges(uint32_t width,
+                                           uint32_t height,
+                                           uint32_t layers,
+                                           const uint8_t *masks,
+                                           uintptr_t masks_len,
+                                           const struct LsTileEdgeOverride *overrides,
+                                           uintptr_t overrides_len,
+                                           struct LsContext **out);
+
+/**
  * Release a context and everything it owns. Null is a no-op.
  */
 void ls_context_destroy(struct LsContext *ctx);
 
 /**
+ * Node id for `(col, row, layer)`. `InvalidArgument` if outside the grid.
+ */
+enum LsStatus ls_node_id(const struct LsContext *ctx,
+                         uint32_t col,
+                         uint32_t row,
+                         uint32_t layer,
+                         uint32_t *out);
+
+/**
+ * `(col, row, layer)` of a node. Any out-pointer may be null to skip it.
+ */
+enum LsStatus ls_node_coords(const struct LsContext *ctx,
+                             uint32_t node,
+                             uint32_t *out_col,
+                             uint32_t *out_row,
+                             uint32_t *out_layer);
+
+/**
  * Center position of a node. `InvalidArgument` if `node` is out of range.
  */
 enum LsStatus ls_node_position(const struct LsContext *ctx, uint32_t node, struct LsVec3 *out);
+
+/**
+ * The node containing `pos`. `InvalidArgument` if outside the grid.
+ */
+enum LsStatus ls_node_from_position(const struct LsContext *ctx, struct LsVec3 pos, uint32_t *out);
+
+/**
+ * Open or close one directed edge (`node` leaving in `dir`). The reverse edge is untouched.
+ */
+enum LsStatus ls_tile_set_edge(struct LsContext *ctx, uint32_t node, uint8_t dir, bool passable);
+
+/**
+ * Set the layer/cost override for one directed edge (ramps, terrain costs).
+ */
+enum LsStatus ls_tile_set_edge_override(struct LsContext *ctx,
+                                        uint32_t node,
+                                        uint8_t dir,
+                                        uint32_t target_layer,
+                                        float cost);
+
+/**
+ * Remove an override, restoring "same layer, cost 1". Clearing a missing override is `Ok`.
+ */
+enum LsStatus ls_tile_clear_edge_override(struct LsContext *ctx, uint32_t node, uint8_t dir);
+
+/**
+ * Add a link, or replace the one with the same id. Endpoints must be inside the grid.
+ */
+enum LsStatus ls_link_add(struct LsContext *ctx, struct LsLinkDesc link);
+
+/**
+ * Remove a link. `InvalidArgument` if the id is unknown.
+ */
+enum LsStatus ls_link_remove(struct LsContext *ctx, uint64_t id);
+
+/**
+ * Enable or disable a link without removing it (unpowered teleporter, locked door).
+ */
+enum LsStatus ls_link_set_enabled(struct LsContext *ctx, uint64_t id, bool enabled);
 
 /**
  * Find a path between the nodes containing `start` and `goal`.
@@ -130,11 +240,25 @@ enum LsStatus ls_find_path(const struct LsContext *ctx,
 uintptr_t ls_path_len(const struct LsPath *path);
 
 /**
- * Copy the path's node ids into `out` (capacity `capacity`). `*written` receives the
- * count actually needed; if it exceeds `capacity`, nothing is copied and `BufferTooSmall` is returned.
+ * Total traversal cost of a path. Zero for a null handle.
+ */
+float ls_path_cost(const struct LsPath *path);
+
+/**
+ * Copy the path's node ids into `out` (capacity `capacity`). `*written` receives the count
+ * needed; if it exceeds `capacity`, nothing is copied and `BufferTooSmall` is returned.
  */
 enum LsStatus ls_path_nodes(const struct LsPath *path,
                             uint32_t *out,
+                            uintptr_t capacity,
+                            uintptr_t *written);
+
+/**
+ * Copy the path's link traversals into `out`. Same buffer convention as [`ls_path_nodes`].
+ * A path with no link traversals writes zero and returns `Ok`.
+ */
+enum LsStatus ls_path_links(const struct LsPath *path,
+                            struct LsPathLink *out,
                             uintptr_t capacity,
                             uintptr_t *written);
 

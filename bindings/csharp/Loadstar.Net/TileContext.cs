@@ -30,6 +30,20 @@ public static class Library
     }
 }
 
+/// <summary>A path result: node ids plus which arrivals happened via a link (spec §8).</summary>
+public sealed class Path
+{
+    /// <summary>Includes both endpoints.</summary>
+    public uint[] Nodes { get; }
+
+    /// <summary>Sparse: one entry per node that was reached by taking a link.</summary>
+    public PathLink[] Links { get; }
+
+    public float Cost { get; }
+
+    internal Path(uint[] nodes, PathLink[] links, float cost) { Nodes = nodes; Links = links; Cost = cost; }
+}
+
 /// <summary>A tile-grid context (spec §4). Dispose releases the native handle.</summary>
 public sealed class TileContext : IDisposable
 {
@@ -48,9 +62,73 @@ public sealed class TileContext : IDisposable
         return new TileContext(h);
     }
 
-    /// <summary>Node ids from the node containing <paramref name="start"/> to the one containing
+    /// <summary>
+    /// Build from explicit directed edge masks (same layout as <see cref="FromWalkable"/>; bit index =
+    /// <see cref="Dir"/>) plus the edges that change layer or cost.
+    /// </summary>
+    public static TileContext FromEdges(uint width, uint height, uint layers, byte[] masks, TileEdgeOverride[]? overrides = null)
+    {
+        var count = overrides?.Length ?? 0;
+        Native.ls_tile_context_create_edges(width, height, layers, masks, (UIntPtr)masks.Length,
+                count == 0 ? null : overrides, (UIntPtr)count, out var h)
+            .ThrowIfError(nameof(Native.ls_tile_context_create_edges));
+        return new TileContext(h);
+    }
+
+    // --- Nodes ---
+
+    public uint NodeId(uint col, uint row, uint layer = 0)
+    {
+        Native.ls_node_id(_handle, col, row, layer, out var id).ThrowIfError(nameof(Native.ls_node_id));
+        return id;
+    }
+
+    public (uint Col, uint Row, uint Layer) NodeCoords(uint node)
+    {
+        Native.ls_node_coords(_handle, node, out var c, out var r, out var l).ThrowIfError(nameof(Native.ls_node_coords));
+        return (c, r, l);
+    }
+
+    public Vec3 NodePosition(uint node)
+    {
+        Native.ls_node_position(_handle, node, out var p).ThrowIfError(nameof(Native.ls_node_position));
+        return p;
+    }
+
+    public uint NodeFromPosition(Vec3 position)
+    {
+        Native.ls_node_from_position(_handle, position, out var id).ThrowIfError(nameof(Native.ls_node_from_position));
+        return id;
+    }
+
+    // --- Edges and links ---
+
+    /// <summary>Open or close one directed edge; the reverse edge is untouched.</summary>
+    public void SetEdge(uint node, Dir dir, bool passable) =>
+        Native.ls_tile_set_edge(_handle, node, dir, passable).ThrowIfError(nameof(Native.ls_tile_set_edge));
+
+    /// <summary>Make one directed edge change layer and/or cost (ramps, terrain).</summary>
+    public void SetEdgeOverride(uint node, Dir dir, uint targetLayer, float cost = 1f) =>
+        Native.ls_tile_set_edge_override(_handle, node, dir, targetLayer, cost).ThrowIfError(nameof(Native.ls_tile_set_edge_override));
+
+    public void ClearEdgeOverride(uint node, Dir dir) =>
+        Native.ls_tile_clear_edge_override(_handle, node, dir).ThrowIfError(nameof(Native.ls_tile_clear_edge_override));
+
+    /// <summary>Add a link, or replace the one with the same id.</summary>
+    public void AddLink(LinkDesc link) =>
+        Native.ls_link_add(_handle, link).ThrowIfError(nameof(Native.ls_link_add));
+
+    public void RemoveLink(ulong id) =>
+        Native.ls_link_remove(_handle, id).ThrowIfError(nameof(Native.ls_link_remove));
+
+    public void SetLinkEnabled(ulong id, bool enabled) =>
+        Native.ls_link_set_enabled(_handle, id, enabled).ThrowIfError(nameof(Native.ls_link_set_enabled));
+
+    // --- Paths ---
+
+    /// <summary>Path from the node containing <paramref name="start"/> to the one containing
     /// <paramref name="goal"/>, or null if no route exists.</summary>
-    public uint[]? FindPath(Vec3 start, Vec3 goal)
+    public Path? FindPath(Vec3 start, Vec3 goal)
     {
         var status = Native.ls_find_path(_handle, start, goal, out var path);
         if (status == Status.NoPath) return null;
@@ -61,14 +139,15 @@ public sealed class TileContext : IDisposable
             var nodes = new uint[(int)(ulong)Native.ls_path_len(path)];
             Native.ls_path_nodes(path, nodes, (UIntPtr)nodes.Length, out _)
                 .ThrowIfError(nameof(Native.ls_path_nodes));
-            return nodes;
-        }
-    }
 
-    public Vec3 NodePosition(uint node)
-    {
-        Native.ls_node_position(_handle, node, out var p).ThrowIfError(nameof(Native.ls_node_position));
-        return p;
+            Native.ls_path_links(path, null, UIntPtr.Zero, out var needed);
+            var links = new PathLink[(int)(ulong)needed];
+            if (links.Length > 0)
+                Native.ls_path_links(path, links, (UIntPtr)links.Length, out _)
+                    .ThrowIfError(nameof(Native.ls_path_links));
+
+            return new Path(nodes, links, Native.ls_path_cost(path));
+        }
     }
 
     public void Dispose() => _handle.Dispose();
