@@ -1,0 +1,10 @@
+[package]
+name = "loadstar-core"
+description = "Engine-agnostic navigation and spatial-awareness core for game accessibility mods"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[dev-dependencies]

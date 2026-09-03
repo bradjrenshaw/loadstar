@@ -1,0 +1,13 @@
+[package]
+name = "loadstar-ffi"
+description = "C ABI for Loadstar (cdylib). Translation layer only — all logic lives in loadstar-core."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[lib]
+name = "loadstar"
+crate-type = ["cdylib"]
+
+[dependencies]
+loadstar-core.workspace = true
