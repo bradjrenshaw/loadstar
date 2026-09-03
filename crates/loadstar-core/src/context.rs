@@ -30,6 +30,25 @@ pub struct PathOptions {
     /// within this many rings that has edges and is not blocked. 0 disables snapping.
     pub snap_radius: u32,
     pub goal_mode: GoalMode,
+    /// Agent profile id from `register_profile`. 0 is the built-in one-cell agent.
+    pub profile: u32,
+}
+
+/// An agent's size (spec §7). Tile grids honour `footprint` (side of the square block of
+/// cells the agent occupies, anchored at its node); the other fields are carried for mesh
+/// maps and future use.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Profile {
+    pub footprint: u32,
+    pub radius: f32,
+    pub height: f32,
+    pub step_height: f32,
+}
+
+impl Default for Profile {
+    fn default() -> Self {
+        Profile { footprint: 1, radius: 0.5, height: 1.0, step_height: 0.0 }
+    }
 }
 
 /// An entity's cached projection, remembering the blocking it contributed so a later
@@ -47,6 +66,8 @@ pub struct TileContext {
     entity_groups: Vec<u32>,
     registry: Registry,
     projections: HashMap<EntityId, Projection>,
+    /// Index 0 is the built-in default agent.
+    profiles: Vec<Profile>,
 }
 
 impl TileContext {
@@ -58,7 +79,29 @@ impl TileContext {
             entity_groups: vec![0; n],
             registry: Registry::default(),
             projections: HashMap::new(),
+            profiles: vec![Profile::default()],
         }
+    }
+
+    // --- Profiles ----------------------------------------------------------------------
+
+    /// Register an agent profile and get its id. `None` if the footprint is 0 or over 255.
+    pub fn register_profile(&mut self, profile: Profile) -> Option<u32> {
+        if profile.footprint == 0 || profile.footprint > 255 {
+            return None;
+        }
+        self.profiles.push(profile);
+        Some(self.profiles.len() as u32 - 1)
+    }
+
+    pub fn profile(&self, id: u32) -> Option<&Profile> {
+        self.profiles.get(id as usize)
+    }
+
+    /// Whether an agent of this footprint may occupy `node`. Footprint 1 never consults the
+    /// clearance field, so the default profile costs nothing.
+    fn fits(&self, node: NodeId, footprint: u32) -> bool {
+        footprint <= 1 || self.grid.clearance(node) as u32 >= footprint
     }
 
     pub fn grid(&self) -> &TileGrid {
@@ -208,37 +251,43 @@ impl TileContext {
     }
 
     /// Path from the node containing `start` to the cheapest of `targets`, interpreted per
-    /// `opts.goal_mode`. Target ids must be in range.
+    /// `opts.goal_mode`. Target ids must be in range; `opts.profile` must be registered.
     pub fn find_path_to_nodes(&self, start: Vec3, targets: &[NodeId], opts: PathOptions) -> Option<Path> {
         if targets.iter().any(|&t| t as usize >= self.manual_groups.len()) {
             return None;
         }
-        let start = self.snap_start(self.grid.node_from_position(start)?, opts)?;
+        let footprint = self.profile(opts.profile)?.footprint;
+        let start = self.snap_start(self.grid.node_from_position(start)?, opts, footprint)?;
         let (goals, exempt): (Vec<NodeId>, HashSet<NodeId>) = match opts.goal_mode {
             GoalMode::Onto => (targets.to_vec(), targets.iter().copied().collect()),
             GoalMode::Adjacent => (self.grid.adjacent_candidates(targets), HashSet::new()),
         };
-        let is_blocked = |n: NodeId| self.effective_groups(n) & opts.blocked_mask != 0 && !exempt.contains(&n);
+        // Group blocking may be exempted for targets; fitting never is.
+        let is_blocked = |n: NodeId| {
+            !self.fits(n, footprint) || (self.effective_groups(n) & opts.blocked_mask != 0 && !exempt.contains(&n))
+        };
         astar_query(&self.grid, &Query { start, goals: &goals, is_blocked: &is_blocked })
     }
 
     /// Reachability from the node containing `start`, indexed by node id.
-    /// `None` if `start` is off-grid (or cannot be snapped).
+    /// `None` if `start` is off-grid (or cannot be snapped) or the profile is unknown.
     pub fn reachable(&self, start: Vec3, opts: PathOptions) -> Option<Vec<bool>> {
-        let start = self.snap_start(self.grid.node_from_position(start)?, opts)?;
-        let is_blocked = |n: NodeId| self.effective_groups(n) & opts.blocked_mask != 0;
+        let footprint = self.profile(opts.profile)?.footprint;
+        let start = self.snap_start(self.grid.node_from_position(start)?, opts, footprint)?;
+        let is_blocked = |n: NodeId| !self.fits(n, footprint) || self.effective_groups(n) & opts.blocked_mask != 0;
         Some(flood_fill(&self.grid, start, &is_blocked))
     }
 
-    /// The start is usable as-is if an agent can stand there (it has edges); blocking is
-    /// irrelevant because the agent is already there. Otherwise snap to the nearest node
-    /// that has edges and is not blocked.
-    fn snap_start(&self, node: NodeId, opts: PathOptions) -> Option<NodeId> {
+    /// The start is usable as-is if an agent can stand there (it has edges); blocking and
+    /// fit are irrelevant because the agent is already there. Otherwise snap to the nearest
+    /// node that has edges, fits, and is not blocked.
+    fn snap_start(&self, node: NodeId, opts: PathOptions, footprint: u32) -> Option<NodeId> {
         if self.grid.has_edges(node) {
             return Some(node);
         }
-        self.grid
-            .nearest_node(node, opts.snap_radius, |n| self.grid.has_edges(n) && self.effective_groups(n) & opts.blocked_mask == 0)
+        self.grid.nearest_node(node, opts.snap_radius, |n| {
+            self.grid.has_edges(n) && self.fits(n, footprint) && self.effective_groups(n) & opts.blocked_mask == 0
+        })
     }
 }
 
@@ -385,6 +434,28 @@ mod tests {
         assert_eq!(c.find_path_to_entity(cell(0, 1), 42, opts), None);
 
         assert_eq!(c.entity_nearest_point(1, cell(0, 1)), Some(Vec3::new(4.0, 0.0, 1.5)));
+    }
+
+    #[test]
+    fn profiles_gate_paths_by_clearance() {
+        // 4x3 open grid with a wall at (1,1): a 2x2 agent only fits anchored at (2,0)/(2,1).
+        let mut w = [1u8; 12];
+        w[5] = 0;
+        let mut c = TileContext::new(TileGrid::from_walkable(4, 3, 1, &w).unwrap());
+        let big = c.register_profile(Profile { footprint: 2, ..Default::default() }).unwrap();
+        assert_eq!(big, 1);
+        assert_eq!(c.register_profile(Profile { footprint: 0, ..Default::default() }), None);
+
+        let small = PathOptions::default();
+        let wide = PathOptions { profile: big, ..Default::default() };
+        assert_eq!(c.find_path(cell(0, 0), cell(2, 1), small).unwrap().nodes.len(), 4);
+        assert_eq!(c.find_path(cell(0, 0), cell(2, 1), wide), None, "no 2x2-clear route out of the corner");
+        assert_eq!(c.find_path(cell(2, 0), cell(2, 1), wide).unwrap().nodes.len(), 2, "between the two anchors that fit");
+        assert_eq!(c.find_path(cell(0, 0), cell(2, 1), PathOptions { profile: 9, ..Default::default() }), None, "unknown profile");
+
+        let reach = c.reachable(cell(2, 0), wide).unwrap();
+        assert_eq!(reach.iter().filter(|&&r| r).count(), 2, "only the two fitting anchors are reachable for the big agent");
+        assert_eq!(c.reachable(cell(2, 0), small).unwrap().iter().filter(|&&r| r).count(), 11);
     }
 
     #[test]

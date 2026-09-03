@@ -9,6 +9,7 @@
 //! and swamp costs; links express everything that isn't cell-to-adjacent-cell. All three
 //! are what a game's movement rules get baked into once per map load.
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
 
 use crate::geometry::{Bounds, Vec3};
@@ -97,6 +98,8 @@ pub struct TileGrid {
     link_entrances: Vec<(u32, u32)>,
     /// Cheapest ordinary step; scales the Manhattan heuristic so it stays admissible.
     min_step_cost: f32,
+    /// Per-node clearance (spec §7), computed on first use and dropped whenever edges change.
+    clearance: OnceCell<Vec<u8>>,
 }
 
 impl TileGrid {
@@ -159,7 +162,46 @@ impl TileGrid {
             link_index: HashMap::new(),
             link_entrances: Vec::new(),
             min_step_cost: 1.0,
+            clearance: OnceCell::new(),
         })
+    }
+
+    // --- Clearance (agent size) -------------------------------------------------------
+
+    /// Largest `k` such that the `k × k` block of cells whose top-left corner is `node` is
+    /// entirely standable (every cell has edges), on the node's layer. 0 for walls. Capped at
+    /// 255. An agent with footprint `f` may occupy `node` iff `clearance(node) >= f`.
+    pub fn clearance(&self, node: NodeId) -> u8 {
+        self.clearance_field().get(node as usize).copied().unwrap_or(0)
+    }
+
+    fn clearance_field(&self) -> &[u8] {
+        self.clearance.get_or_init(|| {
+            let (w, h, per_layer) = (self.width as usize, self.height as usize, (self.width * self.height) as usize);
+            let mut field = vec![0u8; self.edges.len()];
+            for layer in 0..self.layers as usize {
+                let base = layer * per_layer;
+                // Bottom-right to top-left: a block fits here if this cell stands and the
+                // three blocks to the east, south and south-east each fit one size smaller.
+                for r in (0..h).rev() {
+                    for c in (0..w).rev() {
+                        let i = base + r * w + c;
+                        if !self.has_edges(i as NodeId) {
+                            continue;
+                        }
+                        let east = if c + 1 < w { field[i + 1] } else { 0 };
+                        let south = if r + 1 < h { field[i + w] } else { 0 };
+                        let diag = if c + 1 < w && r + 1 < h { field[i + w + 1] } else { 0 };
+                        field[i] = east.min(south).min(diag).saturating_add(1);
+                    }
+                }
+            }
+            field
+        })
+    }
+
+    fn invalidate_clearance(&mut self) {
+        self.clearance.take();
     }
 
     pub fn width(&self) -> u32 {
@@ -352,6 +394,7 @@ impl TileGrid {
         } else {
             *mask &= !dir.bit();
         }
+        self.invalidate_clearance();
         Ok(())
     }
 
@@ -417,6 +460,7 @@ impl TileGrid {
     }
 
     fn rebuild_link_index(&mut self) {
+        self.invalidate_clearance(); // `has_edges` counts links
         self.link_index.clear();
         self.link_entrances.clear();
         for (&id, link) in &self.links {
@@ -715,6 +759,28 @@ mod tests {
         // Radius 1 around a cell center covers the plus shape, not the diagonals.
         let sp = Bounds::Sphere { center: Vec3::new(1.5, 0.0, 1.5), radius: 1.0 };
         assert_eq!(g.project(&sp), vec![1, 4, 5, 6, 9]);
+    }
+
+    #[test]
+    fn clearance_measures_square_footprints_and_tracks_edits() {
+        // 4x3 open grid with a wall at (1,1).
+        let mut w = [1u8; 12];
+        w[5] = 0;
+        let mut g = TileGrid::from_walkable(4, 3, 1, &w).unwrap();
+        let at = |g: &TileGrid, c, r| g.clearance(g.node_id(c, r, 0).unwrap());
+        assert_eq!(at(&g, 1, 1), 0, "wall");
+        assert_eq!(at(&g, 0, 0), 1, "2x2 here would include the wall");
+        assert_eq!(at(&g, 2, 0), 2, "2x2 at (2,0) covers (2..3, 0..1)");
+        assert_eq!(at(&g, 2, 1), 2);
+        assert_eq!(at(&g, 3, 2), 1, "grid edge");
+
+        // Sealing off (2,0) shrinks every block that used it; the cache must notice.
+        for d in Dir::ALL {
+            g.set_edge(g.node_id(2, 0, 0).unwrap(), d, false).unwrap();
+        }
+        assert_eq!(at(&g, 2, 0), 0, "cache was invalidated by the edit");
+        assert_eq!(at(&g, 2, 1), 2, "blocks that never used (2,0) are unaffected");
+        assert_eq!(at(&g, 3, 0), 1);
     }
 
     #[test]

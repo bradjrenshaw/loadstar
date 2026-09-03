@@ -9,7 +9,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use loadstar_core::context::{GoalMode as CoreGoalMode, PathOptions as CorePathOptions, TileContext};
+use loadstar_core::context::{GoalMode as CoreGoalMode, PathOptions as CorePathOptions, Profile, TileContext};
 use loadstar_core::entities::{Entity, SyncStats as CoreSyncStats};
 use loadstar_core::geometry::Bounds;
 use loadstar_core::graph::LinkId;
@@ -92,7 +92,7 @@ pub enum GoalMode {
     Adjacent = 1,
 }
 
-/// Per-query options. A zeroed struct means: nothing blocked, no snapping, `Onto`.
+/// Per-query options. A zeroed struct means: nothing blocked, no snapping, `Onto`, default agent.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PathOptions {
@@ -102,6 +102,8 @@ pub struct PathOptions {
     pub snap_radius: u32,
     /// A `GoalMode` discriminant.
     pub goal_mode: u32,
+    /// Agent profile id from `ls_profile_register`; 0 = built-in one-cell agent.
+    pub profile: u32,
 }
 
 impl PathOptions {
@@ -111,8 +113,19 @@ impl PathOptions {
             1 => CoreGoalMode::Adjacent,
             _ => return None,
         };
-        Some(CorePathOptions { blocked_mask: self.blocked_mask, snap_radius: self.snap_radius, goal_mode })
+        Some(CorePathOptions { blocked_mask: self.blocked_mask, snap_radius: self.snap_radius, goal_mode, profile: self.profile })
     }
+}
+
+/// An agent's size (spec §7). Tile grids honour `footprint` (side of the square block of
+/// cells the agent occupies, anchored at its node, 1–255); the rest is carried for mesh maps.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ProfileDesc {
+    pub footprint: u32,
+    pub radius: f32,
+    pub height: f32,
+    pub step_height: f32,
 }
 
 /// Shape of a [`BoundsDesc`] (spec §5 "Bounds").
@@ -452,6 +465,48 @@ fn with_ctx_mut(ctx: *mut Context, f: impl FnOnce(&mut TileContext) -> Status) -
 
 fn with_grid(ctx: *mut Context, f: impl FnOnce(&mut TileGrid) -> Result<(), GridError>) -> Status {
     with_ctx_mut(ctx, |c| status_of(f(c.grid_mut())))
+}
+
+// ---------------------------------------------------------------------------
+// Profiles
+// ---------------------------------------------------------------------------
+
+/// Register an agent profile; `*out` receives its id for `PathOptions.profile`.
+/// `InvalidArgument` if the footprint is 0 or over 255.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_profile_register(ctx: *mut Context, profile: ProfileDesc, out: *mut u32) -> Status {
+    with_ctx_mut(ctx, |c| {
+        if out.is_null() {
+            return Status::NullPointer;
+        }
+        let p = Profile { footprint: profile.footprint, radius: profile.radius, height: profile.height, step_height: profile.step_height };
+        match c.register_profile(p) {
+            // SAFETY: `out` non-null checked; caller guarantees it is writable.
+            Some(id) => unsafe {
+                *out = id;
+                Status::Ok
+            },
+            None => Status::InvalidArgument,
+        }
+    })
+}
+
+/// Clearance of a node: the largest square footprint that fits anchored there (0 = wall).
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_node_clearance(ctx: *const Context, node: u32, out: *mut u32) -> Status {
+    guard(|| {
+        if ctx.is_null() || out.is_null() {
+            return Status::NullPointer;
+        }
+        // SAFETY: non-null checked; a live context handle.
+        let grid = unsafe { &*ctx }.0.grid();
+        if grid.node_coords(node).is_none() {
+            return Status::InvalidArgument;
+        }
+        // SAFETY: `out` non-null checked; caller guarantees it is writable.
+        unsafe { *out = grid.clearance(node) as u32 };
+        Status::Ok
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -888,7 +943,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<LinkDesc>(), 40);
         assert_eq!(std::mem::size_of::<PathLink>(), 16);
         assert_eq!(std::mem::size_of::<Status>(), 4);
-        assert_eq!(std::mem::size_of::<PathOptions>(), 12);
+        assert_eq!(std::mem::size_of::<PathOptions>(), 16);
+        assert_eq!(std::mem::size_of::<ProfileDesc>(), 16);
         assert_eq!(std::mem::size_of::<BoundsDesc>(), 40);
         assert_eq!(std::mem::size_of::<EntityDesc>(), 64);
         assert_eq!(std::mem::size_of::<SyncStats>(), 16);
@@ -912,7 +968,7 @@ mod tests {
         assert_eq!(guard(|| panic!("boom")), Status::Panic);
     }
 
-    const DEFAULT_OPTS: PathOptions = PathOptions { blocked_mask: 0, snap_radius: 0, goal_mode: 0 };
+    const DEFAULT_OPTS: PathOptions = PathOptions { blocked_mask: 0, snap_radius: 0, goal_mode: 0, profile: 0 };
 
     fn cell(col: f32, row: f32) -> Vec3 {
         Vec3::new(col + 0.5, 0.0, row + 0.5)
@@ -1036,18 +1092,18 @@ mod tests {
         assert_eq!(mask, NPC);
         assert_eq!(ls_node_get_groups(ctx, 99, &mut mask), Status::InvalidArgument);
 
-        let blocked = PathOptions { blocked_mask: NPC, snap_radius: 0, goal_mode: 0 };
+        let blocked = PathOptions { blocked_mask: NPC, snap_radius: 0, goal_mode: 0, profile: 0 };
         let mut path = std::ptr::null_mut();
         assert_eq!(ls_find_path(ctx, cell(0.0, 1.0), cell(4.0, 1.0), blocked, &mut path), Status::Ok);
         assert_eq!(ls_path_len(path), 7, "detours around the NPC");
         ls_path_free(path);
 
-        let adjacent = PathOptions { blocked_mask: NPC, snap_radius: 0, goal_mode: 1 };
+        let adjacent = PathOptions { blocked_mask: NPC, snap_radius: 0, goal_mode: 1, profile: 0 };
         assert_eq!(ls_find_path_to_nodes(ctx, cell(0.0, 1.0), &npc, 1, adjacent, &mut path), Status::Ok);
         assert_eq!(ls_path_len(path), 2, "stops next to the NPC: (0,1) -> (1,1)");
         ls_path_free(path);
         assert_eq!(ls_find_path_to_nodes(ctx, cell(0.0, 1.0), &99, 1, adjacent, &mut path), Status::InvalidArgument);
-        let bad_mode = PathOptions { blocked_mask: 0, snap_radius: 0, goal_mode: 7 };
+        let bad_mode = PathOptions { blocked_mask: 0, snap_radius: 0, goal_mode: 7, profile: 0 };
         assert_eq!(ls_find_path(ctx, cell(0.0, 1.0), cell(4.0, 1.0), bad_mode, &mut path), Status::InvalidArgument);
 
         let mut reach = [0u8; 15];
@@ -1101,7 +1157,7 @@ mod tests {
         assert_eq!(&nodes[..n], &[7]);
         assert_eq!(ls_entity_nodes(ctx, 99, nodes.as_mut_ptr(), 4, &mut n), Status::InvalidArgument);
 
-        let opts = PathOptions { blocked_mask: NPC, snap_radius: 0, goal_mode: 0 };
+        let opts = PathOptions { blocked_mask: NPC, snap_radius: 0, goal_mode: 0, profile: 0 };
         let mut path = std::ptr::null_mut();
         assert_eq!(ls_find_path_to_entity(ctx, cell(0.0, 1.0), 10, opts, &mut path), Status::Ok);
         assert_eq!(ls_path_len(path), 2, "adjacent flag: stops next to the NPC");
@@ -1129,6 +1185,38 @@ mod tests {
         assert_eq!(ls_entity_upsert(ctx, &bad), Status::InvalidArgument);
         assert_eq!(ls_entities_sync(ctx, std::ptr::null(), 0, std::ptr::null_mut()), Status::Ok, "empty snapshot clears");
         assert_eq!(ls_entity_count(ctx), 0);
+        ls_context_destroy(ctx);
+    }
+
+    #[test]
+    fn profiles_through_the_abi() {
+        // 4x3 open grid with a wall at (1,1).
+        let mut w = [1u8; 12];
+        w[5] = 0;
+        let mut ctx = std::ptr::null_mut();
+        assert_eq!(ls_tile_context_create(4, 3, 1, w.as_ptr(), 12, &mut ctx), Status::Ok);
+
+        let mut clearance = 0;
+        assert_eq!(ls_node_clearance(ctx, 2, &mut clearance), Status::Ok);
+        assert_eq!(clearance, 2);
+        assert_eq!(ls_node_clearance(ctx, 5, &mut clearance), Status::Ok);
+        assert_eq!(clearance, 0);
+        assert_eq!(ls_node_clearance(ctx, 99, &mut clearance), Status::InvalidArgument);
+
+        let mut big = 0;
+        let desc = ProfileDesc { footprint: 2, radius: 1.0, height: 2.0, step_height: 0.5 };
+        assert_eq!(ls_profile_register(ctx, desc, &mut big), Status::Ok);
+        assert_eq!(big, 1);
+        assert_eq!(ls_profile_register(ctx, ProfileDesc { footprint: 0, ..desc }, &mut big), Status::InvalidArgument);
+
+        let wide = PathOptions { blocked_mask: 0, snap_radius: 0, goal_mode: 0, profile: 1 };
+        let mut path = std::ptr::null_mut();
+        assert_eq!(ls_find_path(ctx, cell(0.0, 0.0), cell(2.0, 1.0), wide, &mut path), Status::NoPath);
+        assert_eq!(ls_find_path(ctx, cell(2.0, 0.0), cell(2.0, 1.0), wide, &mut path), Status::Ok);
+        assert_eq!(ls_path_len(path), 2);
+        ls_path_free(path);
+        let unknown = PathOptions { profile: 7, ..wide };
+        assert_eq!(ls_find_path(ctx, cell(2.0, 0.0), cell(2.0, 1.0), unknown, &mut path), Status::NoPath);
         ls_context_destroy(ctx);
     }
 

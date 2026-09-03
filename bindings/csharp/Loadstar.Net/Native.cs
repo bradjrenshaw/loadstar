@@ -105,10 +105,26 @@ public struct PathOptions
     /// <summary>Ring radius for start snapping when the start has no edges; 0 disables.</summary>
     public uint SnapRadius;
     public GoalMode GoalMode;
+    /// <summary>Agent profile id from <see cref="TileContext.RegisterProfile"/>; 0 = built-in one-cell agent.</summary>
+    public uint Profile;
 
-    public PathOptions(uint blockedMask, uint snapRadius = 0, GoalMode goalMode = GoalMode.Onto)
+    public PathOptions(uint blockedMask, uint snapRadius = 0, GoalMode goalMode = GoalMode.Onto, uint profile = 0)
     {
-        BlockedMask = blockedMask; SnapRadius = snapRadius; GoalMode = goalMode;
+        BlockedMask = blockedMask; SnapRadius = snapRadius; GoalMode = goalMode; Profile = profile;
+    }
+}
+
+/// <summary>Mirrors <c>LsProfileDesc</c>: an agent's size. Tile grids honour <see cref="Footprint"/>
+/// (side of the square block of cells the agent occupies, 1–255).</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct ProfileDesc
+{
+    public uint Footprint;
+    public float Radius, Height, StepHeight;
+
+    public ProfileDesc(uint footprint, float radius = 0.5f, float height = 1f, float stepHeight = 0f)
+    {
+        Footprint = footprint; Radius = radius; Height = height; StepHeight = stepHeight;
     }
 }
 
@@ -260,6 +276,10 @@ internal static class Native
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_link_add(ContextHandle context, LinkDesc link);
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_link_remove(ContextHandle context, ulong id);
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_link_set_enabled(ContextHandle context, ulong id, [MarshalAs(UnmanagedType.U1)] bool enabled);
+
+    // Profiles
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_profile_register(ContextHandle context, ProfileDesc profile, out uint id);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_node_clearance(ContextHandle context, uint node, out uint clearance);
 
     // Node groups
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_node_get_groups(ContextHandle context, uint node, out uint mask);

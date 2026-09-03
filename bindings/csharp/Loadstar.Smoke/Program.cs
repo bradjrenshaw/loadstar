@@ -13,7 +13,7 @@ Console.WriteLine($"ABI version {Library.AbiVersion} OK");
 
 Expect(Marshal.SizeOf(typeof(Vec3)) == 12 && Marshal.SizeOf(typeof(TileEdgeOverride)) == 16
     && Marshal.SizeOf(typeof(LinkDesc)) == 40 && Marshal.SizeOf(typeof(PathLink)) == 16
-    && Marshal.SizeOf(typeof(Bounds)) == 40 && Marshal.SizeOf(typeof(EntityDesc)) == 64 && Marshal.SizeOf(typeof(SyncStats)) == 16,
+    && Marshal.SizeOf(typeof(Bounds)) == 40 && Marshal.SizeOf(typeof(EntityDesc)) == 64 && Marshal.SizeOf(typeof(SyncStats)) == 16 && Marshal.SizeOf(typeof(PathOptions)) == 16 && Marshal.SizeOf(typeof(ProfileDesc)) == 16,
     "marshaled struct sizes match the ABI");
 
 var sum = Library.Add(new Vec3(1, 2, 3), new Vec3(10, 20, 30));
@@ -127,6 +127,22 @@ using (var ctx = TileContext.FromWalkable(W, H, 1, cells))
 
     try { ctx.EntityNodes(30); Expect(false, "removed entity should throw"); }
     catch (LoadstarException e) { Expect(e.Status == Status.InvalidArgument, $"removed entity → {e.Status}"); }
+}
+
+// --- Agent profiles: a 2x2 agent on a 4x3 grid with a wall at (1,1). ---
+{
+    var grid = Enumerable.Repeat((byte)1, 12).ToArray();
+    grid[5] = 0;
+    using var ctx = TileContext.FromWalkable(4, 3, 1, grid);
+    Expect(ctx.NodeClearance(ctx.NodeId(2, 0)) == 2 && ctx.NodeClearance(ctx.NodeId(0, 0)) == 1 && ctx.NodeClearance(ctx.NodeId(1, 1)) == 0,
+        "clearance field: 2 at (2,0), 1 at (0,0), 0 at the wall");
+    var big = ctx.RegisterProfile(new ProfileDesc(footprint: 2));
+    Expect(big == 1, $"registered profile id {big}");
+    Expect(ctx.FindPath(Vec3.Cell(0, 0), Vec3.Cell(2, 1)) != null, "one-cell agent leaves the corner");
+    Expect(ctx.FindPath(Vec3.Cell(0, 0), Vec3.Cell(2, 1), new PathOptions(0, profile: big)) == null, "2x2 agent cannot leave the corner");
+    Expect(ctx.FindPath(Vec3.Cell(2, 0), Vec3.Cell(2, 1), new PathOptions(0, profile: big))!.Nodes.Length == 2, "2x2 agent moves between the two anchors that fit");
+    try { ctx.RegisterProfile(new ProfileDesc(footprint: 0)); Expect(false, "footprint 0 should throw"); }
+    catch (LoadstarException e) { Expect(e.Status == Status.InvalidArgument, $"footprint 0 → {e.Status}"); }
 }
 
 // --- Tier 2: explicit masks + a ramp override between two layers. ---

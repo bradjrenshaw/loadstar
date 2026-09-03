@@ -129,6 +129,22 @@ public sealed class TileContext : IDisposable
     public void SetLinkEnabled(ulong id, bool enabled) =>
         Native.ls_link_set_enabled(_handle, id, enabled).ThrowIfError(nameof(Native.ls_link_set_enabled));
 
+    // --- Profiles ---
+
+    /// <summary>Register an agent size; use the returned id in <see cref="PathOptions.Profile"/>.</summary>
+    public uint RegisterProfile(ProfileDesc profile)
+    {
+        Native.ls_profile_register(_handle, profile, out var id).ThrowIfError(nameof(Native.ls_profile_register));
+        return id;
+    }
+
+    /// <summary>Largest square footprint that fits anchored at the node (0 = wall).</summary>
+    public uint NodeClearance(uint node)
+    {
+        Native.ls_node_clearance(_handle, node, out var c).ThrowIfError(nameof(Native.ls_node_clearance));
+        return c;
+    }
+
     // --- Node groups (blocking overlay) ---
 
     public uint NodeGroups(uint node)

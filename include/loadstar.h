@@ -82,6 +82,17 @@ typedef struct LsTileEdgeOverride {
 } LsTileEdgeOverride;
 
 /**
+ * An agent's size (spec §7). Tile grids honour `footprint` (side of the square block of
+ * cells the agent occupies, anchored at its node, 1–255); the rest is carried for mesh maps.
+ */
+typedef struct LsProfileDesc {
+  uint32_t footprint;
+  float radius;
+  float height;
+  float step_height;
+} LsProfileDesc;
+
+/**
  * A link to add (spec §6.3). Endpoints are positions and are snapped to their containing nodes.
  */
 typedef struct LsLinkDesc {
@@ -147,7 +158,7 @@ typedef struct LsSyncStats {
 } LsSyncStats;
 
 /**
- * Per-query options. A zeroed struct means: nothing blocked, no snapping, `Onto`.
+ * Per-query options. A zeroed struct means: nothing blocked, no snapping, `Onto`, default agent.
  */
 typedef struct LsPathOptions {
   /**
@@ -162,6 +173,10 @@ typedef struct LsPathOptions {
    * A `GoalMode` discriminant.
    */
   uint32_t goal_mode;
+  /**
+   * Agent profile id from `ls_profile_register`; 0 = built-in one-cell agent.
+   */
+  uint32_t profile;
 } LsPathOptions;
 
 /**
@@ -257,6 +272,19 @@ enum LsStatus ls_node_position(const struct LsContext *ctx, uint32_t node, struc
  * The node containing `pos`. `InvalidArgument` if outside the grid.
  */
 enum LsStatus ls_node_from_position(const struct LsContext *ctx, struct LsVec3 pos, uint32_t *out);
+
+/**
+ * Register an agent profile; `*out` receives its id for `PathOptions.profile`.
+ * `InvalidArgument` if the footprint is 0 or over 255.
+ */
+enum LsStatus ls_profile_register(struct LsContext *ctx,
+                                  struct LsProfileDesc profile,
+                                  uint32_t *out);
+
+/**
+ * Clearance of a node: the largest square footprint that fits anchored there (0 = wall).
+ */
+enum LsStatus ls_node_clearance(const struct LsContext *ctx, uint32_t node, uint32_t *out);
 
 /**
  * Group bitmask of a node. `InvalidArgument` if out of range.
