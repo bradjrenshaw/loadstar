@@ -100,6 +100,8 @@ pub struct TileGrid {
     min_step_cost: f32,
     /// Per-node clearance (spec §7), computed on first use and dropped whenever edges change.
     clearance: OnceCell<Vec<u8>>,
+    /// Bumped on every connectivity change; caches compare it to know they are stale.
+    version: u64,
 }
 
 impl TileGrid {
@@ -163,7 +165,19 @@ impl TileGrid {
             link_entrances: Vec::new(),
             min_step_cost: 1.0,
             clearance: OnceCell::new(),
+            version: 0,
         })
+    }
+
+    /// Changes whenever edges, overrides or links change. Equal versions mean identical
+    /// connectivity, so derived data (reachability sets) can be reused.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    fn touch(&mut self) {
+        self.version += 1;
+        self.invalidate_clearance();
     }
 
     // --- Clearance (agent size) -------------------------------------------------------
@@ -394,7 +408,7 @@ impl TileGrid {
         } else {
             *mask &= !dir.bit();
         }
-        self.invalidate_clearance();
+        self.touch();
         Ok(())
     }
 
@@ -410,6 +424,7 @@ impl TileGrid {
         check_cost(ov.cost)?;
         self.overrides.insert((node, dir), ov);
         self.min_step_cost = self.min_step_cost.min(ov.cost);
+        self.version += 1;
         Ok(())
     }
 
@@ -417,6 +432,7 @@ impl TileGrid {
         let removed = self.overrides.remove(&(node, dir)).is_some();
         if removed {
             self.min_step_cost = self.overrides.values().map(|o| o.cost).fold(1.0, f32::min);
+            self.version += 1;
         }
         removed
     }
@@ -460,7 +476,7 @@ impl TileGrid {
     }
 
     fn rebuild_link_index(&mut self) {
-        self.invalidate_clearance(); // `has_edges` counts links
+        self.touch(); // `has_edges` counts links, and reachability changes
         self.link_index.clear();
         self.link_entrances.clear();
         for (&id, link) in &self.links {

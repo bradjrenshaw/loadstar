@@ -201,6 +201,87 @@ public struct SyncStats
     public override string ToString() => $"+{Added} ~{Updated} -{Removed}";
 }
 
+/// <summary>Mirrors <c>LsEntityVector</c>: announcement geometry relative to the player.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct EntityVector
+{
+    public Vec3 NearestPoint;
+    /// <summary>Degrees clockwise from north (-Z), in [0, 360).</summary>
+    public float BearingDeg;
+    /// <summary>Degrees above (+) or below (-) horizontal.</summary>
+    public float ElevationDeg;
+    public float Distance;
+    /// <summary>Horizontal Manhattan distance (grid step count).</summary>
+    public float Steps;
+}
+
+/// <summary>Mirrors <c>LsFilterKind</c>.</summary>
+public enum FilterKind : uint
+{
+    Reachable = 0,
+    Range = 1,
+    Categories = 2,
+    Flags = 3,
+}
+
+/// <summary>Mirrors <c>LsFilterDesc</c> (32 bytes). A tracker visibility rule — data, never a callback.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct FilterDesc
+{
+    public FilterKind Kind;
+    private uint _enabled;
+    public uint P0, P1;
+    public ulong Mask;
+    public float Value;
+    private uint _reserved;
+
+    public bool Enabled { get => _enabled != 0; set => _enabled = value ? 1u : 0u; }
+
+    /// <summary>Entity (or a node beside it) is reachable from the player.</summary>
+    public static FilterDesc Reachable(uint profile, uint blockedMask, bool enabled = true) =>
+        new() { Kind = FilterKind.Reachable, P0 = profile, P1 = blockedMask, Enabled = enabled };
+
+    /// <summary>Entity's nearest point is within this distance of the player.</summary>
+    public static FilterDesc Range(float maxDistance, bool enabled = true) =>
+        new() { Kind = FilterKind.Range, Value = maxDistance, Enabled = enabled };
+
+    /// <summary>Category must be one of the (at most 64) categories set in the mask.</summary>
+    public static FilterDesc Categories(ulong mask, bool enabled = true) =>
+        new() { Kind = FilterKind.Categories, Mask = mask, Enabled = enabled };
+
+    /// <summary>All <paramref name="require"/> bits set and no <paramref name="forbid"/> bit set.</summary>
+    public static FilterDesc Flags(EntityFlags require, EntityFlags forbid, bool enabled = true) =>
+        new() { Kind = FilterKind.Flags, P0 = (uint)require, P1 = (uint)forbid, Enabled = enabled };
+}
+
+/// <summary>Mirrors <c>LsTrackerAction</c>.</summary>
+public enum TrackerAction : uint
+{
+    Next = 0,
+    Prev = 1,
+    CategoryNext = 2,
+    CategoryPrev = 3,
+    /// <summary>Re-report the current selection without moving.</summary>
+    Current = 4,
+}
+
+/// <summary>Mirrors <c>LsSelection</c>. <see cref="EntityId"/> 0 means nothing is selected.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct Selection
+{
+    public const uint AllCategories = uint.MaxValue;
+
+    public ulong EntityId;
+    /// <summary>The selected entity's category, or the tracker's current category (or <see cref="AllCategories"/>) when nothing is selected.</summary>
+    public uint Category;
+    /// <summary>Position of the selection in cycle order.</summary>
+    public uint Index;
+
+    public bool IsNone => EntityId == 0;
+
+    public override string ToString() => IsNone ? $"(none, category {Category})" : $"(entity {EntityId}, category {Category}, #{Index})";
+}
+
 public sealed class LoadstarException : Exception
 {
     public Status Status { get; }
@@ -297,6 +378,17 @@ internal static class Native
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_entity_nearest_point(ContextHandle context, ulong id, Vec3 from, out Vec3 point);
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_find_path_to_entity(ContextHandle context, Vec3 start, ulong id, PathOptions options, out PathHandle path);
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_entity_reachable(ContextHandle context, Vec3 start, ulong id, PathOptions options, [MarshalAs(UnmanagedType.U1)] out bool reachable);
+
+    // Player, announcement data, trackers
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_player_set(ContextHandle context, Vec3 position);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_entity_vector(ContextHandle context, ulong id, out EntityVector vector);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_entity_reachable_from_player(ContextHandle context, ulong id, uint profile, uint blockedMask, [MarshalAs(UnmanagedType.U1)] out bool reachable);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_tracker_create(ContextHandle context, FilterDesc[]? filters, UIntPtr filtersLen, [MarshalAs(UnmanagedType.U1)] bool includeAll, out uint tracker);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_tracker_destroy(ContextHandle context, uint tracker);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_tracker_set_filters(ContextHandle context, uint tracker, FilterDesc[]? filters, UIntPtr filtersLen);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_tracker_set_filter_enabled(ContextHandle context, uint tracker, UIntPtr index, [MarshalAs(UnmanagedType.U1)] bool enabled);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_tracker_act(ContextHandle context, uint tracker, TrackerAction action, out Selection selection);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_tracker_count(ContextHandle context, uint tracker, uint category, out uint count);
 
     // Paths and reachability
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_find_path(ContextHandle context, Vec3 start, Vec3 goal, PathOptions options, out PathHandle path);

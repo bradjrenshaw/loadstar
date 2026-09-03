@@ -224,6 +224,65 @@ public sealed class TileContext : IDisposable
         return reachable;
     }
 
+    // --- Player, announcement data, trackers ---
+
+    /// <summary>Update the player's position (each frame). A real move invalidates cached reachability.</summary>
+    public void SetPlayer(Vec3 position) =>
+        Native.ls_player_set(_handle, position).ThrowIfError(nameof(Native.ls_player_set));
+
+    /// <summary>Bearing, elevation, distance and step count from the player to the entity's nearest point.</summary>
+    public EntityVector EntityVector(ulong id)
+    {
+        Native.ls_entity_vector(_handle, id, out var v).ThrowIfError(nameof(Native.ls_entity_vector));
+        return v;
+    }
+
+    /// <summary>Cached reachability of an entity from the player — cheap to call per announcement.</summary>
+    public bool EntityReachableFromPlayer(ulong id, uint profile = 0, uint blockedMask = 0)
+    {
+        var status = Native.ls_entity_reachable_from_player(_handle, id, profile, blockedMask, out var reachable);
+        if (status == Status.NoPath) return false;
+        status.ThrowIfError(nameof(Native.ls_entity_reachable_from_player));
+        return reachable;
+    }
+
+    /// <summary>Create a tracker (a selection state machine) with a declarative, AND-combined filter list.
+    /// The core has no built-in visibility rules — even hiding is just a <see cref="FilterDesc.Flags"/> filter.</summary>
+    public uint CreateTracker(FilterDesc[]? filters = null, bool includeAll = true)
+    {
+        var count = filters?.Length ?? 0;
+        Native.ls_tracker_create(_handle, count == 0 ? null : filters, (UIntPtr)count, includeAll, out var id)
+            .ThrowIfError(nameof(Native.ls_tracker_create));
+        return id;
+    }
+
+    public void DestroyTracker(uint tracker) =>
+        Native.ls_tracker_destroy(_handle, tracker).ThrowIfError(nameof(Native.ls_tracker_destroy));
+
+    public void SetTrackerFilters(uint tracker, FilterDesc[]? filters)
+    {
+        var count = filters?.Length ?? 0;
+        Native.ls_tracker_set_filters(_handle, tracker, count == 0 ? null : filters, (UIntPtr)count)
+            .ThrowIfError(nameof(Native.ls_tracker_set_filters));
+    }
+
+    /// <summary>Enable or disable one filter by index — the hotkey-toggle primitive.</summary>
+    public void SetTrackerFilterEnabled(uint tracker, int index, bool enabled) =>
+        Native.ls_tracker_set_filter_enabled(_handle, tracker, (UIntPtr)index, enabled).ThrowIfError(nameof(Native.ls_tracker_set_filter_enabled));
+
+    public Selection TrackerAct(uint tracker, TrackerAction action)
+    {
+        Native.ls_tracker_act(_handle, tracker, action, out var s).ThrowIfError(nameof(Native.ls_tracker_act));
+        return s;
+    }
+
+    /// <summary>Visible entity count under the tracker's filters, in one category or all.</summary>
+    public uint TrackerCount(uint tracker, uint category = Selection.AllCategories)
+    {
+        Native.ls_tracker_count(_handle, tracker, category, out var n).ThrowIfError(nameof(Native.ls_tracker_count));
+        return n;
+    }
+
     // --- Paths and reachability ---
 
     /// <summary>Path from the node containing <paramref name="start"/> to the one containing

@@ -180,6 +180,61 @@ typedef struct LsPathOptions {
 } LsPathOptions;
 
 /**
+ * Announcement geometry for an entity relative to the player (spec §8). Pure geometry.
+ */
+typedef struct LsEntityVector {
+  /**
+   * Closest point of the entity's bounds to the player.
+   */
+  struct LsVec3 nearest_point;
+  /**
+   * Degrees clockwise from north (-Z), in `[0, 360)`.
+   */
+  float bearing_deg;
+  /**
+   * Degrees above (+) or below (-) horizontal.
+   */
+  float elevation_deg;
+  /**
+   * Straight-line distance.
+   */
+  float distance;
+  /**
+   * Horizontal Manhattan distance (grid step count).
+   */
+  float steps;
+} LsEntityVector;
+
+/**
+ * A tracker filter, 32 bytes. Filters are data the core evaluates — never callbacks.
+ */
+typedef struct LsFilterDesc {
+  uint32_t kind;
+  /**
+   * Nonzero = enabled.
+   */
+  uint32_t enabled;
+  uint32_t p0;
+  uint32_t p1;
+  uint64_t mask;
+  float value;
+  uint32_t _reserved;
+} LsFilterDesc;
+
+/**
+ * Result of [`ls_tracker_act`]. `entity_id == 0` means nothing is selected; `category` is
+ * then the tracker's current category, or `UINT32_MAX` for the all-categories view.
+ */
+typedef struct LsSelection {
+  uint64_t entity_id;
+  uint32_t category;
+  /**
+   * Position of the selection in cycle order.
+   */
+  uint32_t index;
+} LsSelection;
+
+/**
  * A link traversal within a path: the node at `index` was reached by taking `link_id`.
  */
 typedef struct LsPathLink {
@@ -408,6 +463,75 @@ enum LsStatus ls_entity_reachable(const struct LsContext *ctx,
                                   uint64_t id,
                                   struct LsPathOptions opts,
                                   bool *out);
+
+/**
+ * Update the player's position (each frame). A real move invalidates cached reachability.
+ */
+enum LsStatus ls_player_set(struct LsContext *ctx, struct LsVec3 position);
+
+/**
+ * Bearing, elevation, distance and step count from the player to an entity's nearest point.
+ */
+enum LsStatus ls_entity_vector(const struct LsContext *ctx,
+                               uint64_t id,
+                               struct LsEntityVector *out);
+
+/**
+ * [`ls_entity_reachable`] from the player's position, using the reachability cache — cheap
+ * to call per announcement. `NoPath` if the player is off-grid.
+ */
+enum LsStatus ls_entity_reachable_from_player(const struct LsContext *ctx,
+                                              uint64_t id,
+                                              uint32_t profile,
+                                              uint32_t blocked_mask,
+                                              bool *out);
+
+/**
+ * Create a tracker with an initial filter list (may be empty; `filters` may then be null).
+ * `include_all` adds an all-categories view ahead of the per-category views.
+ */
+enum LsStatus ls_tracker_create(struct LsContext *ctx,
+                                const struct LsFilterDesc *filters,
+                                uintptr_t filters_len,
+                                bool include_all,
+                                uint32_t *out);
+
+/**
+ * Destroy a tracker. `InvalidArgument` if unknown.
+ */
+enum LsStatus ls_tracker_destroy(struct LsContext *ctx, uint32_t tracker);
+
+/**
+ * Replace a tracker's filter list wholesale. The selection is re-validated on the next action.
+ */
+enum LsStatus ls_tracker_set_filters(struct LsContext *ctx,
+                                     uint32_t tracker,
+                                     const struct LsFilterDesc *filters,
+                                     uintptr_t filters_len);
+
+/**
+ * Enable or disable one filter by index (hotkey toggles).
+ */
+enum LsStatus ls_tracker_set_filter_enabled(struct LsContext *ctx,
+                                            uint32_t tracker,
+                                            uintptr_t index,
+                                            bool enabled);
+
+/**
+ * Drive a tracker. `action` is a `TrackerAction` discriminant.
+ */
+enum LsStatus ls_tracker_act(struct LsContext *ctx,
+                             uint32_t tracker,
+                             uint32_t action,
+                             struct LsSelection *out);
+
+/**
+ * Visible entity count under the tracker's filters, in `category` or (`UINT32_MAX`) all.
+ */
+enum LsStatus ls_tracker_count(const struct LsContext *ctx,
+                               uint32_t tracker,
+                               uint32_t category,
+                               uint32_t *out);
 
 /**
  * Find a path from the node containing `start` to the node containing `goal`.

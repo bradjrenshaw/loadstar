@@ -3,12 +3,39 @@
 //! overlay derived from them. This is the only place entities and the map meet, and they
 //! meet exclusively through projection (spec §2).
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use crate::entities::{Change, Entity, EntityId, Registry, SyncStats, flags};
 use crate::geometry::Vec3;
 use crate::graph::{NodeId, Path, Query, astar_query, flood_fill};
 use crate::tile::TileGrid;
+use crate::tracker::{Action, Filter, Selection, Tracker};
+
+/// Announcement data for an entity relative to the player (spec §8 `entity_vector`).
+/// Pure geometry; the companion decides how to phrase it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EntityVector {
+    /// Closest point of the entity's bounds to the player.
+    pub nearest_point: Vec3,
+    /// Compass bearing to that point, degrees clockwise from north (-Z), in `[0, 360)`.
+    pub bearing_deg: f32,
+    /// Angle above (+) or below (-) the horizontal plane, degrees.
+    pub elevation_deg: f32,
+    /// Straight-line distance.
+    pub distance: f32,
+    /// Horizontal Manhattan distance — the natural step count on a 4-connected grid.
+    pub steps: f32,
+}
+
+/// Reachability sets keyed by `(profile, blocked_mask)`, valid for one `(grid, overlay)`
+/// version pair. Cleared wholesale when either changes.
+#[derive(Default)]
+struct ReachCache {
+    stamp: (u64, u64),
+    sets: HashMap<(u32, u32), Rc<Vec<bool>>>,
+}
 
 /// How a set of target nodes is treated as a destination (spec §8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -68,6 +95,11 @@ pub struct TileContext {
     projections: HashMap<EntityId, Projection>,
     /// Index 0 is the built-in default agent.
     profiles: Vec<Profile>,
+    player: Vec3,
+    /// Bumped whenever groups or the player position change (the grid has its own version).
+    overlay_version: u64,
+    reach_cache: RefCell<ReachCache>,
+    trackers: Vec<Option<Tracker>>,
 }
 
 impl TileContext {
@@ -80,7 +112,190 @@ impl TileContext {
             registry: Registry::default(),
             projections: HashMap::new(),
             profiles: vec![Profile::default()],
+            player: Vec3::default(),
+            overlay_version: 0,
+            reach_cache: RefCell::new(ReachCache::default()),
+            trackers: Vec::new(),
         }
+    }
+
+    // --- Player ------------------------------------------------------------------------
+
+    /// Update the player's position (each frame). A real move invalidates cached reachability.
+    pub fn set_player_position(&mut self, pos: Vec3) {
+        if self.player != pos {
+            self.player = pos;
+            self.overlay_version += 1;
+        }
+    }
+
+    pub fn player_position(&self) -> Vec3 {
+        self.player
+    }
+
+    /// Reachability from the player under `(profile, blocked_mask)`, cached until the grid,
+    /// the groups or the player position change. `None` if the player is off-grid or the
+    /// profile is unknown.
+    pub fn reachable_from_player(&self, profile: u32, blocked_mask: u32) -> Option<Rc<Vec<bool>>> {
+        let stamp = (self.grid.version(), self.overlay_version);
+        let mut cache = self.reach_cache.borrow_mut();
+        if cache.stamp != stamp {
+            cache.stamp = stamp;
+            cache.sets.clear();
+        }
+        if let Some(set) = cache.sets.get(&(profile, blocked_mask)) {
+            return Some(Rc::clone(set));
+        }
+        let set = Rc::new(self.reachable(self.player, PathOptions { blocked_mask, profile, ..Default::default() })?);
+        cache.sets.insert((profile, blocked_mask), Rc::clone(&set));
+        Some(set)
+    }
+
+    /// [`Self::entity_reachable`] against the cached reachability from the player.
+    pub fn entity_reachable_from_player(&self, id: EntityId, profile: u32, blocked_mask: u32) -> Option<bool> {
+        let reached = self.reachable_from_player(profile, blocked_mask)?;
+        self.entity_reachable(&reached, id)
+    }
+
+    /// Announcement geometry for an entity relative to the player.
+    pub fn entity_vector(&self, id: EntityId) -> Option<EntityVector> {
+        let nearest_point = self.entity_nearest_point(id, self.player)?;
+        let d = nearest_point - self.player;
+        let horizontal = d.horizontal_length();
+        let bearing = if horizontal == 0.0 { 0.0 } else { d.x.atan2(-d.z).to_degrees().rem_euclid(360.0) };
+        let elevation = if horizontal == 0.0 && d.y == 0.0 { 0.0 } else { d.y.atan2(horizontal).to_degrees() };
+        Some(EntityVector {
+            nearest_point,
+            bearing_deg: bearing,
+            elevation_deg: elevation,
+            distance: d.length(),
+            steps: d.manhattan_horizontal(),
+        })
+    }
+
+    // --- Trackers ----------------------------------------------------------------------
+
+    /// Add a tracker; returns its id. Ids of destroyed trackers are reused.
+    pub fn tracker_create(&mut self, tracker: Tracker) -> u32 {
+        if let Some(slot) = self.trackers.iter().position(Option::is_none) {
+            self.trackers[slot] = Some(tracker);
+            return slot as u32;
+        }
+        self.trackers.push(Some(tracker));
+        self.trackers.len() as u32 - 1
+    }
+
+    pub fn tracker_destroy(&mut self, id: u32) -> bool {
+        match self.trackers.get_mut(id as usize) {
+            Some(slot) if slot.is_some() => {
+                *slot = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn tracker(&self, id: u32) -> Option<&Tracker> {
+        self.trackers.get(id as usize)?.as_ref()
+    }
+
+    pub fn tracker_mut(&mut self, id: u32) -> Option<&mut Tracker> {
+        self.trackers.get_mut(id as usize)?.as_mut()
+    }
+
+    /// Drive a tracker. `None` for an unknown tracker id.
+    pub fn tracker_act(&mut self, id: u32, action: Action) -> Option<Selection> {
+        let mut tracker = self.trackers.get_mut(id as usize)?.take()?;
+        let result = self.act(&mut tracker, action);
+        self.trackers[id as usize] = Some(tracker);
+        Some(result)
+    }
+
+    /// Visible entity count under the tracker's filters, in one category or (`None`) all.
+    pub fn tracker_count(&self, id: u32, category: Option<u16>) -> Option<u32> {
+        let tracker = self.tracker(id)?;
+        Some(self.registry.iter().filter(|e| category.is_none_or(|c| e.category == c) && self.passes(tracker, e)).count() as u32)
+    }
+
+    fn act(&self, t: &mut Tracker, action: Action) -> Selection {
+        match action {
+            Action::CategoryNext | Action::CategoryPrev => {
+                let categories = self.tracker_categories(t);
+                t.selected = None;
+                if categories.is_empty() {
+                    return Selection::none(t.current_category());
+                }
+                let next = match categories.iter().position(|c| *c == t.category) {
+                    Some(p) if action == Action::CategoryNext => (p + 1) % categories.len(),
+                    Some(p) => (p + categories.len() - 1) % categories.len(),
+                    None => 0,
+                };
+                t.category = categories[next];
+                Selection::none(t.current_category())
+            }
+            Action::Next | Action::Prev | Action::Current => {
+                if !t.include_all && t.category.is_none() {
+                    t.category = self.tracker_categories(t).first().copied().flatten();
+                }
+                let list = self.tracker_visible(t);
+                let position = t.selected.and_then(|s| list.iter().position(|e| e.id == s));
+                let index = match (action, position) {
+                    (_, _) if list.is_empty() => None,
+                    (Action::Current, p) => p,
+                    (Action::Next, Some(p)) => Some((p + 1) % list.len()),
+                    (Action::Next, None) => Some(0),
+                    (Action::Prev, Some(p)) => Some((p + list.len() - 1) % list.len()),
+                    (Action::Prev, None) => Some(list.len() - 1),
+                    _ => None,
+                };
+                match index {
+                    Some(i) => {
+                        let e = list[i];
+                        t.selected = Some(e.id);
+                        Selection { entity_id: e.id, category: u32::from(e.category), index: i as u32 }
+                    }
+                    None => {
+                        t.selected = None;
+                        Selection::none(t.current_category())
+                    }
+                }
+            }
+        }
+    }
+
+    /// Categories in cycle order: the ALL view first if configured, then every category
+    /// that currently has a visible entity, ascending.
+    fn tracker_categories(&self, t: &Tracker) -> Vec<Option<u16>> {
+        let mut cats: Vec<u16> = self.registry.iter().filter(|e| self.passes(t, e)).map(|e| e.category).collect();
+        cats.sort_unstable();
+        cats.dedup();
+        let mut out = Vec::with_capacity(cats.len() + 1);
+        if t.include_all {
+            out.push(None);
+        }
+        out.extend(cats.into_iter().map(Some));
+        out
+    }
+
+    /// Visible entities in the tracker's current category (or all), in cycle order
+    /// `(category, sort_key, id)`.
+    fn tracker_visible(&self, t: &Tracker) -> Vec<&Entity> {
+        let mut list: Vec<&Entity> = self
+            .registry
+            .iter()
+            .filter(|e| t.category.is_none_or(|c| e.category == c) && self.passes(t, e))
+            .collect();
+        list.sort_by_key(|e| (e.category, e.sort_key, e.id));
+        list
+    }
+
+    fn passes(&self, t: &Tracker, e: &Entity) -> bool {
+        t.filters.iter().filter(|f| f.enabled).all(|f| match f.filter {
+            Filter::Reachable { profile, blocked_mask } => self.entity_reachable_from_player(e.id, profile, blocked_mask) == Some(true),
+            Filter::Range { max_distance } => (e.bounds.nearest_point(self.player) - self.player).length() <= max_distance,
+            Filter::Categories { mask } => e.category < 64 && mask & (1u64 << e.category) != 0,
+            Filter::Flags { require, forbid } => e.flags & require == require && e.flags & forbid == 0,
+        })
     }
 
     // --- Profiles ----------------------------------------------------------------------
@@ -120,19 +335,23 @@ impl TileContext {
     }
 
     pub fn set_groups(&mut self, node: NodeId, mask: u32) -> bool {
+        self.overlay_version += 1;
         self.manual_groups.get_mut(node as usize).map(|g| *g = mask).is_some()
     }
 
     pub fn add_groups(&mut self, node: NodeId, mask: u32) -> bool {
+        self.overlay_version += 1;
         self.manual_groups.get_mut(node as usize).map(|g| *g |= mask).is_some()
     }
 
     pub fn remove_groups(&mut self, node: NodeId, mask: u32) -> bool {
+        self.overlay_version += 1;
         self.manual_groups.get_mut(node as usize).map(|g| *g &= !mask).is_some()
     }
 
     /// Remove `mask` from every node's manual groups. Entity-derived groups are unaffected.
     pub fn clear_groups(&mut self, mask: u32) {
+        self.overlay_version += 1;
         for g in &mut self.manual_groups {
             *g &= !mask;
         }
@@ -207,6 +426,7 @@ impl TileContext {
     }
 
     fn rebuild_entity_groups(&mut self) {
+        self.overlay_version += 1;
         self.entity_groups.iter_mut().for_each(|g| *g = 0);
         for p in self.projections.values().filter(|p| p.blocking != 0) {
             for &n in &p.nodes {
@@ -295,6 +515,7 @@ impl TileContext {
 mod tests {
     use super::*;
     use crate::geometry::Bounds;
+    use crate::tracker::{ALL, Action, Filter, Selection, Tracker};
 
     const NPC: u32 = 1 << 0;
     const EXIT: u32 = 1 << 1;
@@ -456,6 +677,119 @@ mod tests {
         let reach = c.reachable(cell(2, 0), wide).unwrap();
         assert_eq!(reach.iter().filter(|&&r| r).count(), 2, "only the two fitting anchors are reachable for the big agent");
         assert_eq!(c.reachable(cell(2, 0), small).unwrap().iter().filter(|&&r| r).count(), 11);
+    }
+
+    fn chest(id: u64, col: u32, row: u32, sort_key: u32) -> Entity {
+        Entity { id, category: 3, bounds: rect(col, row, 1, 1), blocking: 0, flags: 0, sort_key }
+    }
+
+    fn filters(list: &[Filter]) -> Vec<crate::tracker::FilterEntry> {
+        list.iter().map(|&filter| crate::tracker::FilterEntry { filter, enabled: true }).collect()
+    }
+
+    #[test]
+    fn entity_vector_reports_bearing_distance_and_steps() {
+        let mut c = ctx();
+        c.sync_entities(&[chest(1, 4, 1, 0), exit(2, 0, 0, 1)]);
+        c.set_player_position(cell(0, 1));
+        let v = c.entity_vector(1).unwrap();
+        assert_eq!(v.nearest_point, Vec3::new(4.0, 0.0, 1.5));
+        assert_eq!((v.bearing_deg, v.elevation_deg), (90.0, 0.0), "due east");
+        assert_eq!((v.distance, v.steps), (3.5, 3.5));
+        let north = c.entity_vector(2).unwrap();
+        assert!((north.bearing_deg - 0.0).abs() < 1e-3, "due north, got {}", north.bearing_deg);
+        assert_eq!(c.entity_vector(9), None);
+    }
+
+    #[test]
+    fn reachability_cache_tracks_every_kind_of_change() {
+        let mut c = ctx();
+        c.set_player_position(cell(0, 1));
+        let a = c.reachable_from_player(0, NPC).unwrap();
+        assert!(Rc::ptr_eq(&a, &c.reachable_from_player(0, NPC).unwrap()), "same stamp: shared set");
+        assert!(a.iter().all(|&r| r));
+
+        c.sync_entities(&[npc(1, 2, 0), npc(2, 2, 1), npc(3, 2, 2)]);
+        let b = c.reachable_from_player(0, NPC).unwrap();
+        assert!(!Rc::ptr_eq(&a, &b), "entity groups changed → recomputed");
+        assert!(!b[c.grid().node_id(4, 1, 0).unwrap() as usize]);
+
+        c.grid_mut().add_link(1, crate::tile::Link { from: 5, to: 9, cost: 1.0, bidirectional: false, enabled: true }).unwrap();
+        assert!(c.reachable_from_player(0, NPC).unwrap()[9], "grid change → recomputed, teleporter crosses the wall");
+
+        c.set_player_position(cell(4, 1));
+        assert!(c.reachable_from_player(0, NPC).unwrap()[14], "player moved → recomputed from the new side");
+        assert_eq!(c.reachable_from_player(0, NPC).unwrap().iter().filter(|&&r| r).count(), 6, "the east side only");
+    }
+
+    #[test]
+    fn tracker_cycles_entities_in_sort_order_and_categories_ascending() {
+        let mut c = ctx();
+        c.sync_entities(&[chest(30, 3, 0, 1), chest(31, 1, 0, 0), npc(10, 4, 2), exit(20, 4, 0, 1)]);
+        let t = c.tracker_create(Tracker::new(Vec::new(), true));
+        assert_eq!(t, 0);
+
+        // ALL view first: entities ordered by (category, sort_key, id) → npc(1), exit(2), chests(3).
+        assert_eq!(c.tracker_act(t, Action::Next), Some(Selection { entity_id: 10, category: 1, index: 0 }));
+        assert_eq!(c.tracker_act(t, Action::Next), Some(Selection { entity_id: 20, category: 2, index: 1 }));
+        assert_eq!(c.tracker_act(t, Action::Next).unwrap().entity_id, 31, "sort_key 0 before sort_key 1");
+        assert_eq!(c.tracker_act(t, Action::Next).unwrap().entity_id, 30);
+        assert_eq!(c.tracker_act(t, Action::Next).unwrap().entity_id, 10, "wraps");
+        assert_eq!(c.tracker_act(t, Action::Prev).unwrap().entity_id, 30, "wraps backwards");
+        assert_eq!(c.tracker_act(t, Action::Current).unwrap().index, 3);
+        assert_eq!(c.tracker_count(t, None), Some(4));
+
+        // Category cycling: ALL → 1 → 2 → 3 → ALL; selection resets.
+        assert_eq!(c.tracker_act(t, Action::CategoryNext), Some(Selection::none(1)));
+        assert_eq!(c.tracker_act(t, Action::CategoryNext), Some(Selection::none(2)));
+        assert_eq!(c.tracker_act(t, Action::CategoryNext), Some(Selection::none(3)));
+        assert_eq!(c.tracker_count(t, Some(3)), Some(2));
+        assert_eq!(c.tracker_act(t, Action::Next).unwrap().entity_id, 31);
+        assert_eq!(c.tracker_act(t, Action::CategoryNext), Some(Selection::none(ALL)));
+        assert_eq!(c.tracker_act(t, Action::CategoryPrev), Some(Selection::none(3)));
+
+        // The selected entity vanishing: Current reports nothing, Next restarts.
+        c.sync_entities(&[chest(30, 3, 0, 1), npc(10, 4, 2), exit(20, 4, 0, 1)]);
+        assert_eq!(c.tracker_act(t, Action::Next).unwrap().entity_id, 30);
+        c.sync_entities(&[npc(10, 4, 2), exit(20, 4, 0, 1)]);
+        assert_eq!(c.tracker_act(t, Action::Current), Some(Selection::none(3)));
+        assert_eq!(c.tracker_act(t, Action::CategoryNext), Some(Selection::none(ALL)), "category 3 is gone");
+        assert_eq!(c.tracker_act(9, Action::Next), None);
+        assert!(c.tracker_destroy(t) && !c.tracker_destroy(t));
+        assert_eq!(c.tracker_create(Tracker::new(Vec::new(), false)), 0, "slot reused");
+    }
+
+    #[test]
+    fn filters_are_data_and_combine_with_and() {
+        let mut c = ctx();
+        c.set_player_position(cell(0, 1));
+        // Two chests east of a wall of NPCs; one chest is hidden by convention.
+        let mut hidden = chest(32, 4, 2, 0);
+        hidden.flags = flags::HIDDEN;
+        c.sync_entities(&[npc(1, 2, 0), npc(2, 2, 1), npc(3, 2, 2), chest(30, 4, 0, 0), chest(31, 1, 2, 0), hidden]);
+
+        let no_filters = c.tracker_create(Tracker::new(Vec::new(), true));
+        assert_eq!(c.tracker_count(no_filters, None), Some(6), "zero built-in rules: hidden is visible without a filter");
+
+        let default = c.tracker_create(Tracker::new(filters(&[Filter::Flags { require: 0, forbid: flags::HIDDEN }]), true));
+        assert_eq!(c.tracker_count(default, None), Some(5));
+
+        let reachable = c.tracker_create(Tracker::new(
+            filters(&[Filter::Flags { require: 0, forbid: flags::HIDDEN }, Filter::Reachable { profile: 0, blocked_mask: NPC }]),
+            true,
+        ));
+        assert_eq!(c.tracker_count(reachable, None), Some(4), "chest 30 is behind the NPC wall; the NPCs themselves are adjacent-reachable");
+        assert_eq!(c.tracker_count(reachable, Some(3)), Some(1));
+        assert!(c.tracker_mut(reachable).unwrap().set_filter_enabled(1, false));
+        assert_eq!(c.tracker_count(reachable, None), Some(5), "toggled off → plain default view");
+        assert!(!c.tracker_mut(reachable).unwrap().set_filter_enabled(7, true));
+
+        let nearby = c.tracker_create(Tracker::new(filters(&[Filter::Range { max_distance: 1.5 }]), true));
+        assert_eq!(c.tracker_count(nearby, None), Some(2), "npc(2,1) at 1.5 and chest 31 at ~1.4");
+
+        let chests_only = c.tracker_create(Tracker::new(filters(&[Filter::Categories { mask: 1 << 3 }]), false));
+        assert_eq!(c.tracker_act(chests_only, Action::Next).unwrap().category, 3, "without ALL, starts in the first available category");
+        assert_eq!(c.tracker_count(chests_only, None), Some(3));
     }
 
     #[test]

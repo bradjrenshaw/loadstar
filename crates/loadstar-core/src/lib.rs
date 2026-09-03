@@ -5,7 +5,7 @@
 //! 2. [`graph`] — A*, flood fill, goal candidates, segment compression
 //! 3. [`tile`] — tile grids (directed edges + links); nav meshes later
 //! 4. [`entities`] — numeric records, snapshot diffing
-//! 5. guide — trackers, filters, reachability
+//! 5. [`tracker`] — selection state machines with declarative filters
 //!
 //! [`context`] ties one map to the state that must stay consistent with it, and is where
 //! entities meet the map (projection into node sets).
@@ -19,3 +19,4 @@ pub mod entities;
 pub mod geometry;
 pub mod graph;
 pub mod tile;
+pub mod tracker;

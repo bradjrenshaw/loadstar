@@ -11,6 +11,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use loadstar_core::context::{GoalMode as CoreGoalMode, PathOptions as CorePathOptions, Profile, TileContext};
 use loadstar_core::entities::{Entity, SyncStats as CoreSyncStats};
+use loadstar_core::tracker::{Action as CoreAction, Filter, FilterEntry, Tracker};
 use loadstar_core::geometry::Bounds;
 use loadstar_core::graph::LinkId;
 use loadstar_core::tile::{Dir, EdgeOverride, GridError, Link, TileGrid};
@@ -224,6 +225,97 @@ pub struct SyncStats {
     pub updated: u32,
     pub removed: u32,
     pub _reserved: u32,
+}
+
+/// Announcement geometry for an entity relative to the player (spec §8). Pure geometry.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EntityVector {
+    /// Closest point of the entity's bounds to the player.
+    pub nearest_point: Vec3,
+    /// Degrees clockwise from north (-Z), in `[0, 360)`.
+    pub bearing_deg: f32,
+    /// Degrees above (+) or below (-) horizontal.
+    pub elevation_deg: f32,
+    /// Straight-line distance.
+    pub distance: f32,
+    /// Horizontal Manhattan distance (grid step count).
+    pub steps: f32,
+}
+
+/// Kinds of [`FilterDesc`] (spec §8).
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterKind {
+    /// `p0` = profile, `p1` = blocked mask.
+    Reachable = 0,
+    /// `value` = max distance to the entity's nearest point.
+    Range = 1,
+    /// `mask` = bit per category (categories 0–63).
+    Categories = 2,
+    /// `p0` = required flag bits, `p1` = forbidden flag bits.
+    Flags = 3,
+}
+
+/// A tracker filter, 32 bytes. Filters are data the core evaluates — never callbacks.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FilterDesc {
+    pub kind: u32,
+    /// Nonzero = enabled.
+    pub enabled: u32,
+    pub p0: u32,
+    pub p1: u32,
+    pub mask: u64,
+    pub value: f32,
+    pub _reserved: u32,
+}
+
+impl FilterDesc {
+    fn to_core(self) -> Option<FilterEntry> {
+        let filter = match self.kind {
+            0 => Filter::Reachable { profile: self.p0, blocked_mask: self.p1 },
+            1 => Filter::Range { max_distance: self.value },
+            2 => Filter::Categories { mask: self.mask },
+            3 => Filter::Flags { require: self.p0, forbid: self.p1 },
+            _ => return None,
+        };
+        Some(FilterEntry { filter, enabled: self.enabled != 0 })
+    }
+}
+
+/// Tracker actions (spec §8).
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackerAction {
+    Next = 0,
+    Prev = 1,
+    CategoryNext = 2,
+    CategoryPrev = 3,
+    /// Re-report the current selection without moving.
+    Current = 4,
+}
+
+/// Result of [`ls_tracker_act`]. `entity_id == 0` means nothing is selected; `category` is
+/// then the tracker's current category, or `UINT32_MAX` for the all-categories view.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub entity_id: u64,
+    pub category: u32,
+    /// Position of the selection in cycle order.
+    pub index: u32,
+}
+
+fn parse_filters(filters: *const FilterDesc, len: usize) -> Option<Vec<FilterEntry>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    if filters.is_null() {
+        return None;
+    }
+    // SAFETY: non-null checked; caller guarantees `filters` is readable for `len` entries.
+    unsafe { std::slice::from_raw_parts(filters, len) }.iter().map(|f| f.to_core()).collect()
 }
 
 impl From<CoreSyncStats> for SyncStats {
@@ -762,6 +854,174 @@ pub extern "C" fn ls_entity_reachable(ctx: *const Context, start: Vec3, id: u64,
 }
 
 // ---------------------------------------------------------------------------
+// Player, announcement data, trackers
+// ---------------------------------------------------------------------------
+
+/// Update the player's position (each frame). A real move invalidates cached reachability.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_player_set(ctx: *mut Context, position: Vec3) -> Status {
+    with_ctx_mut(ctx, |c| {
+        c.set_player_position(position);
+        Status::Ok
+    })
+}
+
+/// Bearing, elevation, distance and step count from the player to an entity's nearest point.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_entity_vector(ctx: *const Context, id: u64, out: *mut EntityVector) -> Status {
+    guard(|| {
+        if ctx.is_null() || out.is_null() {
+            return Status::NullPointer;
+        }
+        // SAFETY: non-null checked; a live context handle.
+        match unsafe { &*ctx }.0.entity_vector(id) {
+            // SAFETY: `out` non-null checked; caller guarantees it is writable.
+            Some(v) => unsafe {
+                *out = EntityVector {
+                    nearest_point: v.nearest_point,
+                    bearing_deg: v.bearing_deg,
+                    elevation_deg: v.elevation_deg,
+                    distance: v.distance,
+                    steps: v.steps,
+                };
+                Status::Ok
+            },
+            None => Status::InvalidArgument,
+        }
+    })
+}
+
+/// [`ls_entity_reachable`] from the player's position, using the reachability cache — cheap
+/// to call per announcement. `NoPath` if the player is off-grid.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_entity_reachable_from_player(ctx: *const Context, id: u64, profile: u32, blocked_mask: u32, out: *mut bool) -> Status {
+    guard(|| {
+        if ctx.is_null() || out.is_null() {
+            return Status::NullPointer;
+        }
+        // SAFETY: non-null checked; a live context handle.
+        let ctx = &unsafe { &*ctx }.0;
+        if ctx.entity(id).is_none() || ctx.profile(profile).is_none() {
+            return Status::InvalidArgument;
+        }
+        match ctx.entity_reachable_from_player(id, profile, blocked_mask) {
+            // SAFETY: `out` non-null checked; caller guarantees it is writable.
+            Some(r) => unsafe {
+                *out = r;
+                Status::Ok
+            },
+            None => Status::NoPath,
+        }
+    })
+}
+
+/// Create a tracker with an initial filter list (may be empty; `filters` may then be null).
+/// `include_all` adds an all-categories view ahead of the per-category views.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_tracker_create(
+    ctx: *mut Context,
+    filters: *const FilterDesc,
+    filters_len: usize,
+    include_all: bool,
+    out: *mut u32,
+) -> Status {
+    with_ctx_mut(ctx, |c| {
+        if out.is_null() {
+            return Status::NullPointer;
+        }
+        let Some(filters) = parse_filters(filters, filters_len) else { return Status::InvalidArgument };
+        let id = c.tracker_create(Tracker::new(filters, include_all));
+        // SAFETY: `out` non-null checked; caller guarantees it is writable.
+        unsafe { *out = id };
+        Status::Ok
+    })
+}
+
+/// Destroy a tracker. `InvalidArgument` if unknown.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_tracker_destroy(ctx: *mut Context, tracker: u32) -> Status {
+    with_ctx_mut(ctx, |c| if c.tracker_destroy(tracker) { Status::Ok } else { Status::InvalidArgument })
+}
+
+/// Replace a tracker's filter list wholesale. The selection is re-validated on the next action.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_tracker_set_filters(ctx: *mut Context, tracker: u32, filters: *const FilterDesc, filters_len: usize) -> Status {
+    with_ctx_mut(ctx, |c| {
+        let Some(filters) = parse_filters(filters, filters_len) else { return Status::InvalidArgument };
+        match c.tracker_mut(tracker) {
+            Some(t) => {
+                t.set_filters(filters);
+                Status::Ok
+            }
+            None => Status::InvalidArgument,
+        }
+    })
+}
+
+/// Enable or disable one filter by index (hotkey toggles).
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_tracker_set_filter_enabled(ctx: *mut Context, tracker: u32, index: usize, enabled: bool) -> Status {
+    with_ctx_mut(ctx, |c| match c.tracker_mut(tracker) {
+        Some(t) => {
+            if t.set_filter_enabled(index, enabled) { Status::Ok } else { Status::InvalidArgument }
+        }
+        None => Status::InvalidArgument,
+    })
+}
+
+/// Drive a tracker. `action` is a `TrackerAction` discriminant.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_tracker_act(ctx: *mut Context, tracker: u32, action: u32, out: *mut Selection) -> Status {
+    with_ctx_mut(ctx, |c| {
+        if out.is_null() {
+            return Status::NullPointer;
+        }
+        let action = match action {
+            0 => CoreAction::Next,
+            1 => CoreAction::Prev,
+            2 => CoreAction::CategoryNext,
+            3 => CoreAction::CategoryPrev,
+            4 => CoreAction::Current,
+            _ => return Status::InvalidArgument,
+        };
+        match c.tracker_act(tracker, action) {
+            // SAFETY: `out` non-null checked; caller guarantees it is writable.
+            Some(s) => unsafe {
+                *out = Selection { entity_id: s.entity_id, category: s.category, index: s.index };
+                Status::Ok
+            },
+            None => Status::InvalidArgument,
+        }
+    })
+}
+
+/// Visible entity count under the tracker's filters, in `category` or (`UINT32_MAX`) all.
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_tracker_count(ctx: *const Context, tracker: u32, category: u32, out: *mut u32) -> Status {
+    guard(|| {
+        if ctx.is_null() || out.is_null() {
+            return Status::NullPointer;
+        }
+        let category = match category {
+            u32::MAX => None,
+            c => match u16::try_from(c) {
+                Ok(c) => Some(c),
+                Err(_) => return Status::InvalidArgument,
+            },
+        };
+        // SAFETY: non-null checked; a live context handle.
+        match unsafe { &*ctx }.0.tracker_count(tracker, category) {
+            // SAFETY: `out` non-null checked; caller guarantees it is writable.
+            Some(n) => unsafe {
+                *out = n;
+                Status::Ok
+            },
+            None => Status::InvalidArgument,
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Paths
 // ---------------------------------------------------------------------------
 
@@ -945,6 +1205,9 @@ mod tests {
         assert_eq!(std::mem::size_of::<Status>(), 4);
         assert_eq!(std::mem::size_of::<PathOptions>(), 16);
         assert_eq!(std::mem::size_of::<ProfileDesc>(), 16);
+        assert_eq!(std::mem::size_of::<FilterDesc>(), 32);
+        assert_eq!(std::mem::size_of::<Selection>(), 16);
+        assert_eq!(std::mem::size_of::<EntityVector>(), 28);
         assert_eq!(std::mem::size_of::<BoundsDesc>(), 40);
         assert_eq!(std::mem::size_of::<EntityDesc>(), 64);
         assert_eq!(std::mem::size_of::<SyncStats>(), 16);
@@ -1217,6 +1480,63 @@ mod tests {
         ls_path_free(path);
         let unknown = PathOptions { profile: 7, ..wide };
         assert_eq!(ls_find_path(ctx, cell(2.0, 0.0), cell(2.0, 1.0), unknown, &mut path), Status::NoPath);
+        ls_context_destroy(ctx);
+    }
+
+    #[test]
+    fn trackers_through_the_abi() {
+        const NPC: u32 = 1;
+        // 5x3 corridor: NPC at (2,1), chest at (4,2), hidden chest at (1,2).
+        let mut ctx = std::ptr::null_mut();
+        assert_eq!(ls_tile_context_create(5, 3, 1, [1u8; 15].as_ptr(), 15, &mut ctx), Status::Ok);
+        let mut hidden = entity(31, tile_rect(1, 2, 1, 1), 0, EntityFlags::Hidden as u32);
+        hidden.category = 3;
+        let mut chest = entity(30, tile_rect(4, 2, 1, 1), 0, 0);
+        chest.category = 3;
+        let snapshot = [entity(10, tile_rect(2, 1, 1, 1), NPC, EntityFlags::PathfindAdjacent as u32), chest, hidden];
+        assert_eq!(ls_entities_sync(ctx, snapshot.as_ptr(), 3, std::ptr::null_mut()), Status::Ok);
+        assert_eq!(ls_player_set(ctx, cell(0.0, 1.0)), Status::Ok);
+
+        let no_hidden = FilterDesc { kind: 3, enabled: 1, p0: 0, p1: EntityFlags::Hidden as u32, mask: 0, value: 0.0, _reserved: 0 };
+        let reachable = FilterDesc { kind: 0, enabled: 0, p0: 0, p1: NPC, mask: 0, value: 0.0, _reserved: 0 };
+        let filters = [no_hidden, reachable];
+        let mut t = 0;
+        assert_eq!(ls_tracker_create(ctx, filters.as_ptr(), 2, true, &mut t), Status::Ok);
+
+        let mut sel = Selection { entity_id: 0, category: 0, index: 0 };
+        assert_eq!(ls_tracker_act(ctx, t, TrackerAction::Next as u32, &mut sel), Status::Ok);
+        assert_eq!(sel, Selection { entity_id: 10, category: 1, index: 0 });
+        assert_eq!(ls_tracker_act(ctx, t, TrackerAction::Next as u32, &mut sel), Status::Ok);
+        assert_eq!(sel.entity_id, 30, "hidden chest 31 is filtered out");
+        let mut n = 0;
+        assert_eq!(ls_tracker_count(ctx, t, u32::MAX, &mut n), Status::Ok);
+        assert_eq!(n, 2);
+        assert_eq!(ls_tracker_count(ctx, t, 3, &mut n), Status::Ok);
+        assert_eq!(n, 1);
+
+        let mut v = EntityVector { nearest_point: Vec3::default(), bearing_deg: 0.0, elevation_deg: 0.0, distance: 0.0, steps: 0.0 };
+        assert_eq!(ls_entity_vector(ctx, 30, &mut v), Status::Ok);
+        assert_eq!(v.nearest_point, Vec3::new(4.0, 0.0, 2.0));
+        assert!(v.bearing_deg > 90.0 && v.bearing_deg < 180.0, "south-east, got {}", v.bearing_deg);
+        assert_eq!(v.steps, 4.0);
+
+        let mut r = false;
+        assert_eq!(ls_entity_reachable_from_player(ctx, 30, 0, NPC, &mut r), Status::Ok);
+        assert!(r);
+        assert_eq!(ls_entity_reachable_from_player(ctx, 30, 9, NPC, &mut r), Status::InvalidArgument, "unknown profile");
+
+        assert_eq!(ls_tracker_act(ctx, t, TrackerAction::CategoryNext as u32, &mut sel), Status::Ok);
+        assert_eq!(sel, Selection { entity_id: 0, category: 1, index: 0 });
+        assert_eq!(ls_tracker_set_filter_enabled(ctx, t, 1, true), Status::Ok);
+        assert_eq!(ls_tracker_set_filter_enabled(ctx, t, 5, true), Status::InvalidArgument);
+        assert_eq!(ls_tracker_act(ctx, t, 9, &mut sel), Status::InvalidArgument);
+        assert_eq!(ls_tracker_set_filters(ctx, t, std::ptr::null(), 0), Status::Ok);
+        assert_eq!(ls_tracker_count(ctx, t, u32::MAX, &mut n), Status::Ok);
+        assert_eq!(n, 3, "no filters: hidden chest visible again");
+        assert_eq!(ls_tracker_destroy(ctx, t), Status::Ok);
+        assert_eq!(ls_tracker_act(ctx, t, 0, &mut sel), Status::InvalidArgument);
+        let bad = FilterDesc { kind: 9, ..no_hidden };
+        assert_eq!(ls_tracker_create(ctx, &bad, 1, true, &mut t), Status::InvalidArgument);
         ls_context_destroy(ctx);
     }
 

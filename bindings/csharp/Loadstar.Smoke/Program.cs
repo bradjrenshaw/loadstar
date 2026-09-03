@@ -13,7 +13,8 @@ Console.WriteLine($"ABI version {Library.AbiVersion} OK");
 
 Expect(Marshal.SizeOf(typeof(Vec3)) == 12 && Marshal.SizeOf(typeof(TileEdgeOverride)) == 16
     && Marshal.SizeOf(typeof(LinkDesc)) == 40 && Marshal.SizeOf(typeof(PathLink)) == 16
-    && Marshal.SizeOf(typeof(Bounds)) == 40 && Marshal.SizeOf(typeof(EntityDesc)) == 64 && Marshal.SizeOf(typeof(SyncStats)) == 16 && Marshal.SizeOf(typeof(PathOptions)) == 16 && Marshal.SizeOf(typeof(ProfileDesc)) == 16,
+    && Marshal.SizeOf(typeof(Bounds)) == 40 && Marshal.SizeOf(typeof(EntityDesc)) == 64 && Marshal.SizeOf(typeof(SyncStats)) == 16 && Marshal.SizeOf(typeof(PathOptions)) == 16 && Marshal.SizeOf(typeof(ProfileDesc)) == 16
+    && Marshal.SizeOf(typeof(FilterDesc)) == 32 && Marshal.SizeOf(typeof(Selection)) == 16 && Marshal.SizeOf(typeof(EntityVector)) == 28,
     "marshaled struct sizes match the ABI");
 
 var sum = Library.Add(new Vec3(1, 2, 3), new Vec3(10, 20, 30));
@@ -143,6 +144,61 @@ using (var ctx = TileContext.FromWalkable(W, H, 1, cells))
     Expect(ctx.FindPath(Vec3.Cell(2, 0), Vec3.Cell(2, 1), new PathOptions(0, profile: big))!.Nodes.Length == 2, "2x2 agent moves between the two anchors that fit");
     try { ctx.RegisterProfile(new ProfileDesc(footprint: 0)); Expect(false, "footprint 0 should throw"); }
     catch (LoadstarException e) { Expect(e.Status == Status.InvalidArgument, $"footprint 0 → {e.Status}"); }
+}
+
+// --- Trackers: filters as data, cycling, counts, announcement geometry. ---
+{
+    const uint NPC = 1u << 0;
+    const ushort CatNpc = 1, CatChest = 3;
+    using var ctx = TileContext.FromWalkable(5, 3, 1, Enumerable.Repeat((byte)1, 15).ToArray());
+    ctx.SyncEntities(new[]
+    {
+        new EntityDesc(10, CatNpc, Bounds.TileRect(2, 0), blocking: NPC, flags: EntityFlags.PathfindAdjacent),
+        new EntityDesc(11, CatNpc, Bounds.TileRect(2, 1), blocking: NPC, flags: EntityFlags.PathfindAdjacent),
+        new EntityDesc(12, CatNpc, Bounds.TileRect(2, 2), blocking: NPC, flags: EntityFlags.PathfindAdjacent),
+        new EntityDesc(30, CatChest, Bounds.TileRect(4, 0), sortKey: 1),
+        new EntityDesc(31, CatChest, Bounds.TileRect(1, 2), sortKey: 0),
+        new EntityDesc(32, CatChest, Bounds.TileRect(4, 2), flags: EntityFlags.Hidden),
+    });
+    ctx.SetPlayer(Vec3.Cell(0, 1));
+
+    var everything = ctx.CreateTracker();
+    Expect(ctx.TrackerCount(everything) == 6, "no filters → zero built-in rules, hidden chest included");
+
+    var tracker = ctx.CreateTracker(new[]
+    {
+        FilterDesc.Flags(require: EntityFlags.None, forbid: EntityFlags.Hidden),
+        FilterDesc.Reachable(profile: 0, blockedMask: NPC, enabled: false),
+    });
+    Expect(ctx.TrackerCount(tracker) == 5 && ctx.TrackerCount(tracker, CatChest) == 2, "hidden filtered; counts per category");
+
+    var s = ctx.TrackerAct(tracker, TrackerAction.Next);
+    Expect(s.EntityId == 10 && s.Category == CatNpc && s.Index == 0, $"first in ALL view: {s}");
+    ctx.TrackerAct(tracker, TrackerAction.Next); ctx.TrackerAct(tracker, TrackerAction.Next);
+    s = ctx.TrackerAct(tracker, TrackerAction.Next);
+    Expect(s.EntityId == 31, $"chests follow NPCs, sort_key 0 first: {s}");
+    Expect(ctx.TrackerAct(tracker, TrackerAction.Prev).EntityId == 12, "Prev goes back");
+
+    s = ctx.TrackerAct(tracker, TrackerAction.CategoryNext);
+    Expect(s.IsNone && s.Category == CatNpc, $"category cycle clears the selection: {s}");
+    s = ctx.TrackerAct(tracker, TrackerAction.CategoryNext);
+    Expect(s.Category == CatChest && ctx.TrackerAct(tracker, TrackerAction.Next).EntityId == 31, "second category is chests");
+
+    ctx.SetTrackerFilterEnabled(tracker, 1, true);
+    Expect(ctx.TrackerCount(tracker, CatChest) == 1, "reachability filter on: chest 30 behind the NPC wall drops out");
+    Expect(!ctx.EntityReachableFromPlayer(30, 0, NPC) && ctx.EntityReachableFromPlayer(11, 0, NPC), "cached reachability agrees: chest 30 no, NPC 11 yes (adjacent)");
+
+    var v = ctx.EntityVector(30);
+    Expect(v.NearestPoint.X == 4 && v.NearestPoint.Z == 1 && v.Steps == 4 && v.BearingDeg > 0 && v.BearingDeg < 90, $"vector to chest 30: bearing {v.BearingDeg:F1}°, {v.Steps} steps");
+
+    var nearby = ctx.CreateTracker(new[] { FilterDesc.Range(1.5f) });
+    Expect(ctx.TrackerCount(nearby) == 2, "range 1.5: NPC 11 and chest 31 only");
+    var chestsOnly = ctx.CreateTracker(new[] { FilterDesc.Categories(1ul << CatChest) }, includeAll: false);
+    Expect(ctx.TrackerAct(chestsOnly, TrackerAction.Next).Category == CatChest, "category-restricted tracker starts in its category");
+
+    ctx.DestroyTracker(tracker);
+    try { ctx.TrackerAct(tracker, TrackerAction.Next); Expect(false, "destroyed tracker should throw"); }
+    catch (LoadstarException e) { Expect(e.Status == Status.InvalidArgument, $"destroyed tracker → {e.Status}"); }
 }
 
 // --- Tier 2: explicit masks + a ramp override between two layers. ---
