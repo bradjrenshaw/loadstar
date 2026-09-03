@@ -11,26 +11,21 @@
 #include <stdlib.h>
 
 /**
- * Bumped only on breaking ABI changes. Companions check this at load.
+ * Result of every ABI call. Exported to C as `LsStatus`.
  */
-#define LsABI_VERSION 1
-
-/**
- * Result of every ABI call.
- */
-typedef enum LsLsStatus {
-  LsLsStatus_Ok = 0,
-  LsLsStatus_NullPointer = 1,
-  LsLsStatus_InvalidArgument = 2,
+typedef enum LsStatus {
+  LsStatus_Ok = 0,
+  LsStatus_NullPointer = 1,
+  LsStatus_InvalidArgument = 2,
   /**
    * A caller-provided buffer was too small; the required size was written to the count out-param.
    */
-  LsLsStatus_BufferTooSmall = 3,
+  LsStatus_BufferTooSmall = 3,
   /**
    * Internal panic caught at the boundary. The context may be inconsistent; the host is intact.
    */
-  LsLsStatus_Panic = 100,
-} LsLsStatus;
+  LsStatus_Panic = 100,
+} LsStatus;
 
 /**
  * A position or displacement. `#[repr(C)]` so the FFI layer can pass it by value unchanged.
@@ -40,7 +35,6 @@ typedef struct LsVec3 {
   float y;
   float z;
 } LsVec3;
-#define LsVec3_ZERO (LsVec3){ .x = 0.0, .y = 0.0, .z = 0.0 }
 
 #ifdef __cplusplus
 extern "C" {
@@ -54,9 +48,9 @@ uint32_t ls_abi_version(void);
 /**
  * Smoke test for bindings: writes `a + b` into `out`. Exercises by-value struct passing and out-params.
  */
-enum LsLsStatus ls_vec3_add(struct LsVec3 a,
-                            struct LsVec3 b,
-                            struct LsVec3 *out);
+enum LsStatus ls_vec3_add(struct LsVec3 a,
+                          struct LsVec3 b,
+                          struct LsVec3 *out);
 
 #ifdef __cplusplus
 }  // extern "C"
