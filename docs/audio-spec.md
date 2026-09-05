@@ -24,7 +24,7 @@ It follows the same rules as the navigation core: tools not a framework, data in
 ### Out of scope (v1)
 
 - Exclusive-mode WASAPI (it silences the game's own audio).
-- HRTF / binaural rendering. The head model below is deliberately simpler and was tuned by ear; HRTF is a later, deliberate addition once compared against it with blind players.
+- HRTF / binaural rendering *in v1*. The head model below is deliberately simpler and was tuned by ear. The renderer stage is pluggable from day one (§4.8) so Steam Audio (HRTF, geometry-based occlusion, reflections) can be added without changing the model — it is the first planned plug-in, not an afterthought.
 - Streaming, music, OGG/MP3 decoding, reverb, arbitrary routing graphs (v1 is chains and buses — see §4).
 - Non-Windows backends (the trait exists so PipeWire/cpal can slot in for Linux and Steam Deck).
 - Deciding what plays: no "footstep system", no "wall tones" — those are mod policy built from sources and chains (§7 shows how small they become).
@@ -68,6 +68,10 @@ Procedural convenience: `la_buffer_click(device, ms)` and `la_buffer_tone(device
 An `AudioSpace` ≈ a navigation context: a listener, buses, sources and a chain. `la_space_create(device, mode, gain) → space` with mode `Planar` (pan by XZ bearing, elevation ignored) or `Spatial` (full 3D). One type; the modes differ only in how the spatializer reads the geometry.
 
 Spaces coexist (overworld vs. dungeon; a UI space with no spatialization at all) and sum into the device master.
+
+A space chooses its **renderer** (§4.8) — the built-in head model by default — and may carry **acoustic geometry** for renderers that use it: `la_space_set_geometry(space, vertices[], triangles[], materials[])`, or `la_space_geometry_from_tiles(space, tile_context)` to export a nav grid's solid cells as boxes. The head model ignores geometry; Steam Audio's occlusion and reflections consume it.
+
+Renderers that simulate (occlusion rays, reflections) need a per-frame step: **`la_space_update(space, dt)`**, called by the mod once per frame after positioning the listener and syncing sources. It runs cheap work on the calling thread and hands heavy work to an internal worker; results reach the audio thread through the command queue. The head model's update is a no-op, so v1 mods can call it unconditionally.
 
 ### Listener
 
@@ -134,8 +138,9 @@ No callbacks, so completion is polled: `la_source_state(space, id, out) → {pla
 source (mono)
   → distance model                      gain from nearest-point distance
   → source chain (mono effects)         e.g. LOWPASS for occlusion — cheap, before stereo
-  → SPATIALIZER                         mono → stereo: pan, ITD, head shadow, rear shelf
-  → source post-chain (stereo effects)  rare; e.g. a per-source EQ
+  → RENDERER                            mono → bus format: the head model (pan, ITD, head
+                                        shadow, rear shelf) or a plug-in such as Steam Audio
+  → source post-chain (bus-format effects)  rare; e.g. a per-source EQ
   → bus gain + bus chain (stereo)
   → space gain + space chain (stereo)
   → device master gain + master chain   e.g. a LIMITER
@@ -149,10 +154,10 @@ source (mono)
 An effect chain is an ordered list of nodes, each a fixed-size record. Chains attach to a source (pre/post), a bus, a space or the device. Arbitrary routing graphs are out of scope for v1: **chains plus buses express everything wotr needed**, they cross the ABI as flat arrays, and they keep per-period cost predictable. Sends/returns (reverb) can be added later as a bus feature without changing the node model.
 
 ```
-LaEffectDesc {                   // 32 bytes
-    kind:     u32                // LaEffectKind
+LaEffectDesc {                   // 40 bytes
+    kind:     u32                // LaEffectKind; values >= 0x1000 are renderer-specific nodes
     flags:    u32                // ENABLED | node-specific cue toggles
-    p:        [f32; 6]           // node-specific parameters (unused = 0)
+    p:        [f32; 8]           // node-specific parameters (unused = 0)
 }
 
 la_source_set_chain(space, id, stage: PRE | POST, nodes[], n)
@@ -174,7 +179,8 @@ la_*_set_effect_enabled(..., index, enabled)         // A/B by ear, crossfaded
 | `DELAY` | ms, feedback, mix | Fixed delay, tail drained on stop. |
 | `LIMITER` | threshold_db, release_ms | Master safety; brickwall-ish. |
 | `DISTANCE` | min, max, rolloff, model | The source's distance model (below); one per source, implicit if absent. |
-| `SPATIALIZER` | see §4.4 | Implicit at the end of every source pre-chain; listed explicitly only to override its parameters or cue flags per source. |
+| `SPATIALIZER` | see §4.4 | Parameters and cue flags of the head-model renderer for this source, overriding the space's defaults. |
+| `RENDER_*` (≥ 0x1000) | renderer-defined | Renderer-specific per-source controls, e.g. Steam Audio's air absorption, transmission, directivity. Ignored by renderers that don't know them. |
 
 ### 4.4 The spatializer node (head model)
 
@@ -202,14 +208,36 @@ Every node keeps **target** and **current** values. Per period: gains, pans and 
 
 Default cap 32 per device. Over the cap, the quietest lowest-priority sources are stolen with a ramp-out. Looping sources at gain 0 still occupy a voice (that is the point of mute-not-dispose); mods with many silent loops should raise the cap or remove them.
 
+### 4.8 Renderers and extensibility
+
+The mono → bus-format stage is a **`Renderer` trait**, not a fixed node. It receives, per voice per period, the mono block and a `Placement` (nearest point in the listener's frame, distance, whether the listener is inside the bounds, the source's `pan_width`), and writes into the bus format. Implementations:
+
+- **`HeadModel`** — the built-in §4.4 model. Always available; the default.
+- **`SteamAudio`** (planned) — binaural HRTF via `iplBinauralEffectApply`, with `iplDirectEffect` for occlusion/transmission from the space's geometry and, optionally, reflections. Loaded **dynamically** (`phonon.dll` found at runtime; absent → the space silently falls back to `HeadModel`, logged once), so `loadstar.dll` never hard-depends on it. Steam Audio is Apache-2.0.
+- Room for others (a future HRTF-from-SOFA renderer, an ambisonic renderer).
+
+Contract every renderer must honour, designed around what Steam Audio needs:
+
+1. **Fixed block size and sample rate at init** — `init(sample_rate, block_frames, bus_format)`. The mixer's period is the block size. On stream reopen (device loss, format change) renderers are re-initialised and per-voice state recreated.
+2. **Real-time safe `process`**, allocation-free; all per-voice objects are created on the game thread when a source is upserted and moved to the audio thread through the command queue (Steam Audio effect creation is not RT-safe; application is).
+3. **Optional `update(dt)`** on the game thread via `la_space_update`, plus an optional worker for heavy simulation; results are posted as targets like any other parameter, so the ramp discipline (§4.6) applies to occlusion and reflection changes too.
+4. **Optional geometry** — `set_geometry(...)` is called with the space's triangles when present; renderers that don't use it ignore it.
+5. **Bus format aware** — output channel count comes from the bus (v1: stereo everywhere; ambisonic buses later without changing this trait).
+6. **Distance stays ours.** The `DISTANCE` node applies before the renderer; a renderer's own attenuation is disabled or its parameters routed through `RENDER_*` nodes, so switching renderers never changes loudness-vs-distance behaviour that a mod tuned.
+
+Selection: `la_space_set_renderer(space, kind, config[])` and `la_source_set_renderer(space, id, kind)` for per-source overrides (a mod might render beacons binaurally but keep wall tones on the ear-fixed head model). `la_renderers_available(out[])` reports what loaded.
+
 ---
 
 ## 5. Crate layout and the backend trait
 
 ```
 crates/loadstar-audio/           pure Rust: spaces, buses, sources, chains, DSP nodes, resampler
-  src/dsp/                       biquads, delay lines, ramps, pan laws, head model — pure functions
-  src/mixer.rs                   period loop: sources → chains → buses → spaces → master
+  src/dsp/                       biquads, delay lines, ramps, pan laws — pure functions
+  src/render/mod.rs              trait Renderer (§4.8) + Placement
+  src/render/head_model.rs       the built-in §4.4 renderer
+  src/render/steam_audio.rs      (later) dynamic-loading phonon binding  (cfg(feature = "steam-audio"))
+  src/mixer.rs                   period loop: sources → chains → renderer → buses → spaces → master
   src/backend/mod.rs             trait Backend { open(format, period) -> Stream; ... }
   src/backend/wasapi.rs          windows crate, IAudioClient3, MMCSS  (cfg(windows))
   src/backend/null.rs            silent backend with synthetic time, for tests and CI
@@ -255,7 +283,8 @@ Per-system volume sliders are bus gains; a master slider is the device gain; "oc
 3. **WASAPI backend** — `IAudioClient3` + MMCSS, device-loss recovery, period reporting.
 4. **FFI + .NET**, smoke harness plays a positioned, ITD/shadowed tone from x86 net472; then inside CSTW.
 5. **CSTW footsteps and wall tones** on the crate; retire `WaveOutToneOutput` and the inlined `ToneGenerator`.
-6. Later: HRTF evaluation against the head model, sends/reverb, Linux backend, streaming.
+6. **Steam Audio renderer**: dynamic loading, binaural + direct effect, geometry export from tile contexts, evaluated against the head model with blind players.
+7. Later: sends/reverb, ambisonic buses, Linux backend, streaming.
 
 ## 9. Open questions for review
 
