@@ -31,27 +31,29 @@ impl Default for DeviceConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceError {
     /// The command queue is full; the mixer is not draining (stalled thread or no pumping).
     QueueFull,
     UnknownSpace,
     UnknownBus,
     InvalidArgument,
+    /// The backend could not open a device.
+    Backend(String),
 }
 
 const QUEUE_CAPACITY: usize = 4096;
 
 enum Backend {
     /// The engine lives here; [`Device::render`] pumps it.
-    Null { engine: Engine },
+    Null { engine: Engine, inbox: rtrb::Consumer<Command> },
+    #[cfg(windows)]
+    Wasapi { stream: crate::backend::wasapi::WasapiStream, garbage: rtrb::Consumer<Garbage>, finished: rtrb::Consumer<(u32, u64)> },
 }
 
 pub struct Device {
     info: StreamInfo,
     commands: rtrb::Producer<Command>,
-    inbox: rtrb::Consumer<Command>,
-    garbage: Vec<Garbage>,
     finished: Vec<(u32, u64)>,
     spaces: Vec<Option<u32>>, // bus count per space id
     buffers: Vec<bool>,
@@ -69,11 +71,45 @@ impl Device {
             master_gain: cfg.master_gain,
             voice_cap: cfg.voice_cap,
         });
-        Device { info, commands, inbox, garbage: Vec::new(), finished: Vec::new(), spaces: Vec::new(), buffers: Vec::new(), backend: Backend::Null { engine } }
+        Device { info, commands, finished: Vec::new(), spaces: Vec::new(), buffers: Vec::new(), backend: Backend::Null { engine, inbox } }
+    }
+
+    /// Open the default Windows render endpoint on its own audio thread (spec §2).
+    #[cfg(windows)]
+    pub fn open_wasapi(cfg: DeviceConfig) -> Result<Device, DeviceError> {
+        use crate::backend::wasapi::{WasapiConfig, spawn};
+        let (commands, inbox) = rtrb::RingBuffer::new(QUEUE_CAPACITY);
+        let (garbage_tx, garbage_rx) = rtrb::RingBuffer::new(QUEUE_CAPACITY);
+        let (finished_tx, finished_rx) = rtrb::RingBuffer::new(QUEUE_CAPACITY);
+        let stream = spawn(
+            WasapiConfig { period_frames: cfg.period_frames, master_gain: cfg.master_gain, voice_cap: cfg.voice_cap },
+            inbox,
+            garbage_tx,
+            finished_tx,
+        )
+        .map_err(|e| DeviceError::Backend(e.0))?;
+        let info = stream.info;
+        Ok(Device {
+            info,
+            commands,
+            finished: Vec::new(),
+            spaces: Vec::new(),
+            buffers: Vec::new(),
+            backend: Backend::Wasapi { stream, garbage: garbage_rx, finished: finished_rx },
+        })
     }
 
     pub fn info(&self) -> StreamInfo {
         self.info
+    }
+
+    /// Whether the low-latency (`IAudioClient3`) path is active. Always false for the null backend.
+    pub fn low_latency(&self) -> bool {
+        match &self.backend {
+            Backend::Null { .. } => false,
+            #[cfg(windows)]
+            Backend::Wasapi { stream, .. } => stream.status().low_latency.load(std::sync::atomic::Ordering::Relaxed),
+        }
     }
 
     fn rate(&self) -> f32 {
@@ -91,7 +127,10 @@ impl Device {
 
     /// Drop whatever the audio thread handed back. Called on every API call; harmless to call more.
     pub fn collect_garbage(&mut self) {
-        self.garbage.clear();
+        #[cfg(windows)]
+        if let Backend::Wasapi { garbage, .. } = &mut self.backend {
+            while garbage.pop().is_ok() {}
+        }
     }
 
     // --- Spaces ---
@@ -257,28 +296,36 @@ impl Device {
 
     /// `(space, id)` pairs whose sequences ended since the last call.
     pub fn take_finished(&mut self) -> Vec<(u32, u64)> {
+        #[cfg(windows)]
+        if let Backend::Wasapi { finished, .. } = &mut self.backend {
+            while let Ok(f) = finished.pop() {
+                self.finished.push(f);
+            }
+        }
         std::mem::take(&mut self.finished)
     }
 
     // --- Null backend pumping ---
 
     /// Apply pending commands and render one period into `out` (interleaved stereo).
-    /// Null backend only; a real backend does this on its own thread.
+    /// Null backend only; a real backend does this on its own thread (this is then a no-op).
     pub fn render(&mut self, out: &mut [f32]) {
-        let Backend::Null { engine } = &mut self.backend;
-        while let Ok(cmd) = self.inbox.pop() {
-            if let Some(g) = engine.apply(cmd) {
-                self.garbage.push(g);
+        if let Backend::Null { engine, inbox } = &mut self.backend {
+            while let Ok(cmd) = inbox.pop() {
+                drop(engine.apply(cmd));
             }
+            engine.process(out);
+            self.finished.extend(engine.take_finished());
         }
-        engine.process(out);
-        self.finished.extend(engine.take_finished());
     }
 
     /// Null backend only: inspect audio-thread state (tests, harnesses).
-    pub fn engine(&self) -> &Engine {
-        let Backend::Null { engine } = &self.backend;
-        engine
+    pub fn engine(&self) -> Option<&Engine> {
+        match &self.backend {
+            Backend::Null { engine, .. } => Some(engine),
+            #[cfg(windows)]
+            Backend::Wasapi { .. } => None,
+        }
     }
 }
 

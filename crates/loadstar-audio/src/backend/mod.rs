@@ -5,6 +5,9 @@
 pub mod null;
 pub use null::NullBackend;
 
+#[cfg(windows)]
+pub mod wasapi;
+
 /// The format a backend actually opened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamInfo {
