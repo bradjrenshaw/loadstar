@@ -45,6 +45,7 @@ Rules the mixer thread lives by:
 
 - Pinned to MMCSS task `"Pro Audio"` (`AvSetMmThreadCharacteristicsW`).
 - **No allocation, no locks, no syscalls other than the WASAPI render calls** inside the period callback. Command intake is a lock-free SPSC ring buffer; all audio state is owned by the audio thread.
+- *v1 note*: the mixing path is allocation-free, but **voice creation still allocates when a command is applied** at the start of a period (chains, renderer state). A voice pool is the planned fix; until then, sync bursts that create many new sources at once are the one place the audio thread may allocate.
 - Every audible parameter is a **target**: gains, pans, delays and filter parameters ramp toward their targets; nothing steps discontinuously (§4.5).
 - Falls back to the 10 ms path if `IAudioClient3` is unavailable, and reports which period it got.
 - Device loss / format change (headphones unplugged) is detected and the stream reopened; sources keep their state.

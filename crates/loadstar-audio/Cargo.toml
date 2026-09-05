@@ -1,0 +1,13 @@
+[package]
+name = "loadstar-audio"
+description = "Low-latency spatial audio for game accessibility mods: spaces, buses, sources with geometry, effect chains as data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+loadstar-core.workspace = true
+rtrb = "0.3"
+
+[dev-dependencies]
