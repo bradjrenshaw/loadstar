@@ -10,6 +10,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+/* The audio surface (la_*) is compiled in by default. */
+#define LOADSTAR_AUDIO 1
+
 /**
  * Result of every ABI call. Exported to C as `LsStatus`.
  */
@@ -60,10 +63,12 @@ typedef uint8_t LsDir;
 #endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
 
+#if defined(LOADSTAR_AUDIO)
 /**
  * Opaque: an open audio device and everything under it. Exported to C as `LsAudioDevice`.
  */
 typedef struct LsAudioDevice LsAudioDevice;
+#endif
 
 /**
  * Opaque: a map plus everything consistent with it (spec §4). Exported to C as `LsContext`.
@@ -270,6 +275,7 @@ typedef struct LsPathSegment {
   uint64_t link_id;
 } LsPathSegment;
 
+#if defined(LOADSTAR_AUDIO)
 typedef struct LsAudioDeviceConfig {
   /**
    * 0 = the device's mix rate.
@@ -285,7 +291,9 @@ typedef struct LsAudioDeviceConfig {
    */
   uint32_t voice_cap;
 } LsAudioDeviceConfig;
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 typedef struct LsAudioStreamInfo {
   uint32_t sample_rate;
   uint32_t period_frames;
@@ -295,7 +303,9 @@ typedef struct LsAudioStreamInfo {
    */
   uint32_t low_latency;
 } LsAudioStreamInfo;
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 /**
  * A finished one-shot: `(space, source id)`, 16 bytes.
  */
@@ -304,7 +314,9 @@ typedef struct LsAudioFinished {
   uint32_t _reserved;
   uint64_t id;
 } LsAudioFinished;
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 /**
  * A source record (audio spec §3), 96 bytes.
  */
@@ -347,7 +359,9 @@ typedef struct LsAudioSourceDesc {
   float repeat_gap_ms;
   uint32_t _reserved2[3];
 } LsAudioSourceDesc;
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 /**
  * Which chain an effect operation addresses, 24 bytes.
  */
@@ -361,7 +375,9 @@ typedef struct LsAudioChainTarget {
   uint32_t _reserved;
   uint64_t source_id;
 } LsAudioChainTarget;
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 /**
  * An effect node (audio spec §4.2), 40 bytes. `flags` bit 0 = enabled; renderer cue bits above.
  */
@@ -373,6 +389,7 @@ typedef struct LsAudioEffectDesc {
   uint32_t flags;
   float p[8];
 } LsAudioEffectDesc;
+#endif
 
 #define LsDir_ALL { LsDir_South, LsDir_North, LsDir_East, LsDir_West, }
 
@@ -740,11 +757,14 @@ enum LsStatus ls_path_segments(const struct LsContext *ctx,
  */
 void ls_path_free(struct LsPath *path);
 
+#if defined(LOADSTAR_AUDIO)
 /**
  * Open the default audio output (WASAPI shared mode on Windows). `DeviceUnavailable` if none.
  */
 enum LsStatus la_device_open(struct LsAudioDeviceConfig cfg, struct LsAudioDevice **out);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 /**
  * Open a device with no hardware: periods are rendered on demand with [`la_device_render`].
  * For tests and harnesses.
@@ -753,25 +773,35 @@ enum LsStatus la_device_open_null(struct LsAudioDeviceConfig cfg,
                                   uint32_t sample_rate,
                                   uint32_t period_frames,
                                   struct LsAudioDevice **out);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 /**
  * Close a device, stopping its audio thread and releasing every space and buffer. Null is a no-op.
  */
 void la_device_close(struct LsAudioDevice *dev);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 /**
  * The format the backend actually opened.
  */
 enum LsStatus la_device_info(struct LsAudioDevice *dev, struct LsAudioStreamInfo *out);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 enum LsStatus la_device_master_gain(struct LsAudioDevice *dev, float gain);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 /**
  * Null devices only: apply pending commands and render `frames` frames of interleaved
  * stereo into `out` (`2 * frames` floats). A no-op on hardware devices.
  */
 enum LsStatus la_device_render(struct LsAudioDevice *dev, float *out, uintptr_t frames);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 /**
  * Drain the `(space, id)` pairs whose sequences ended since the last call. Buffer convention
  * as `ls_path_nodes`: `*written` receives the count; `BufferTooSmall` if it exceeds `capacity`
@@ -781,7 +811,9 @@ enum LsStatus la_device_finished(struct LsAudioDevice *dev,
                                  struct LsAudioFinished *out,
                                  uintptr_t capacity,
                                  uintptr_t *written);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 /**
  * Create a space. `mode` is an `AudioSpaceMode`; `unit_scale` = units per metre (0 = 1).
  */
@@ -790,11 +822,17 @@ enum LsStatus la_space_create(struct LsAudioDevice *dev,
                               float gain,
                               float unit_scale,
                               uint32_t *out);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 enum LsStatus la_space_destroy(struct LsAudioDevice *dev, uint32_t space);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 enum LsStatus la_space_gain(struct LsAudioDevice *dev, uint32_t space, float gain);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 /**
  * Listener pose for a space, each frame.
  */
@@ -803,16 +841,24 @@ enum LsStatus la_listener_set(struct LsAudioDevice *dev,
                               struct LsVec3 position,
                               struct LsVec3 forward,
                               struct LsVec3 up);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 /**
  * Per-frame hook for simulating renderers (audio spec §3). A no-op for the head model.
  */
 enum LsStatus la_space_update(struct LsAudioDevice *dev, uint32_t space, float dt);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 enum LsStatus la_bus_create(struct LsAudioDevice *dev, uint32_t space, float gain, uint32_t *out);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 enum LsStatus la_bus_gain(struct LsAudioDevice *dev, uint32_t space, uint32_t bus, float gain);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 /**
  * Upload interleaved PCM; converted to mono at the mixer rate (copied — the caller keeps ownership).
  */
@@ -822,18 +868,26 @@ enum LsStatus la_buffer_create(struct LsAudioDevice *dev,
                                uint32_t channels,
                                uint32_t sample_rate,
                                uint32_t *out);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 enum LsStatus la_buffer_click(struct LsAudioDevice *dev, float ms, uint32_t *out);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 enum LsStatus la_buffer_tone(struct LsAudioDevice *dev,
                              float hz,
                              float ms,
                              float attack_ms,
                              float release_ms,
                              uint32_t *out);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 enum LsStatus la_buffer_free(struct LsAudioDevice *dev, uint32_t buffer);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 /**
  * Declarative snapshot of a space's declared sources (audio spec §3). `InvalidArgument`
  * rejects the whole snapshot on any bad bounds kind.
@@ -842,22 +896,32 @@ enum LsStatus la_space_sync(struct LsAudioDevice *dev,
                             uint32_t space,
                             const struct LsAudioSourceDesc *descs,
                             uintptr_t descs_len);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 enum LsStatus la_source_upsert(struct LsAudioDevice *dev,
                                uint32_t space,
                                const struct LsAudioSourceDesc *desc);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 enum LsStatus la_source_remove(struct LsAudioDevice *dev, uint32_t space, uint64_t id);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 /**
  * Play a sequence and remove the source when it drains (audio spec §3, fired sources).
  */
 enum LsStatus la_space_fire(struct LsAudioDevice *dev,
                             uint32_t space,
                             const struct LsAudioSourceDesc *desc);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 enum LsStatus la_source_stop(struct LsAudioDevice *dev, uint32_t space, uint64_t id);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 /**
  * Replace a chain wholesale (`nodes` may be null when `nodes_len` is 0).
  */
@@ -865,7 +929,9 @@ enum LsStatus la_chain_set(struct LsAudioDevice *dev,
                            struct LsAudioChainTarget target,
                            const struct LsAudioEffectDesc *nodes,
                            uintptr_t nodes_len);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 /**
  * Retune one parameter of one node in place.
  */
@@ -874,7 +940,9 @@ enum LsStatus la_effect_set_param(struct LsAudioDevice *dev,
                                   uint32_t index,
                                   uint32_t param,
                                   float value);
+#endif
 
+#if defined(LOADSTAR_AUDIO)
 /**
  * Enable or disable one node, crossfaded.
  */
@@ -882,6 +950,7 @@ enum LsStatus la_effect_set_enabled(struct LsAudioDevice *dev,
                                     struct LsAudioChainTarget target,
                                     uint32_t index,
                                     bool enabled);
+#endif
 
 #ifdef __cplusplus
 }  // extern "C"
