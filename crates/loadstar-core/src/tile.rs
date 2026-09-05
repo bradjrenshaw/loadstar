@@ -53,6 +53,14 @@ impl Dir {
     }
 }
 
+/// One leg of a path in guidance terms (spec §8): a run of steps in one direction, or a
+/// link traversal. Words are the companion's job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Segment {
+    Move { dir: Dir, count: u32 },
+    Link { link_id: LinkId },
+}
+
 /// Replaces the default "same layer, cost 1" for one directed edge. Only consulted when the
 /// edge's mask bit is set. A ramp is an override whose `target_layer` differs from the source.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -279,6 +287,34 @@ impl TileGrid {
         let (_, _, layer) = self.node_coords(node)?;
         let (nc, nr) = self.adjacent(node, dir)?;
         self.node_id(nc, nr, layer)
+    }
+
+    /// Compress a path into direction runs, broken at link traversals: "north 5, east 2,
+    /// take the teleporter, east 3" *as data*. Steps that change layer (ramps) still count
+    /// as a move in their grid direction.
+    pub fn segments(&self, path: &crate::graph::Path) -> Vec<Segment> {
+        let mut out: Vec<Segment> = Vec::new();
+        for i in 1..path.nodes.len() {
+            if let Some(&(_, link_id)) = path.links.iter().find(|&&(index, _)| index == i) {
+                out.push(Segment::Link { link_id });
+                continue;
+            }
+            let (Some((c0, r0, _)), Some((c1, r1, _))) = (self.node_coords(path.nodes[i - 1]), self.node_coords(path.nodes[i])) else {
+                continue;
+            };
+            let dir = match (c1 as i64 - c0 as i64, r1 as i64 - r0 as i64) {
+                (0, 1) => Dir::South,
+                (0, -1) => Dir::North,
+                (1, 0) => Dir::East,
+                (-1, 0) => Dir::West,
+                _ => continue, // not a unit step (wrap or corrupt path) — skip rather than guess
+            };
+            match out.last_mut() {
+                Some(Segment::Move { dir: d, count }) if *d == dir => *count += 1,
+                _ => out.push(Segment::Move { dir, count: 1 }),
+            }
+        }
+        out
     }
 
     /// The projection seam (spec §2, §5): every node this geometry occupies, clipped to the
@@ -797,6 +833,34 @@ mod tests {
         assert_eq!(at(&g, 2, 0), 0, "cache was invalidated by the edit");
         assert_eq!(at(&g, 2, 1), 2, "blocks that never used (2,0) are unaffected");
         assert_eq!(at(&g, 3, 0), 1);
+    }
+
+    #[test]
+    fn segments_compress_runs_and_break_at_links() {
+        // 1x10 line, middle walled, teleporter 2 -> 7: path is east 2, link, east 2.
+        let mut w = vec![1u8; 10];
+        w[5] = 0;
+        let mut g = TileGrid::from_walkable(10, 1, 1, &w).unwrap();
+        g.add_link(42, Link { from: 2, to: 7, cost: 1.0, bidirectional: false, enabled: true }).unwrap();
+        let p = astar(&g, 0, 9).unwrap();
+        assert_eq!(
+            g.segments(&p),
+            vec![Segment::Move { dir: Dir::East, count: 2 }, Segment::Link { link_id: 42 }, Segment::Move { dir: Dir::East, count: 2 }]
+        );
+        // Around the wall on the 5x5 grid. Several routes tie at 12 steps; whichever A*
+        // picks, the runs must total 12 and contain the 4-down / 4-up legs past the wall.
+        let g = walled();
+        let p = astar(&g, g.node_id(0, 0, 0).unwrap(), g.node_id(4, 0, 0).unwrap()).unwrap();
+        let segs = g.segments(&p);
+        let total: u32 = segs.iter().map(|s| if let Segment::Move { count, .. } = s { *count } else { 0 }).sum();
+        assert_eq!(total, 12);
+        assert!(segs.contains(&Segment::Move { dir: Dir::South, count: 4 }));
+        assert!(segs.contains(&Segment::Move { dir: Dir::North, count: 4 }));
+        assert!(segs.windows(2).all(|w| match (w[0], w[1]) {
+            (Segment::Move { dir: a, .. }, Segment::Move { dir: b, .. }) => a != b,
+            _ => true,
+        }), "adjacent runs are merged: {segs:?}");
+        assert!(g.segments(&astar(&g, 3, 3).unwrap()).is_empty(), "already there");
     }
 
     #[test]

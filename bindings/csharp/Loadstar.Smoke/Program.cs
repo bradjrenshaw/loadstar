@@ -14,7 +14,7 @@ Console.WriteLine($"ABI version {Library.AbiVersion} OK");
 Expect(Marshal.SizeOf(typeof(Vec3)) == 12 && Marshal.SizeOf(typeof(TileEdgeOverride)) == 16
     && Marshal.SizeOf(typeof(LinkDesc)) == 40 && Marshal.SizeOf(typeof(PathLink)) == 16
     && Marshal.SizeOf(typeof(Bounds)) == 40 && Marshal.SizeOf(typeof(EntityDesc)) == 64 && Marshal.SizeOf(typeof(SyncStats)) == 16 && Marshal.SizeOf(typeof(PathOptions)) == 16 && Marshal.SizeOf(typeof(ProfileDesc)) == 16
-    && Marshal.SizeOf(typeof(FilterDesc)) == 32 && Marshal.SizeOf(typeof(Selection)) == 16 && Marshal.SizeOf(typeof(EntityVector)) == 28,
+    && Marshal.SizeOf(typeof(FilterDesc)) == 32 && Marshal.SizeOf(typeof(Selection)) == 16 && Marshal.SizeOf(typeof(EntityVector)) == 28 && Marshal.SizeOf(typeof(PathSegment)) == 24,
     "marshaled struct sizes match the ABI");
 
 var sum = Library.Add(new Vec3(1, 2, 3), new Vec3(10, 20, 30));
@@ -199,6 +199,29 @@ using (var ctx = TileContext.FromWalkable(W, H, 1, cells))
     ctx.DestroyTracker(tracker);
     try { ctx.TrackerAct(tracker, TrackerAction.Next); Expect(false, "destroyed tracker should throw"); }
     catch (LoadstarException e) { Expect(e.Status == Status.InvalidArgument, $"destroyed tracker → {e.Status}"); }
+}
+
+// --- Segments and the companion's default phrasing. ---
+{
+    var line = Enumerable.Repeat((byte)1, 10).ToArray();
+    line[5] = 0;
+    using var ctx = TileContext.FromWalkable(10, 1, 1, line);
+    ctx.AddLink(new LinkDesc(id: 42, Vec3.Cell(2, 0), Vec3.Cell(7, 0)));
+    var p = ctx.FindPath(Vec3.Cell(0, 0), Vec3.Cell(9, 0))!;
+    Expect(p.Segments.Length == 3 && p.Segments[1].Kind == SegmentKind.Link && p.Segments[1].LinkId == 42 && p.Segments[2].Count == 2,
+        "segments: " + string.Join(" | ", p.Segments));
+    var words = Phrases.Directions(p.Segments, id => id == 42 ? "the blue portal" : null);
+    Expect(words == "east 2, take the blue portal, east 2", $"directions: \"{words}\"");
+    Expect(Phrases.Directions(ctx.FindPath(Vec3.Cell(3, 0), Vec3.Cell(3, 0))!.Segments) == "Already there", "zero-length path phrase");
+
+    ctx.SyncEntities(new[] { new EntityDesc(1, 1, Bounds.TileRect(4, 0)) });
+    ctx.SetPlayer(Vec3.Cell(0, 0));
+    var v = ctx.EntityVector(1);
+    var announce = Phrases.Announce("Chest", "Chest", new Selection { EntityId = 1, Category = 1, Index = 2 }, 7, v);
+    Expect(announce == "Chest, Chest, 3 of 7, east, 4 tiles", $"announcement: \"{announce}\"");
+    Expect(Phrases.Compass(20) == "north" && Phrases.Compass(45) == "northeast" && Phrases.Compass(120) == "southeast" && Phrases.Compass(300) == "northwest" && Phrases.Compass(350) == "north",
+        "compass sectors use the 2:1 cardinal rule");
+    Expect(Phrases.CategorySwitch("NPCs", 1) == "NPCs, 1 object", "category switch phrase");
 }
 
 // --- Tier 2: explicit masks + a ramp override between two layers. ---

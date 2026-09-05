@@ -87,6 +87,27 @@ public struct PathLink
     private uint _reserved;
 }
 
+/// <summary>Mirrors <c>LsSegmentKind</c>.</summary>
+public enum SegmentKind : uint
+{
+    Move = 0,
+    Link = 1,
+}
+
+/// <summary>Mirrors <c>LsPathSegment</c>: a run of steps in one direction, or a link traversal.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct PathSegment
+{
+    public SegmentKind Kind;
+    public Dir Dir;
+    private byte _dirPad0, _dirPad1, _dirPad2;
+    public uint Count;
+    private uint _reserved;
+    public ulong LinkId;
+
+    public override string ToString() => Kind == SegmentKind.Link ? $"link {LinkId}" : $"{Dir} {Count}";
+}
+
 /// <summary>Mirrors <c>LsGoalMode</c>.</summary>
 public enum GoalMode : uint
 {
@@ -398,5 +419,6 @@ internal static class Native
     [DllImport(Lib, CallingConvention = Cc)] public static extern float ls_path_cost(PathHandle path);
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_path_nodes(PathHandle path, [Out] uint[] buffer, UIntPtr capacity, out UIntPtr written);
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_path_links(PathHandle path, [Out] PathLink[]? buffer, UIntPtr capacity, out UIntPtr written);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_path_segments(ContextHandle context, PathHandle path, [Out] PathSegment[]? buffer, UIntPtr capacity, out UIntPtr written);
     [DllImport(Lib, CallingConvention = Cc)] public static extern void ls_path_free(IntPtr path);
 }

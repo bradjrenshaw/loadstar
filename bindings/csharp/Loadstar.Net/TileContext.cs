@@ -35,7 +35,7 @@ public static class Library
     }
 }
 
-/// <summary>A path result: node ids plus which arrivals happened via a link (spec §8).</summary>
+/// <summary>A path result: node ids, link traversals, and the guidance segments (spec §8).</summary>
 public sealed class Path
 {
     /// <summary>Includes both endpoints.</summary>
@@ -44,9 +44,15 @@ public sealed class Path
     /// <summary>Sparse: one entry per node that was reached by taking a link.</summary>
     public PathLink[] Links { get; }
 
+    /// <summary>Direction runs broken at link traversals — "north 5, east 2" as data. Empty when already there.</summary>
+    public PathSegment[] Segments { get; }
+
     public float Cost { get; }
 
-    internal Path(uint[] nodes, PathLink[] links, float cost) { Nodes = nodes; Links = links; Cost = cost; }
+    internal Path(uint[] nodes, PathLink[] links, PathSegment[] segments, float cost)
+    {
+        Nodes = nodes; Links = links; Segments = segments; Cost = cost;
+    }
 }
 
 /// <summary>A tile-grid context (spec §4). Dispose releases the native handle.</summary>
@@ -315,7 +321,7 @@ public sealed class TileContext : IDisposable
         return result;
     }
 
-    private static Path? ReadPath(Status status, PathHandle path, string call)
+    private Path? ReadPath(Status status, PathHandle path, string call)
     {
         if (status == Status.NoPath) return null;
         status.ThrowIfError(call);
@@ -332,7 +338,13 @@ public sealed class TileContext : IDisposable
                 Native.ls_path_links(path, links, (UIntPtr)links.Length, out _)
                     .ThrowIfError(nameof(Native.ls_path_links));
 
-            return new Path(nodes, links, Native.ls_path_cost(path));
+            Native.ls_path_segments(_handle, path, null, UIntPtr.Zero, out needed);
+            var segments = new PathSegment[(int)(ulong)needed];
+            if (segments.Length > 0)
+                Native.ls_path_segments(_handle, path, segments, (UIntPtr)segments.Length, out _)
+                    .ThrowIfError(nameof(Native.ls_path_segments));
+
+            return new Path(nodes, links, segments, Native.ls_path_cost(path));
         }
     }
 

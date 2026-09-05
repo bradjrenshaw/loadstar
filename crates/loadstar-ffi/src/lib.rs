@@ -14,7 +14,7 @@ use loadstar_core::entities::{Entity, SyncStats as CoreSyncStats};
 use loadstar_core::tracker::{Action as CoreAction, Filter, FilterEntry, Tracker};
 use loadstar_core::geometry::Bounds;
 use loadstar_core::graph::LinkId;
-use loadstar_core::tile::{Dir, EdgeOverride, GridError, Link, TileGrid};
+use loadstar_core::tile::{Dir, EdgeOverride, GridError, Link, Segment, TileGrid};
 pub use loadstar_core::geometry::Vec3;
 
 /// Bumped only on breaking ABI changes. Companions check this via [`ls_abi_version`] at load.
@@ -81,6 +81,36 @@ pub struct PathLink {
     pub index: u32,
     /// Keeps the struct 16 bytes on every ABI regardless of how `u64` is aligned.
     pub _reserved: u32,
+}
+
+/// Kind of a [`PathSegment`].
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SegmentKind {
+    /// `dir` steps `count` times in one direction.
+    Move = 0,
+    /// Take the link `link_id`.
+    Link = 1,
+}
+
+/// One leg of a path in guidance terms (spec §8), 24 bytes. `dir` is a `Dir` discriminant.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PathSegment {
+    pub kind: u32,
+    pub dir: u32,
+    pub count: u32,
+    pub _reserved: u32,
+    pub link_id: u64,
+}
+
+impl From<Segment> for PathSegment {
+    fn from(s: Segment) -> Self {
+        match s {
+            Segment::Move { dir, count } => PathSegment { kind: 0, dir: dir as u32, count, _reserved: 0, link_id: 0 },
+            Segment::Link { link_id } => PathSegment { kind: 1, dir: 0, count: 0, _reserved: 0, link_id },
+        }
+    }
 }
 
 /// How target nodes are treated as a destination (spec §8).
@@ -1159,6 +1189,21 @@ pub extern "C" fn ls_path_links(path: *const Path, out: *mut PathLink, capacity:
     })
 }
 
+/// Compress a path into direction runs broken at link traversals ("north 5, east 2, take
+/// the teleporter" as data). Needs the context the path was found on. Same buffer
+/// convention as [`ls_path_nodes`].
+#[unsafe(no_mangle)]
+pub extern "C" fn ls_path_segments(ctx: *const Context, path: *const Path, out: *mut PathSegment, capacity: usize, written: *mut usize) -> Status {
+    guard(|| {
+        if ctx.is_null() || path.is_null() {
+            return Status::NullPointer;
+        }
+        // SAFETY: non-null checked; live context and path handles.
+        let segments: Vec<PathSegment> = unsafe { &*ctx }.0.grid().segments(&unsafe { &*path }.0).into_iter().map(Into::into).collect();
+        copy_out(&segments, out, capacity, written)
+    })
+}
+
 /// Shared buffer convention: report the needed count, copy only if it fits.
 fn copy_out<T: Copy>(items: &[T], out: *mut T, capacity: usize, written: *mut usize) -> Status {
     if written.is_null() {
@@ -1208,6 +1253,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<FilterDesc>(), 32);
         assert_eq!(std::mem::size_of::<Selection>(), 16);
         assert_eq!(std::mem::size_of::<EntityVector>(), 28);
+        assert_eq!(std::mem::size_of::<PathSegment>(), 24);
         assert_eq!(std::mem::size_of::<BoundsDesc>(), 40);
         assert_eq!(std::mem::size_of::<EntityDesc>(), 64);
         assert_eq!(std::mem::size_of::<SyncStats>(), 16);
@@ -1322,6 +1368,10 @@ mod tests {
         assert_eq!(ls_path_links(path, links.as_mut_ptr(), 2, &mut n), Status::Ok);
         assert_eq!(n, 1);
         assert_eq!((links[0].link_id, links[0].index), (9001, 1));
+        let mut segs = [PathSegment { kind: 0, dir: 0, count: 0, _reserved: 0, link_id: 0 }; 4];
+        assert_eq!(ls_path_segments(ctx, path, segs.as_mut_ptr(), 4, &mut n), Status::Ok);
+        assert_eq!(n, 1);
+        assert_eq!(segs[0], PathSegment { kind: 1, dir: 0, count: 0, _reserved: 0, link_id: 9001 });
         ls_path_free(path);
 
         assert_eq!(ls_link_remove(ctx, 9001), Status::Ok);

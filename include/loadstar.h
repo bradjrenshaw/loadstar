@@ -246,6 +246,17 @@ typedef struct LsPathLink {
   uint32_t _reserved;
 } LsPathLink;
 
+/**
+ * One leg of a path in guidance terms (spec §8), 24 bytes. `dir` is a `Dir` discriminant.
+ */
+typedef struct LsPathSegment {
+  uint32_t kind;
+  uint32_t dir;
+  uint32_t count;
+  uint32_t _reserved;
+  uint64_t link_id;
+} LsPathSegment;
+
 #define LsDir_ALL { LsDir_South, LsDir_North, LsDir_East, LsDir_West, }
 
 #ifdef __cplusplus
@@ -595,6 +606,17 @@ enum LsStatus ls_path_links(const struct LsPath *path,
                             struct LsPathLink *out,
                             uintptr_t capacity,
                             uintptr_t *written);
+
+/**
+ * Compress a path into direction runs broken at link traversals ("north 5, east 2, take
+ * the teleporter" as data). Needs the context the path was found on. Same buffer
+ * convention as [`ls_path_nodes`].
+ */
+enum LsStatus ls_path_segments(const struct LsContext *ctx,
+                               const struct LsPath *path,
+                               struct LsPathSegment *out,
+                               uintptr_t capacity,
+                               uintptr_t *written);
 
 /**
  * Release a path. Null is a no-op.
