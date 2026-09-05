@@ -1,7 +1,9 @@
 using System;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading;
 using Loadstar;
+using Loadstar.Audio;
 
 // Walking-skeleton smoke test: prove the Rust → C ABI → .NET Framework x86 path end to end.
 // Exit code 0 on success; any mismatch or exception is a failure.
@@ -222,6 +224,55 @@ using (var ctx = TileContext.FromWalkable(W, H, 1, cells))
     Expect(Phrases.Compass(20) == "north" && Phrases.Compass(45) == "northeast" && Phrases.Compass(120) == "southeast" && Phrases.Compass(300) == "northwest" && Phrases.Compass(350) == "north",
         "compass sectors use the 2:1 cardinal rule");
     Expect(Phrases.CategorySwitch("NPCs", 1) == "NPCs, 1 object", "category switch phrase");
+}
+
+// --- Audio through the ABI: null-device math, then a short real WASAPI ping. ---
+{
+    Expect(Marshal.SizeOf(typeof(Loadstar.Audio.SourceDesc)) == 96 && Marshal.SizeOf(typeof(EffectDesc)) == 40
+        && Marshal.SizeOf(typeof(ChainTarget)) == 24 && Marshal.SizeOf(typeof(DeviceConfig)) == 16
+        && Marshal.SizeOf(typeof(StreamInfo)) == 16 && Marshal.SizeOf(typeof(Finished)) == 16, "audio struct sizes match the ABI");
+
+    using (var dev = AudioDevice.OpenNull(48000, 256))
+    {
+        Expect(dev.Info.SampleRate == 48000 && dev.Info.PeriodFrames == 256 && !dev.Info.LowLatency, $"null device: {dev.Info}");
+        var space = dev.CreateSpace(SpaceMode.Planar);
+        var tone = dev.Tone(440, 500);
+        dev.SetListener(space, default, new Vec3(0, 0, -1), new Vec3(0, 1, 0));
+        dev.Sync(space, new[] { Loadstar.Audio.SourceDesc.Buffer_(1, tone, Bounds.Point(new Vec3(4, 0, 0))).Looping() });
+        var buf = new float[512];
+        float l = 0, r = 0;
+        for (int i = 0; i < 6; i++)
+        {
+            dev.Render(buf);
+            for (int k = 0; k < buf.Length; k += 2) { l += buf[k] * buf[k]; r += buf[k + 1] * buf[k + 1]; }
+        }
+        Expect(r > l * 2, $"null device: a source to the east is heard on the right (L {l:F1}, R {r:F1})");
+
+        var walls = dev.CreateBus(space, 0.5f);
+        dev.SetChain(ChainTarget.ForBus(space, walls), new[] { EffectDesc.LowPass(200) });
+        dev.SetEffectEnabled(ChainTarget.ForBus(space, walls), 0, false);
+        dev.Fire(space, Loadstar.Audio.SourceDesc.Buffer_(77, tone, Bounds.Point(new Vec3(0, 0, -1))).Repeats(1, 0));
+        for (int i = 0; i < 120; i++) dev.Render(buf);
+        var done = dev.TakeFinished();
+        Expect(done.Length == 1 && done[0].Id == 77 && done[0].Space == space, "fired one-shot reported finished");
+        Expect(dev.TakeFinished().Length == 0, "finished list drains");
+    }
+
+    try
+    {
+        using var dev = AudioDevice.Open();
+        Console.WriteLine($"  WASAPI: {dev.Info}");
+        var space = dev.CreateSpace(SpaceMode.Planar);
+        var ping = dev.Tone(880, 120, 5, 40);
+        dev.SetListener(space, default, new Vec3(0, 0, -1), new Vec3(0, 1, 0));
+        dev.Fire(space, Loadstar.Audio.SourceDesc.Buffer_(5, ping, Bounds.Point(new Vec3(3, 0, 0))).Repeats(3, 150).WithGain(0.4f));
+        Thread.Sleep(900);
+        Expect(Array.Exists(dev.TakeFinished(), f => f.Id == 5), "WASAPI: three pings on the right played and finished");
+    }
+    catch (LoadstarException e) when (e.Status == Status.DeviceUnavailable)
+    {
+        Console.WriteLine("  (no audio device: WASAPI check skipped)");
+    }
 }
 
 // --- Tier 2: explicit masks + a ramp override between two layers. ---

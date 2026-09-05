@@ -294,6 +294,13 @@ impl Device {
 
     // --- Readback ---
 
+    /// Hand back items taken with [`Device::take_finished`] that the caller could not accept
+    /// (a too-small buffer); they are reported again on the next call, in order.
+    pub fn return_finished(&mut self, mut items: Vec<(u32, u64)>) {
+        items.append(&mut self.finished);
+        self.finished = items;
+    }
+
     /// `(space, id)` pairs whose sequences ended since the last call.
     pub fn take_finished(&mut self) -> Vec<(u32, u64)> {
         #[cfg(windows)]

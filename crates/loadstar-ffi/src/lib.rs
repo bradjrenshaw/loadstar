@@ -9,6 +9,9 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+#[cfg(feature = "audio")]
+pub mod audio;
+
 use loadstar_core::context::{GoalMode as CoreGoalMode, PathOptions as CorePathOptions, Profile, TileContext};
 use loadstar_core::entities::{Entity, SyncStats as CoreSyncStats};
 use loadstar_core::tracker::{Action as CoreAction, Filter, FilterEntry, Tracker};
@@ -31,6 +34,10 @@ pub enum Status {
     BufferTooSmall = 3,
     /// No route exists (or an endpoint is off the map). Not an error; the out handle is null.
     NoPath = 4,
+    /// No audio device could be opened, or the backend is unavailable on this platform.
+    DeviceUnavailable = 5,
+    /// The audio command queue is full — the mixer is not draining.
+    Busy = 6,
     /// Internal panic caught at the boundary. The context may be inconsistent; the host is intact.
     Panic = 100,
 }
@@ -188,7 +195,7 @@ pub struct BoundsDesc {
 }
 
 impl BoundsDesc {
-    fn to_core(self) -> Option<Bounds> {
+    pub(crate) fn to_core(self) -> Option<Bounds> {
         Some(match self.kind {
             0 => Bounds::Point(self.a),
             1 => Bounds::TileRect {
@@ -355,7 +362,7 @@ impl From<CoreSyncStats> for SyncStats {
 }
 
 /// Run an ABI body, converting any panic into [`Status::Panic`] instead of unwinding into the host.
-fn guard(f: impl FnOnce() -> Status) -> Status {
+pub(crate) fn guard(f: impl FnOnce() -> Status) -> Status {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or(Status::Panic)
 }
 

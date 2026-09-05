@@ -26,6 +26,8 @@ public enum Status
     InvalidArgument = 2,
     BufferTooSmall = 3,
     NoPath = 4,
+    DeviceUnavailable = 5,
+    Busy = 6,
     Panic = 100,
 }
 

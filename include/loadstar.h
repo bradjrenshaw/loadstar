@@ -26,6 +26,14 @@ typedef enum LsStatus {
    */
   LsStatus_NoPath = 4,
   /**
+   * No audio device could be opened, or the backend is unavailable on this platform.
+   */
+  LsStatus_DeviceUnavailable = 5,
+  /**
+   * The audio command queue is full — the mixer is not draining.
+   */
+  LsStatus_Busy = 6,
+  /**
    * Internal panic caught at the boundary. The context may be inconsistent; the host is intact.
    */
   LsStatus_Panic = 100,
@@ -51,6 +59,11 @@ typedef enum LsDir LsDir;
 typedef uint8_t LsDir;
 #endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
+
+/**
+ * Opaque: an open audio device and everything under it. Exported to C as `LsAudioDevice`.
+ */
+typedef struct LsAudioDevice LsAudioDevice;
 
 /**
  * Opaque: a map plus everything consistent with it (spec §4). Exported to C as `LsContext`.
@@ -256,6 +269,110 @@ typedef struct LsPathSegment {
   uint32_t _reserved;
   uint64_t link_id;
 } LsPathSegment;
+
+typedef struct LsAudioDeviceConfig {
+  /**
+   * 0 = the device's mix rate.
+   */
+  uint32_t sample_rate;
+  /**
+   * 0 = the smallest period the driver offers.
+   */
+  uint32_t period_frames;
+  float master_gain;
+  /**
+   * 0 = default (64).
+   */
+  uint32_t voice_cap;
+} LsAudioDeviceConfig;
+
+typedef struct LsAudioStreamInfo {
+  uint32_t sample_rate;
+  uint32_t period_frames;
+  uint32_t channels;
+  /**
+   * Nonzero when the `IAudioClient3` low-latency path is active.
+   */
+  uint32_t low_latency;
+} LsAudioStreamInfo;
+
+/**
+ * A finished one-shot: `(space, source id)`, 16 bytes.
+ */
+typedef struct LsAudioFinished {
+  uint32_t space;
+  uint32_t _reserved;
+  uint64_t id;
+} LsAudioFinished;
+
+/**
+ * A source record (audio spec §3), 96 bytes.
+ */
+typedef struct LsAudioSourceDesc {
+  /**
+   * Mod-assigned; 0 = anonymous (fired sources only).
+   */
+  uint64_t id;
+  /**
+   * `AudioSourceKind`.
+   */
+  uint8_t kind;
+  /**
+   * Oscillator waveform (0 sine, 1 triangle, 2 square, 3 saw) or noise colour (0 white, 1 pink, 2 brown).
+   */
+  uint8_t waveform;
+  uint8_t priority;
+  uint8_t _reserved0;
+  /**
+   * Plays per trigger; 0 = forever.
+   */
+  uint16_t repeat_count;
+  uint16_t _reserved1;
+  uint32_t buffer;
+  uint32_t bus;
+  /**
+   * Bitwise OR of `AudioSourceFlags`.
+   */
+  uint32_t flags;
+  struct LsBoundsDesc bounds;
+  float gain;
+  /**
+   * Buffer: playback rate. Oscillator: frequency in Hz.
+   */
+  float pitch;
+  /**
+   * Lateral crossover in the space's units; for RELATIVE sources, the pan (−1..1).
+   */
+  float pan_width;
+  float repeat_gap_ms;
+  uint32_t _reserved2[3];
+} LsAudioSourceDesc;
+
+/**
+ * Which chain an effect operation addresses, 24 bytes.
+ */
+typedef struct LsAudioChainTarget {
+  /**
+   * `AudioChainKind`.
+   */
+  uint32_t kind;
+  uint32_t space;
+  uint32_t bus;
+  uint32_t _reserved;
+  uint64_t source_id;
+} LsAudioChainTarget;
+
+/**
+ * An effect node (audio spec §4.2), 40 bytes. `flags` bit 0 = enabled; renderer cue bits above.
+ */
+typedef struct LsAudioEffectDesc {
+  /**
+   * `AudioEffectKind`.
+   */
+  uint32_t kind;
+  uint32_t flags;
+  float p[8];
+} LsAudioEffectDesc;
 
 #define LsDir_ALL { LsDir_South, LsDir_North, LsDir_East, LsDir_West, }
 
@@ -622,6 +739,149 @@ enum LsStatus ls_path_segments(const struct LsContext *ctx,
  * Release a path. Null is a no-op.
  */
 void ls_path_free(struct LsPath *path);
+
+/**
+ * Open the default audio output (WASAPI shared mode on Windows). `DeviceUnavailable` if none.
+ */
+enum LsStatus la_device_open(struct LsAudioDeviceConfig cfg, struct LsAudioDevice **out);
+
+/**
+ * Open a device with no hardware: periods are rendered on demand with [`la_device_render`].
+ * For tests and harnesses.
+ */
+enum LsStatus la_device_open_null(struct LsAudioDeviceConfig cfg,
+                                  uint32_t sample_rate,
+                                  uint32_t period_frames,
+                                  struct LsAudioDevice **out);
+
+/**
+ * Close a device, stopping its audio thread and releasing every space and buffer. Null is a no-op.
+ */
+void la_device_close(struct LsAudioDevice *dev);
+
+/**
+ * The format the backend actually opened.
+ */
+enum LsStatus la_device_info(struct LsAudioDevice *dev, struct LsAudioStreamInfo *out);
+
+enum LsStatus la_device_master_gain(struct LsAudioDevice *dev, float gain);
+
+/**
+ * Null devices only: apply pending commands and render `frames` frames of interleaved
+ * stereo into `out` (`2 * frames` floats). A no-op on hardware devices.
+ */
+enum LsStatus la_device_render(struct LsAudioDevice *dev, float *out, uintptr_t frames);
+
+/**
+ * Drain the `(space, id)` pairs whose sequences ended since the last call. Buffer convention
+ * as `ls_path_nodes`: `*written` receives the count; `BufferTooSmall` if it exceeds `capacity`
+ * (nothing is consumed in that case).
+ */
+enum LsStatus la_device_finished(struct LsAudioDevice *dev,
+                                 struct LsAudioFinished *out,
+                                 uintptr_t capacity,
+                                 uintptr_t *written);
+
+/**
+ * Create a space. `mode` is an `AudioSpaceMode`; `unit_scale` = units per metre (0 = 1).
+ */
+enum LsStatus la_space_create(struct LsAudioDevice *dev,
+                              uint32_t mode,
+                              float gain,
+                              float unit_scale,
+                              uint32_t *out);
+
+enum LsStatus la_space_destroy(struct LsAudioDevice *dev, uint32_t space);
+
+enum LsStatus la_space_gain(struct LsAudioDevice *dev, uint32_t space, float gain);
+
+/**
+ * Listener pose for a space, each frame.
+ */
+enum LsStatus la_listener_set(struct LsAudioDevice *dev,
+                              uint32_t space,
+                              struct LsVec3 position,
+                              struct LsVec3 forward,
+                              struct LsVec3 up);
+
+/**
+ * Per-frame hook for simulating renderers (audio spec §3). A no-op for the head model.
+ */
+enum LsStatus la_space_update(struct LsAudioDevice *dev, uint32_t space, float dt);
+
+enum LsStatus la_bus_create(struct LsAudioDevice *dev, uint32_t space, float gain, uint32_t *out);
+
+enum LsStatus la_bus_gain(struct LsAudioDevice *dev, uint32_t space, uint32_t bus, float gain);
+
+/**
+ * Upload interleaved PCM; converted to mono at the mixer rate (copied — the caller keeps ownership).
+ */
+enum LsStatus la_buffer_create(struct LsAudioDevice *dev,
+                               const float *samples,
+                               uintptr_t samples_len,
+                               uint32_t channels,
+                               uint32_t sample_rate,
+                               uint32_t *out);
+
+enum LsStatus la_buffer_click(struct LsAudioDevice *dev, float ms, uint32_t *out);
+
+enum LsStatus la_buffer_tone(struct LsAudioDevice *dev,
+                             float hz,
+                             float ms,
+                             float attack_ms,
+                             float release_ms,
+                             uint32_t *out);
+
+enum LsStatus la_buffer_free(struct LsAudioDevice *dev, uint32_t buffer);
+
+/**
+ * Declarative snapshot of a space's declared sources (audio spec §3). `InvalidArgument`
+ * rejects the whole snapshot on any bad bounds kind.
+ */
+enum LsStatus la_space_sync(struct LsAudioDevice *dev,
+                            uint32_t space,
+                            const struct LsAudioSourceDesc *descs,
+                            uintptr_t descs_len);
+
+enum LsStatus la_source_upsert(struct LsAudioDevice *dev,
+                               uint32_t space,
+                               const struct LsAudioSourceDesc *desc);
+
+enum LsStatus la_source_remove(struct LsAudioDevice *dev, uint32_t space, uint64_t id);
+
+/**
+ * Play a sequence and remove the source when it drains (audio spec §3, fired sources).
+ */
+enum LsStatus la_space_fire(struct LsAudioDevice *dev,
+                            uint32_t space,
+                            const struct LsAudioSourceDesc *desc);
+
+enum LsStatus la_source_stop(struct LsAudioDevice *dev, uint32_t space, uint64_t id);
+
+/**
+ * Replace a chain wholesale (`nodes` may be null when `nodes_len` is 0).
+ */
+enum LsStatus la_chain_set(struct LsAudioDevice *dev,
+                           struct LsAudioChainTarget target,
+                           const struct LsAudioEffectDesc *nodes,
+                           uintptr_t nodes_len);
+
+/**
+ * Retune one parameter of one node in place.
+ */
+enum LsStatus la_effect_set_param(struct LsAudioDevice *dev,
+                                  struct LsAudioChainTarget target,
+                                  uint32_t index,
+                                  uint32_t param,
+                                  float value);
+
+/**
+ * Enable or disable one node, crossfaded.
+ */
+enum LsStatus la_effect_set_enabled(struct LsAudioDevice *dev,
+                                    struct LsAudioChainTarget target,
+                                    uint32_t index,
+                                    bool enabled);
 
 #ifdef __cplusplus
 }  // extern "C"

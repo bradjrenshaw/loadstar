@@ -10,5 +10,10 @@ repository.workspace = true
 name = "loadstar"
 crate-type = ["cdylib"]
 
+[features]
+default = ["audio"]
+audio = ["dep:loadstar-audio"]
+
 [dependencies]
 loadstar-core.workspace = true
+loadstar-audio = { workspace = true, optional = true }
