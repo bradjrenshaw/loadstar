@@ -89,44 +89,55 @@ Sources are **persistent objects re-evaluated every period**: a one-shot fired f
 
 ```
 LaSourceDesc {                   // 96 bytes; all numeric, mod-assigned id
-    id:           u64            // reuse the nav entity id to tie a sound to an object
+    id:           u64            // reuse the nav entity id to tie a sound to an object; 0 = anonymous (fired only)
     kind:         u8             // BUFFER | OSCILLATOR
     waveform:     u8             // oscillator: SINE | TRIANGLE | SQUARE | SAW
     priority:     u8             // voice stealing when over the voice cap
     _reserved0:   u8
+    repeat_count: u16            // plays per trigger: 1 = once, N = N times, 0 = forever (LOOP)
+    _reserved1:   u16
     buffer:       u32            // BUFFER kind
     bus:          u32
-    flags:        u32            // LOOP | PLAYING | RESTART | RELATIVE | ...
+    flags:        u32            // PLAYING | RESTART | RELATIVE | AUTO_REMOVE | ...
     bounds:       LsBoundsDesc   // 40 bytes
     gain:         f32            // linear
     pitch:        f32            // BUFFER: playback rate; OSCILLATOR: frequency in Hz (phase-continuous)
     pan_width:    f32            // lateral crossover (units of the space); see spatializer
-    _reserved1:   [u32; 3]
+    repeat_gap_ms: f32           // silence between repeats (a sonar ping every 800 ms)
+    _reserved2:   [u32; 2]
 }
 ```
 
+`repeat_count` replaces a separate loop flag: 0 loops forever, 1 is a one-shot, N plays N times with `repeat_gap_ms` between plays (0 = back to back). A **trigger** is what starts a play sequence: the record first arriving with `PLAYING` set, `PLAYING` going 0→1, or a `RESTART` pulse.
+
 Flags:
-- `LOOP` — repeat until stopped.
-- `PLAYING` — desired state; clearing it stops with a ramp. One-shots clear themselves when drained and are reported as finished (below). **Gain 0 with `PLAYING` set keeps a voice alive and silent** — wotr's mute-not-dispose, so a system muted during a cutscene resumes seamlessly.
-- `RESTART` — edge-triggered: retrigger from the start this frame even if already playing (a footstep every step). Cleared by the crate after acting.
-- `RELATIVE` — position is relative to the listener; bypasses the spatializer's geometry (UI sounds, breath, heartbeat, centered speech).
+- `PLAYING` — desired state, level-triggered; clearing it stops with a ramp. **A finished sequence stays finished while its record is unchanged** — re-sending the same record with `PLAYING` still set does *not* retrigger, which is what makes one-shots safe to leave in a per-frame snapshot. **Gain 0 with `PLAYING` set keeps a voice alive and silent** — wotr's mute-not-dispose, so a system muted during a cutscene resumes seamlessly.
+- `RESTART` — edge-triggered: start the sequence again this frame even if already playing (a footstep every step). Cleared by the crate after acting.
+- `RELATIVE` — position is relative to the listener; bypasses the renderer's geometry (UI sounds, breath, heartbeat, centered speech).
+- `AUTO_REMOVE` — remove the source from the space when its sequence finishes, so upsert-style mods never have to clean up one-shots. Fired sources (below) always behave this way.
 
 Per-source **effect chain** and **distance model** are set separately (§4) because they are lists, not fixed-size fields.
 
 An `OSCILLATOR` source is the slope/elevation tone: frequency changes are phase-continuous (glissando), gain ramps ~20 ms, so pitch can track a cursor's height without clicks.
 
-### Declaring the soundscape
+### Declaring the soundscape: two ownership models
 
-Same contract as entities:
+**Declared sources** — the mod owns their lifetime, same contract as entities:
 
-- **`la_space_sync(space, sources[], count, stats*)`** — declarative snapshot: upsert every record, stop and remove every source absent from the snapshot. The crate diffs numerically; an unchanged record costs nothing, a moved one updates its targets, a changed buffer restarts.
-- **`la_source_upsert` / `la_source_remove`** — explicit deltas.
+- **`la_space_sync(space, sources[], count, stats*)`** — declarative snapshot: upsert every record, stop and remove every *declared* source absent from the snapshot. The crate diffs numerically; an unchanged record costs nothing, a moved one updates its targets, a changed buffer restarts. A one-shot can sit in the snapshot indefinitely: it plays once on arrival and stays finished until its record changes (see `PLAYING`).
+- **`la_source_upsert` / `la_source_remove`** — explicit deltas. With `AUTO_REMOVE` a one-shot removes itself when done.
+
+**Fired sources** — the crate owns their lifetime:
+
+- **`la_space_fire(space, desc*)`** — play a record's sequence (`repeat_count` times, `repeat_gap_ms` apart) and remove the source when it drains. Fired sources are invisible to `la_space_sync` (never removed by a snapshot that omits them) and are still full sources while alive: positioned from their bounds, re-spatialized as the listener moves, on their bus, with their chains. `id` may be 0 for anonymous fire-and-forget; a nonzero id allows `la_source_stop`, state polling and completion reporting, and firing again with the same id retriggers the existing voice instead of stacking a new one.
+
+The common cases: a chest opening is `la_space_fire` with `repeat_count = 1`; a three-ping sonar reply is `la_space_fire` with `repeat_count = 3, repeat_gap_ms = 250`; a footstep is a declared `RELATIVE` source pulsed with `RESTART`; a beacon that pings every second while the object exists is a declared source with `repeat_count = 0, repeat_gap_ms = 1000`.
 
 Every call encodes a command into the ring buffer; the audio thread applies a frame's commands together at the next period boundary.
 
 ### Reading back
 
-No callbacks, so completion is polled: `la_source_state(space, id, out) → {playing, position_frames}` and `la_space_finished(space, out_ids[], cap, written)` drains the one-shots that ended since the last call. Fire-and-forget mods never call either.
+No callbacks, so completion is polled: `la_source_state(space, id, out) → {playing, position_frames, plays_remaining}` and `la_space_finished(space, out_ids[], cap, written)` drains the ids (nonzero only) whose sequences ended since the last call. Fire-and-forget mods never call either.
 
 ---
 
@@ -269,6 +280,7 @@ Each of these was a bespoke subsystem in wotr or CSTW; here they are configurati
 - **Positioned, overlapping speech** (wotr `PositionalSpeech`): TTS PCM uploaded as a buffer, played as a one-shot source on a "speech" bus with a `REFERENCE` distance model; centered speech is `RELATIVE`. Many can play at once because they are just sources.
 - **Slope/elevation tone** (wotr `ToneEngine`): one `OSCILLATOR` source, `pitch` = frequency tracking the cursor's height each frame, gain 0 when idle.
 - **Footsteps** (CSTW `FootstepPatch`, wotr `TerrainSounds`): a click or terrain buffer on a `RELATIVE` source with `RESTART` set on each arrival; stop-on-key-release is clearing `PLAYING` (20 ms ramp, no click).
+- **Interaction feedback** (chest opened, door unlocked, menu confirm): `la_space_fire` with a one-shot record — no bookkeeping, the source removes itself.
 - **Compass ping**: a one-shot placed at world north through the rotated ear frame — the listener API does the rotation.
 - **Menu/dialog cues**: `RELATIVE` one-shots on a "ui" bus, or a whole UI space.
 
