@@ -398,13 +398,17 @@ impl TileGrid {
         None
     }
 
-    /// Nodes from which one ordinary (non-link) step enters any of `targets`, excluding the
-    /// targets themselves — the "stand next to it" goal candidates (spec §8). Sorted, deduplicated.
+    /// The "stand next to it" goal candidates (spec §8): cells a step away from any of
+    /// `targets` that an agent can stand on, on the target's layer — plus any node with an
+    /// ordinary (non-link) edge *into* a target, which covers ramps and floor changes. The
+    /// targets themselves are excluded and need not be enterable at all: a chest sits on a
+    /// solid tile, and you talk to a shopkeeper across the counter. Sorted, deduplicated.
     pub fn adjacent_candidates(&self, targets: &[NodeId]) -> Vec<NodeId> {
         let target_set: std::collections::HashSet<NodeId> = targets.iter().copied().collect();
         let mut out = Vec::new();
         let mut scratch = Vec::with_capacity(8);
         for &t in targets {
+            let Some((_, _, t_layer)) = self.node_coords(t) else { continue };
             for dir in Dir::ALL {
                 let Some((c, r)) = self.adjacent(t, dir) else { continue };
                 for layer in 0..self.layers {
@@ -412,9 +416,13 @@ impl TileGrid {
                     if target_set.contains(&candidate) {
                         continue;
                     }
-                    scratch.clear();
-                    self.neighbors(candidate, &mut scratch);
-                    if scratch.iter().any(|e| e.link.is_none() && e.to == t) {
+                    let mut ok = layer == t_layer && self.has_edges(candidate);
+                    if !ok {
+                        scratch.clear();
+                        self.neighbors(candidate, &mut scratch);
+                        ok = scratch.iter().any(|e| e.link.is_none() && e.to == t);
+                    }
+                    if ok {
                         out.push(candidate);
                     }
                 }
@@ -775,19 +783,35 @@ mod tests {
     }
 
     #[test]
-    fn adjacent_candidates_follow_real_edges_only() {
-        // 3x3 open grid; NPC occupies the center. Candidates are its four neighbours...
+    fn adjacent_candidates_are_standable_neighbours_even_when_the_target_is_solid() {
+        // 3x3 grid whose center is a chest on a solid tile: no edges in or out of it.
+        let mut w = [1u8; 9];
+        w[4] = 0;
+        let mut g = TileGrid::from_walkable(3, 3, 1, &w).unwrap();
+        assert!(!g.has_edges(4));
+        assert_eq!(g.adjacent_candidates(&[4]), vec![1, 3, 5, 7], "you interact from beside a chest you can't step on");
+        // A wall beside the target is not somewhere to stand.
+        for d in Dir::ALL {
+            g.set_edge(1, d, false).unwrap();
+        }
+        assert_eq!(g.adjacent_candidates(&[4]), vec![3, 5, 7]);
+
+        // A closed edge into an enterable target does not matter (talking across a counter)...
         let mut g = open(3, 3, 1);
-        let center = g.node_id(1, 1, 0).unwrap();
-        assert_eq!(g.adjacent_candidates(&[center]), vec![1, 3, 5, 7]);
-        // ...unless the edge into it is closed (a counter between you and the shopkeeper),
-        assert_eq!(g.set_edge(1, Dir::South, false), Ok(()));
-        assert_eq!(g.adjacent_candidates(&[center]), vec![3, 5, 7]);
+        g.set_edge(1, Dir::South, false).unwrap();
+        assert_eq!(g.adjacent_candidates(&[4]), vec![1, 3, 5, 7]);
         // ...and a teleporter landing on it does not count as adjacency.
-        g.add_link(1, Link { from: 8, to: center, cost: 1.0, bidirectional: false, enabled: true }).unwrap();
-        assert_eq!(g.adjacent_candidates(&[center]), vec![3, 5, 7]);
-        // A 2-cell target excludes its own cells from the candidates (1 is still cut off by the closed edge).
-        assert_eq!(g.adjacent_candidates(&[3, 4]), vec![0, 5, 6, 7]);
+        g.add_link(1, Link { from: 8, to: 4, cost: 1.0, bidirectional: false, enabled: true }).unwrap();
+        assert_eq!(g.adjacent_candidates(&[4]), vec![1, 3, 5, 7]);
+        // A 2-cell target excludes its own cells from the candidates.
+        assert_eq!(g.adjacent_candidates(&[3, 4]), vec![0, 1, 5, 6, 7]);
+
+        // Across a floor change: the cell at the bottom of a ramp has an edge into the upper
+        // target, so it is a candidate even though it is on another layer.
+        let mut g = open(3, 1, 2);
+        g.set_edge_override(1, Dir::East, EdgeOverride { target_layer: 1, cost: 1.0 }).unwrap();
+        let upper = g.node_id(2, 0, 1).unwrap();
+        assert!(g.adjacent_candidates(&[upper]).contains(&1));
     }
 
     #[test]
