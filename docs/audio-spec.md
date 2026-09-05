@@ -1,6 +1,6 @@
 # Loadstar Audio — Design Specification
 
-*Companion to `spec.md`. Status: draft 2 for review, pre-implementation.*
+*Companion to `spec.md`. Status: reviewed; decisions in §9. Pre-implementation.*
 
 *Draft 2 folds in what the Wrath of the Righteous mod (`wotr-access`) learned by ear: the head model in its `Spatializer`, the block-rate retuning discipline in its `PositionalEmitter`, ear-fixed wall-tone banks, the facing-rotated listener frame, the slope oscillator, and positional speech. Those are the validated behaviours; this document turns them into data the crate evaluates.*
 
@@ -55,7 +55,7 @@ Rules the mixer thread lives by:
 
 ### Device
 
-One per process: `la_device_open(config) → handle`. Config: preferred sample rate (0 = device mix format), requested period (0 = minimum), master gain. Opens the default render endpoint in shared mode; mixes in f32 at the device's mix format (typically 48 kHz stereo). Reports the period actually obtained. Owns the **master chain** (§4).
+One per process: `la_device_open(config) → handle`. Config: preferred sample rate (0 = device mix format), requested period (0 = minimum), master gain, voice cap (0 = default 64). Opens the default render endpoint in shared mode; mixes in f32 at the device's mix format (typically 48 kHz stereo). Reports the period actually obtained. Owns the **master chain** (§4).
 
 ### Buffers
 
@@ -65,7 +65,7 @@ Procedural convenience: `la_buffer_click(device, ms)` and `la_buffer_tone(device
 
 ### Space
 
-An `AudioSpace` ≈ a navigation context: a listener, buses, sources and a chain. `la_space_create(device, mode, gain) → space` with mode `Planar` (pan by XZ bearing, elevation ignored) or `Spatial` (full 3D). One type; the modes differ only in how the spatializer reads the geometry.
+An `AudioSpace` ≈ a navigation context: a listener, buses, sources and a chain. `la_space_create(device, mode, gain, unit_scale) → space` with mode `Planar` (pan by XZ bearing, elevation ignored) or `Spatial` (full 3D), and `unit_scale` = the space's units per metre (1 for a metric game, e.g. 1/1.5 for a tile game whose tiles are 1.5 m) so metre-based defaults land sensibly. One type; the modes differ only in how the spatializer reads the geometry.
 
 Spaces coexist (overworld vs. dungeon; a UI space with no spatialization at all) and sum into the device master.
 
@@ -90,8 +90,8 @@ Sources are **persistent objects re-evaluated every period**: a one-shot fired f
 ```
 LaSourceDesc {                   // 96 bytes; all numeric, mod-assigned id
     id:           u64            // reuse the nav entity id to tie a sound to an object; 0 = anonymous (fired only)
-    kind:         u8             // BUFFER | OSCILLATOR
-    waveform:     u8             // oscillator: SINE | TRIANGLE | SQUARE | SAW
+    kind:         u8             // BUFFER | OSCILLATOR | NOISE
+    waveform:     u8             // oscillator: SINE | TRIANGLE | SQUARE | SAW; noise: WHITE | PINK | BROWN
     priority:     u8             // voice stealing when over the voice cap
     _reserved0:   u8
     repeat_count: u16            // plays per trigger: 1 = once, N = N times, 0 = forever (LOOP)
@@ -118,7 +118,7 @@ Flags:
 
 Per-source **effect chain** and **distance model** are set separately (§4) because they are lists, not fixed-size fields.
 
-An `OSCILLATOR` source is the slope/elevation tone: frequency changes are phase-continuous (glissando), gain ramps ~20 ms, so pitch can track a cursor's height without clicks.
+An `OSCILLATOR` source is the slope/elevation tone: frequency changes are phase-continuous (glissando), gain ramps ~20 ms, so pitch can track a cursor's height without clicks. A `NOISE` source is a continuous generator (white, pink or brown) for wind, water and static-style cues; its colour and the source chain do the shaping.
 
 ### Declaring the soundscape: two ownership models
 
@@ -217,7 +217,7 @@ Every node keeps **target** and **current** values. Per period: gains, pans and 
 
 ### 4.7 Voices
 
-Default cap 32 per device. Over the cap, the quietest lowest-priority sources are stolen with a ramp-out. Looping sources at gain 0 still occupy a voice (that is the point of mute-not-dispose); mods with many silent loops should raise the cap or remove them.
+Cap configurable at `la_device_open`, default 64. Over the cap, the quietest lowest-priority sources are stolen with a ramp-out. Looping sources at gain 0 still occupy a voice (that is the point of mute-not-dispose); mods with many silent loops should raise the cap or remove them.
 
 ### 4.8 Renderers and extensibility
 
@@ -298,12 +298,12 @@ Per-system volume sliders are bus gains; a master slider is the device gain; "oc
 6. **Steam Audio renderer**: dynamic loading, binaural + direct effect, geometry export from tile contexts, evaluated against the head model with blind players.
 7. Later: sends/reverb, ambisonic buses, Linux backend, streaming.
 
-## 9. Open questions for review
+## 9. Decisions (review of draft 2)
 
-- **Chains vs. a real graph**: v1 proposes linear chains on four attachment points plus buses. Is there a routing you need that this cannot express (e.g., one source feeding two buses)? Sends would cover reverb-style cases later.
-- **Head-model defaults**: adopt wotr's tuned constants (12 dB cap, 0.82 exponent, 0.66 ms ITD, 1.5 kHz/−8 dB shadow, 3 kHz/−10 dB rear) as the crate defaults?
-- **Distance units**: per-space unit scale (tiles vs. metres) so `DISTANCE` defaults can be sensible per space?
-- **Voice cap** — 32 enough given mute-not-dispose keeps voices alive?
-- **Single DLL**: fold `la_*` into `loadstar.dll` behind a cargo feature (proposed) vs. a separate `loadstar_audio.dll`.
-- **Buffer ownership**: upload-and-copy (proposed) vs. mod-owned memory.
-- **Oscillator waveforms and a noise source** — worth including in v1 for wind/water-style cues, or later?
+- **Routing**: linear chains on four attachment points plus buses. No general graph; sends/returns are the extension path if reverb-style routing is ever needed.
+- **Head-model defaults**: wotr's ear-tuned constants are the crate defaults — 12 dB ILD cap, 0.82 pan exponent, 0.66 ms max ITD, head shadow 1.5 kHz / −8 dB, rear cue 3 kHz / −10 dB — and every one of them is a parameter of the `SPATIALIZER` node, settable per space and per source.
+- **Distance units**: a space declares `unit_scale` (units per metre) at creation; `DISTANCE` defaults and the head model's `pan_width` default are expressed in metres and scaled, so a tile game and a metric 3D game get sensible behaviour without per-source tuning.
+- **Voice cap**: configurable at `la_device_open`; **default 64**. Mute-not-dispose keeps voices alive, and busier games will want more.
+- **Packaging**: the `la_*` surface ships inside `loadstar.dll` behind the `audio` cargo feature (on by default). One native DLL.
+- **Buffer ownership**: **upload-and-copy.** It is also the faster choice in practice: the copy is one-time and the crate resamples and de-interleaves into its own mixer-ready layout at upload, so the per-period path reads contiguous, already-converted samples with no rate conversion, no pinning and no lifetime hazards across the ABI. Mod-owned memory would save a one-time copy and cost every period.
+- **Noise source**: included in v1 as `NOISE` kind with `waveform` ∈ {WHITE, PINK, BROWN}; gain and the source chain shape it (a `LOWPASS` on pink noise is wind; brown noise under a river prism is water). Cheap to add, useful immediately.
