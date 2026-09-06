@@ -49,6 +49,8 @@ enum Backend {
     Null { engine: Engine, inbox: rtrb::Consumer<Command> },
     #[cfg(windows)]
     Wasapi { stream: crate::backend::wasapi::WasapiStream, garbage: rtrb::Consumer<Garbage>, finished: rtrb::Consumer<(u32, u64)> },
+    #[cfg(feature = "miniaudio")]
+    Miniaudio { stream: crate::backend::miniaudio::MiniaudioStream, garbage: rtrb::Consumer<Garbage>, finished: rtrb::Consumer<(u32, u64)> },
 }
 
 pub struct Device {
@@ -99,8 +101,63 @@ impl Device {
         })
     }
 
+    /// Open the default output through miniaudio (WASAPI → DirectSound → WinMM on Windows;
+    /// CoreAudio, ALSA, PulseAudio, JACK elsewhere). Handles device changes itself.
+    #[cfg(feature = "miniaudio")]
+    pub fn open_miniaudio(cfg: DeviceConfig) -> Result<Device, DeviceError> {
+        use crate::backend::miniaudio::{MiniaudioConfig, open};
+        let (commands, inbox) = rtrb::RingBuffer::new(QUEUE_CAPACITY);
+        let (garbage_tx, garbage_rx) = rtrb::RingBuffer::new(QUEUE_CAPACITY);
+        let (finished_tx, finished_rx) = rtrb::RingBuffer::new(QUEUE_CAPACITY);
+        let stream = open(
+            MiniaudioConfig { sample_rate: cfg.sample_rate, period_frames: cfg.period_frames, master_gain: cfg.master_gain, voice_cap: cfg.voice_cap },
+            inbox,
+            garbage_tx,
+            finished_tx,
+        )
+        .map_err(|e| DeviceError::Backend(e.0))?;
+        let info = stream.info;
+        Ok(Device {
+            info,
+            commands,
+            finished: Vec::new(),
+            spaces: Vec::new(),
+            buffers: Vec::new(),
+            backend: Backend::Miniaudio { stream, garbage: garbage_rx, finished: finished_rx },
+        })
+    }
+
+    /// The recommended way to open real hardware: miniaudio when compiled in (broadest device
+    /// support), otherwise the direct WASAPI backend on Windows.
+    pub fn open_default(cfg: DeviceConfig) -> Result<Device, DeviceError> {
+        #[cfg(feature = "miniaudio")]
+        {
+            Device::open_miniaudio(cfg)
+        }
+        #[cfg(all(not(feature = "miniaudio"), windows))]
+        {
+            Device::open_wasapi(cfg)
+        }
+        #[cfg(all(not(feature = "miniaudio"), not(windows)))]
+        {
+            let _ = cfg;
+            Err(DeviceError::Backend("no audio backend compiled in for this platform".into()))
+        }
+    }
+
     pub fn info(&self) -> StreamInfo {
         self.info
+    }
+
+    /// Which device layer is driving the stream.
+    pub fn backend_name(&self) -> &str {
+        match &self.backend {
+            Backend::Null { .. } => "null",
+            #[cfg(windows)]
+            Backend::Wasapi { .. } => "wasapi (direct)",
+            #[cfg(feature = "miniaudio")]
+            Backend::Miniaudio { stream, .. } => &stream.backend_name,
+        }
     }
 
     /// Whether the low-latency (`IAudioClient3`) path is active. Always false for the null backend.
@@ -109,6 +166,8 @@ impl Device {
             Backend::Null { .. } => false,
             #[cfg(windows)]
             Backend::Wasapi { stream, .. } => stream.status().low_latency.load(std::sync::atomic::Ordering::Relaxed),
+            #[cfg(feature = "miniaudio")]
+            Backend::Miniaudio { stream, .. } => stream.status().low_latency.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -129,6 +188,10 @@ impl Device {
     pub fn collect_garbage(&mut self) {
         #[cfg(windows)]
         if let Backend::Wasapi { garbage, .. } = &mut self.backend {
+            while garbage.pop().is_ok() {}
+        }
+        #[cfg(feature = "miniaudio")]
+        if let Backend::Miniaudio { garbage, .. } = &mut self.backend {
             while garbage.pop().is_ok() {}
         }
     }
@@ -309,6 +372,12 @@ impl Device {
                 self.finished.push(f);
             }
         }
+        #[cfg(feature = "miniaudio")]
+        if let Backend::Miniaudio { finished, .. } = &mut self.backend {
+            while let Ok(f) = finished.pop() {
+                self.finished.push(f);
+            }
+        }
         std::mem::take(&mut self.finished)
     }
 
@@ -332,6 +401,8 @@ impl Device {
             Backend::Null { engine, .. } => Some(engine),
             #[cfg(windows)]
             Backend::Wasapi { .. } => None,
+            #[cfg(feature = "miniaudio")]
+            Backend::Miniaudio { .. } => None,
         }
     }
 }

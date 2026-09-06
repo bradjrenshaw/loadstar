@@ -9,7 +9,12 @@ use loadstar_audio::{Bounds, Vec3};
 fn main() {
     #[cfg(windows)]
     {
-        let mut d = Device::open_wasapi(DeviceConfig::default()).expect("open default audio device");
+        let choice = std::env::var("LOADSTAR_BACKEND").unwrap_or_default();
+        let mut d = match choice.as_str() {
+            "wasapi" => Device::open_wasapi(DeviceConfig::default()).expect("open WASAPI"),
+            _ => Device::open_default(DeviceConfig::default()).expect("open default audio device"),
+        };
+        println!("backend: {}", d.backend_name());
         let info = d.info();
         println!(
             "WASAPI: {} Hz, {} frames per period ({:.2} ms), low-latency path: {}",

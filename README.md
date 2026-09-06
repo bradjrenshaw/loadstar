@@ -23,6 +23,9 @@ hosts, bindings must say so explicitly (`CallingConvention.Cdecl` in .NET).
 
 ## Building
 
+The audio crate vendors [miniaudio](https://miniaud.io) (`crates/loadstar-audio/vendor`), compiled by the
+`cc` crate, so a C compiler is needed (MSVC on Windows — the same toolchain Rust already uses).
+
 ```
 cargo build --release                                  # x64
 cargo build --release --target i686-pc-windows-msvc    # x86 (32-bit games)

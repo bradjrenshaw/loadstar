@@ -244,15 +244,16 @@ Selection: `la_space_set_renderer(space, kind, config[])` and `la_source_set_ren
 ## 5. Crate layout and the backend trait
 
 ```
-crates/loadstar-audio/           pure Rust: spaces, buses, sources, chains, DSP nodes, resampler
-  src/dsp/                       biquads, delay lines, ramps, pan laws — pure functions
+crates/loadstar-audio/           spaces, buses, sources, chains, DSP nodes, resampler
+  src/dsp/                       biquads, delay lines, ramps, pan laws, generators — pure functions
   src/render/mod.rs              trait Renderer (§4.8) + Placement
   src/render/head_model.rs       the built-in §4.4 renderer
   src/render/steam_audio.rs      (later) dynamic-loading phonon binding  (cfg(feature = "steam-audio"))
-  src/mixer.rs                   period loop: sources → chains → renderer → buses → spaces → master
-  src/backend/mod.rs             trait Backend { open(format, period) -> Stream; ... }
-  src/backend/wasapi.rs          windows crate, IAudioClient3, MMCSS  (cfg(windows))
-  src/backend/null.rs            silent backend with synthetic time, for tests and CI
+  src/engine.rs                  period loop: sources → chains → renderer → buses → spaces → master
+  src/backend/miniaudio.rs       DEFAULT device layer: vendored miniaudio (feature "miniaudio", on by default)
+  src/backend/wasapi.rs          direct WASAPI reference backend: windows crate, IAudioClient3, MMCSS
+  src/backend/null.rs            silent backend, pumped by the caller, for tests and harnesses
+  vendor/miniaudio/              miniaudio.h (pinned) + loadstar_ma.c, a 4-function C shim
 crates/loadstar-ffi/             gains the `la_*` surface behind an `audio` cargo feature (one DLL)
 bindings/csharp/Loadstar.Net/    Audio.cs: AudioDevice / AudioSpace / SourceDesc / EffectDesc wrappers,
                                  WavFile.Load(path) → f32 PCM convenience
@@ -260,7 +261,9 @@ bindings/csharp/Loadstar.Net/    Audio.cs: AudioDevice / AudioSpace / SourceDesc
 
 Testing against the null backend with synthetic time: property tests for pan-law power constancy, ILD cap, ITD monotonicity, shelf identity at 0 dB, **ramp continuity** (no sample-to-sample jump above a threshold across any parameter change or toggle), voice stealing, sync diffing, and drain/tail behaviour. The WASAPI backend is exercised by the smoke harness — a positioned tone from the 32-bit .NET process, then inside CSTW.
 
-The backend trait is minimal on purpose: open a stream at a format and period, hand the mixer a `&mut [f32]` per period, report the achieved period, and signal device loss. Everything above it is platform-free.
+The backend boundary is minimal on purpose: open a stream at a format and period, hand the mixer a `&mut [f32]` per period, report the achieved period, and signal device loss. Everything above it is platform-free.
+
+**miniaudio is the default device layer** (decided 2026-09-03). Only its low-level `ma_device` API is used — it asks for interleaved f32 stereo frames and the mixer fills them; miniaudio's own engine, spatializer, panner, resampler and decoders are compiled out. What it buys: WASAPI → DirectSound → WinMM fallback on Windows (old or broken WASAPI drivers still get sound), automatic default-device routing, and CoreAudio / ALSA / PulseAudio / JACK for other platforms at no extra cost. Measured on the reference machine it reaches the same 128-frame / 2.67 ms `IAudioClient3` period as the direct backend, provided a specific small period is requested (0 means miniaudio's 10 ms default) and the sample rate is left at the device's native rate (an application-set rate disables its low-latency shared mode). MMCSS "Pro Audio" is applied from inside the first data callback. The direct WASAPI backend stays as the reference implementation and a selectable fallback (`Device::open_wasapi`). Vendoring miniaudio means the crate needs a C compiler at build time (MSVC's `cl` on Windows).
 
 ---
 

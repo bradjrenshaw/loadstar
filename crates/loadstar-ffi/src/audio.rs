@@ -239,10 +239,7 @@ pub extern "C" fn la_device_open(cfg: AudioDeviceConfig, out: *mut *mut AudioDev
         if out.is_null() {
             return Status::NullPointer;
         }
-        #[cfg(windows)]
-        let opened = Device::open_wasapi(config(cfg));
-        #[cfg(not(windows))]
-        let opened: Result<Device, DeviceError> = Err(DeviceError::Backend("no backend on this platform".into()));
+        let opened = Device::open_default(config(cfg));
         match opened {
             // SAFETY: `out` non-null checked; caller guarantees it is writable.
             Ok(d) => unsafe {

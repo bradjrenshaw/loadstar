@@ -6,9 +6,18 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["miniaudio"]
+# Device layer via a vendored miniaudio (WASAPI/DirectSound/WinMM on Windows, CoreAudio, ALSA,
+# PulseAudio, JACK...). Only its low-level device API is used; Loadstar does all the mixing.
+miniaudio = ["dep:cc"]
+
 [dependencies]
 loadstar-core.workspace = true
 rtrb = "0.3"
+
+[build-dependencies]
+cc = { version = "1", optional = true }
 
 [dev-dependencies]
 

@@ -7,7 +7,7 @@
 
 #![allow(unsafe_code)]
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -22,7 +22,7 @@ use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInst
 use windows::Win32::System::Threading::{AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW, WaitForSingleObject};
 use windows::core::{GUID, Interface, w};
 
-use super::StreamInfo;
+use super::{StreamInfo, StreamStatus};
 use crate::commands::{Command, Garbage};
 use crate::engine::{Engine, EngineConfig};
 
@@ -36,17 +36,6 @@ pub struct WasapiConfig {
     pub period_frames: usize,
     pub master_gain: f32,
     pub voice_cap: usize,
-}
-
-/// Live status of the audio thread, readable from the game thread.
-#[derive(Debug, Default)]
-pub struct StreamStatus {
-    pub running: AtomicBool,
-    /// True when the `IAudioClient3` low-latency path is active.
-    pub low_latency: AtomicBool,
-    pub reopen_count: AtomicU32,
-    pub last_hresult: AtomicI32,
-    pub underruns: AtomicU32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
