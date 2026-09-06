@@ -190,7 +190,7 @@ la_*_set_effect_enabled(..., index, enabled)         // A/B by ear, crossfaded
 | `PEAK` | center_hz, gain_db, q | Parametric band. |
 | `DELAY` | ms, feedback, mix | Fixed delay, tail drained on stop. |
 | `LIMITER` | threshold_db, release_ms | Master safety; brickwall-ish. |
-| `DISTANCE` | min, max, rolloff, model | The source's distance model (below); one per source, implicit if absent. |
+| `DISTANCE` | min, max, rolloff, model | The source's distance model (below); one per source, falling back to the space chain's, then the implicit default. |
 | `SPATIALIZER` | see §4.4 | Parameters and cue flags of the head-model renderer for this source, overriding the space's defaults. |
 | `RENDER_*` (≥ 0x1000) | renderer-defined | Renderer-specific per-source controls, e.g. Steam Audio's air absorption, transmission, directivity. Ignored by renderers that don't know them. |
 
@@ -210,7 +210,7 @@ The mod exposes the flags as user settings if it wants (`audio.itd`, `audio.head
 
 ### 4.5 Distance model
 
-`DISTANCE {min, max, rolloff, model}`: gain 1 inside `min`; between `min` and `max`, `INVERSE` (`(min/d)^rolloff`), `LINEAR`, or `REFERENCE` (`ref/(ref+d)`, wotr's speech/sonar curve, clamped to a floor); 0 beyond `max`; `max = 0` never attenuates. Distance is measured to the nearest point of the bounds; inside the bounds it is 0.
+`DISTANCE {min, max, rolloff, model}`: gain 1 inside `min`; between `min` and `max`, `INVERSE` (`(min/d)^rolloff`), `LINEAR`, `REFERENCE` (`ref/(ref+d)`, wotr's speech/sonar curve, clamped to a floor), or `NONE` (gain 1 at every distance — the mod computes distance → gain itself and hands it over as the source's `gain`, which is how wotr's NAudio path always worked); 0 beyond `max`; `max = 0` never attenuates. Distance is measured to the nearest point of the bounds; inside the bounds it is 0. A source without its own `DISTANCE` node uses the **space chain's** `DISTANCE` node if there is one, else the implicit default (`INVERSE`, min = 1 m, no cutoff) — so "I own gain" is one node on the space, not one per source.
 
 ### 4.6 Parameter discipline (the no-click rules)
 

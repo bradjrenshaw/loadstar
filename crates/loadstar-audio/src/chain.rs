@@ -50,7 +50,7 @@ pub const ENABLED: u32 = 1;
 /// - `Peak`: p0 = centre Hz, p1 = gain dB, p2 = Q
 /// - `Delay`: p0 = ms, p1 = feedback 0..1, p2 = mix 0..1
 /// - `Limiter`: p0 = threshold dB, p1 = release ms
-/// - `Distance`: p0 = min, p1 = max (0 = none), p2 = rolloff, p3 = model (0 inverse, 1 linear, 2 reference)
+/// - `Distance`: p0 = min, p1 = max (0 = none), p2 = rolloff, p3 = model (0 inverse, 1 linear, 2 reference, 3 none = gain 1 everywhere)
 /// - `Spatializer`: see `render::SpatializerParams`
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EffectDesc {
@@ -113,6 +113,9 @@ pub enum DistanceModel {
     Linear = 1,
     /// `min / (min + d)`, never below `1 / rolloff` (rolloff ≥ 1 as the floor divisor).
     Reference = 2,
+    /// Gain 1 at every distance: the mod owns distance → gain (it computes the source's `gain`
+    /// itself, as wotr's NAudio path always did). `max` still culls when set.
+    None = 3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -133,6 +136,7 @@ impl DistanceParams {
         let model = match d.p[3] as u32 {
             1 => DistanceModel::Linear,
             2 => DistanceModel::Reference,
+            3 => DistanceModel::None,
             _ => DistanceModel::Inverse,
         };
         DistanceParams { min: d.p[0].max(1e-3), max: d.p[1].max(0.0), rolloff: d.p[2].max(0.0), model }
@@ -143,10 +147,11 @@ impl DistanceParams {
         if self.max > 0.0 && d >= self.max {
             return 0.0;
         }
-        if d <= self.min {
+        if d <= self.min || self.model == DistanceModel::None {
             return 1.0;
         }
         match self.model {
+            DistanceModel::None => 1.0,
             DistanceModel::Inverse => (self.min / d).powf(self.rolloff),
             DistanceModel::Linear => {
                 if self.max <= self.min {
@@ -480,6 +485,13 @@ mod tests {
         assert!((reference.gain(1000.0) - 0.2).abs() < 1e-6, "floored at 1/rolloff");
         let d = EffectDesc::distance(1.0, 10.0, 2.0, DistanceModel::Linear);
         assert_eq!(DistanceParams::from_desc(&d).model, DistanceModel::Linear);
+        let none = DistanceParams { min: 1.0, max: 0.0, rolloff: 1.0, model: DistanceModel::None };
+        assert_eq!(none.gain(0.5), 1.0);
+        assert_eq!(none.gain(500.0), 1.0, "none: the mod owns distance gain");
+        let none_capped = DistanceParams { min: 1.0, max: 20.0, rolloff: 1.0, model: DistanceModel::None };
+        assert_eq!(none_capped.gain(19.0), 1.0);
+        assert_eq!(none_capped.gain(25.0), 0.0, "max still culls");
+        assert_eq!(DistanceParams::from_desc(&EffectDesc::distance(1.0, 0.0, 0.0, DistanceModel::None)).model, DistanceModel::None);
     }
 
     #[test]

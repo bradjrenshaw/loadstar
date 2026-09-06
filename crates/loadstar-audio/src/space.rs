@@ -632,7 +632,10 @@ impl Space {
             bus.buf[..frames * 2].iter_mut().for_each(|s| *s = 0.0);
         }
 
-        // Voices → buses.
+        // Voices → buses. A source without its own DISTANCE node falls back to the SPACE chain's
+        // (so a mod can declare "no distance model, I own gain" once per space), then to the
+        // implicit default.
+        let space_distance = self.chain.distance();
         let mut i = 0;
         while i < self.voices.len() {
             let placement = self.placement(&self.voices[i].desc);
@@ -644,7 +647,7 @@ impl Space {
             let distance_gain = if placement.relative || placement.inside {
                 1.0
             } else {
-                v.pre.distance().unwrap_or_else(|| DistanceParams::default_for(unit_scale)).gain(placement.distance)
+                v.pre.distance().or(space_distance).unwrap_or_else(|| DistanceParams::default_for(unit_scale)).gain(placement.distance)
             };
             if !v.stopping && !v.stolen {
                 v.level.set_target(v.desc.gain.max(0.0) * distance_gain);

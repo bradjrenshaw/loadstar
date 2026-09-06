@@ -49,7 +49,8 @@ public enum EffectFlags : uint
     Elevation = 16,
 }
 
-public enum DistanceModel : uint { Inverse = 0, Linear = 1, Reference = 2 }
+/// <summary><see cref="None"/>: gain 1 at every distance — the mod owns distance → gain (max still culls when set).</summary>
+public enum DistanceModel : uint { Inverse = 0, Linear = 1, Reference = 2, None = 3 }
 
 public enum ChainKind : uint { Master = 0, Space = 1, Bus = 2, SourcePre = 3, SourcePost = 4 }
 
