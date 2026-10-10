@@ -92,10 +92,10 @@ Each utterance carries its own profile, so one queue may alternate engines and v
 ## 3. Speaking
 
 ```
-lv_speak   (ctx, queue, profile*, text, len, flags, out utterance) → LsStatus   // voice only
-lv_output  (ctx, queue, profile*, text, len, flags, out utterance) → LsStatus   // voice + braille where supported
-lv_braille (ctx, queue, profile*, text, len,        out utterance) → LsStatus   // braille only
-lv_gap     (ctx, queue, ms,                         out utterance) → LsStatus   // silence as a queue item
+lv_speak   (ctx, queue, profile*, text, flags, out utterance) → LsStatus   // voice only
+lv_output  (ctx, queue, profile*, text, flags, out utterance) → LsStatus   // voice + braille where supported
+lv_braille (ctx, queue, profile*, text,        out utterance) → LsStatus   // braille only
+lv_gap     (ctx, queue, ms,                    out utterance) → LsStatus   // silence as a queue item
 lv_stop    (ctx, queue)        // cut what is speaking on this queue, keep the rest
 lv_flush   (ctx, queue)        // drop everything pending on this queue, keep what is speaking
 lv_pause   (ctx, queue) / lv_resume(ctx, queue)
@@ -114,7 +114,7 @@ Flags on a speak call:
 Rules, all learned by ear in the mods:
 
 - **Speaking never blocks the game thread.** The ABI call hands the utterance to the queue and returns; the worker (§8) talks to engines. Even where an engine's own speak call would block (some Prism backends synthesize before returning), the game thread never sees it.
-- **Text is UTF-8 with an explicit length**, never NUL-terminated by contract (the mod's strings aren't). Invalid UTF-8 is `InvalidArgument`; the crate does not repair text.
+- **Text is a NUL-terminated UTF-8 `const char*`.** No length parameter: the one place a caller could miscount is removed, every binding generator and marshaller handles the form natively (.NET `LPUTF8Str` on a plain `string`, no byte array on the GC heap, no pinning in mod code), and Prism's own API takes exactly this so text passes through uncopied. The crate reads to the first NUL; embedded NULs do not occur in text meant to be spoken. Invalid UTF-8 is `InvalidArgument`; the crate does not repair text.
 - **Empty text is a no-op** that returns a valid, already-`Done` utterance id, not an error.
 - **Screen readers are one channel across all queues.** Utterances from different queues reach the reader in submission order. `lv_stop` on one queue cuts the reader — which may be speaking another queue's text — because there is nothing else it can cut; it then drops only its own pending items. The spec states this rather than pretending queues are isolated on a reader.
 - **Commands, not calls, inside.** Every verb above becomes a command on the queue's inbox, consumed by the worker. That is an implementation statement with user-visible consequences: ordering between a `speak` and a `stop` issued on the same frame is the call order, a debug tap can log and replay the command stream, and a future `lv_submit(queue, commands[], n)` for atomic batches ("interrupt, then A, then B" with no race) costs nothing to add. It is not in v1 because no mod has hit the race yet.
@@ -181,7 +181,7 @@ Copies the text. Exists so "something happens" when nothing else can; the fallba
 ## 6. Rendering and the audio crate
 
 ```
-lv_render(ctx, profile*, text, len, flags, out job)                       → LsStatus   // worker job, not queued
+lv_render(ctx, profile*, text, flags, out job)                            → LsStatus   // worker job, not queued
 lv_render_poll(ctx, job, out state)                                       → {Pending | Done | Failed}
 lv_render_take(ctx, job, out samples*, out frames, out channels, out rate)             // library-owned until lv_render_free
 lv_render_free(ctx, job)
@@ -192,7 +192,7 @@ Rendering is blocking in every engine, so it runs on the worker and is **polled,
 With the `audio` feature on, positioned speech is an ordinary queued utterance:
 
 ```
-lv_speak_at(ctx, queue, profile*, text, len, flags, device, space, bus, bounds*, gain, out utterance, out source_id)
+lv_speak_at(ctx, queue, profile*, text, flags, device, space, bus, bounds*, gain, out utterance, out source_id)
 ```
 
 The utterance enters its queue like any other and honours the same flags and `max_concurrent`. When the queue starts it, the worker renders → `la_buffer_create` → `la_space_fire` a one-shot source with the given bounds on the given bus, `AUTO_REMOVE`, buffer freed when the source finishes. The source id is allocated immediately (the source exists, silent, until the render lands — a few hundred milliseconds for SAPI), so the mod can stop or reposition it like any other, and `lv_utterance_state` tracks it through `Speaking` to `Done` off the source's lifetime. This is wotr's `PositionalSpeech` plus `SpatialSources` plus the render path collapsed into a line, and it is why the speech crate belongs next to the audio crate rather than in a companion. An events queue with `max_concurrent = 0` is the intended home for it.
@@ -216,7 +216,7 @@ Prefix `lv_` (voice). `LsStatus` return codes, extended with `EngineUnavailable`
 | Utterances | `lv_utterance_state(id, out state)` |
 | Rendering | `lv_render`, `lv_render_poll`, `lv_render_take`, `lv_render_free`, `lv_speak_at` (audio feature) |
 
-Strings **in**: `(const uint8_t* utf8, size_t len)`. Strings **out**: the two-call buffer pattern, UTF-8, length excludes any terminator. No other string crosses.
+Strings **in**: NUL-terminated UTF-8 `const char*`, no length (§3). Strings **out**: the two-call buffer pattern — null buffer returns the required capacity *including* the terminator; a real buffer is filled, always NUL-terminated within capacity, and the reported length excludes the terminator, so a C caller reads the buffer directly and a .NET caller makes one `PtrToStringUTF8` call. No other string crosses.
 
 ---
 
@@ -231,7 +231,7 @@ The context is driven from one game thread. The ABI verbs only push commands ont
 Two lines in `spec.md` move:
 
 - **Non-goals, "Speech output."** → "Speech output *lives in `loadstar-speech`* (`speech-spec.md`), admitted 2026-10 on the audio crate's precedent: two consumers (wotr, Say the Spire 2) with the same stack."
-- **Non-goals, "Strings…"** and **FFI conventions, "No strings anywhere in the ABI."** → unchanged for the core and audio surfaces. The speech surface is the single, explicit exception: text to be spoken goes in, voice and engine names come out, by the conventions in §7. The core still emits numbers only; labels still never enter it.
+- **Non-goals, "Strings…"** and **FFI conventions, "No strings anywhere in the ABI."** → unchanged for the core and audio surfaces. The speech surface is the single, explicit exception: text to be spoken goes in, voice and engine names come out, by the conventions in §7. Inbound text is NUL-terminated, never length-prefixed. The core still emits numbers only; labels still never enter it.
 
 `§10 Companion layers` drops "Speech helper (Tolk binding)" — the companion's speech helper becomes a thin wrapper over `lv_*`.
 

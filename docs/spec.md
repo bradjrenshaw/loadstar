@@ -282,7 +282,7 @@ Composability is safe because the library never mutates between the mod's calls:
 ## 9. FFI conventions
 
 - **Opaque handles** (`LsContext*`, path IDs). Every function's first parameter is the context (except geometry utilities, which are free functions).
-- **Flat data only**: ints, floats, packed structs, caller-visible arrays. No callbacks. No strings anywhere in the core or audio ABI; the speech surface (`lv_*`) is the explicit exception and carries them as UTF-8 pointer + length (`speech-spec.md` §7).
+- **Flat data only**: ints, floats, packed structs, caller-visible arrays. No callbacks. No strings anywhere in the core or audio ABI; the speech surface (`lv_*`) is the explicit exception and carries them as NUL-terminated UTF-8 (`speech-spec.md` §7).
 - **Buffers**: two-call pattern (call with null buffer → required count) or caller-provided buffer + capacity → written count. Library-owned results (paths) are handle-addressed and freed via `ls_path_free` / freed wholesale with the context.
 - **Errors**: every function returns a status code; results via out-params. No panics across the boundary (catch_unwind at the ABI edge).
 - **Versioning**: `ls_abi_version()` checked by companions at load.
