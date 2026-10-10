@@ -5,6 +5,7 @@ Engine-agnostic navigation and spatial-awareness core for game accessibility mod
 Sibling of [Loadstone](https://github.com/bradjrenshaw) (mod manager): Loadstone loads the mods, Loadstar guides them.
 
 Design: [`docs/spec.md`](docs/spec.md). Distilled from the Wayfinder/CSTW experiment; read the non-goals first.
+Audio: [`docs/audio-spec.md`](docs/audio-spec.md). Speech (draft, pre-implementation): [`docs/speech-spec.md`](docs/speech-spec.md).
 
 ## Layout
 

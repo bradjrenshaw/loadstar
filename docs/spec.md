@@ -21,8 +21,8 @@ Learned the hard way from Wayfinder. The core does **not** contain:
 - **Input handling or action routing.** The mod detects input and calls functions.
 - **Screens, scenes-as-lifecycle, systems, priorities, or any update loop.** The library never acts spontaneously; there is no inversion of control.
 - **UI/menu reading.** Game-specific by nature; no abstraction survived contact with real games.
-- **Strings, text formatting, or localization.** The core emits numeric/structured data only. Labels never enter the library.
-- **Speech output.** Tolk-style output lives in per-language companion layers.
+- **Strings, text formatting, or localization.** The core emits numeric/structured data only. Labels never enter the library. (The one sanctioned exception is the speech surface, where text to be spoken goes in and voice names come out — see `speech-spec.md` §7. The core and audio ABIs stay string-free.)
+- **Speech output** was a non-goal until 2026-10, when it was admitted on the audio crate's precedent: two consumers (wotr, Say the Spire 2) carrying the same stack. It lives in its own crate, `loadstar-speech`, behind a cargo feature — see `speech-spec.md`. The core is untouched by it.
 - **Audio.** Deferred by decision (2026-08); revisit with better ideas later. Tone synthesis, wall-tone channel logic, and playback are all out for now. (The cardinal wall-distance *scan* survives as a plain spatial query — see §6.1.)
 - **Cross-context routing.** "This dungeon exit leads to overworld (52, 88)" is game knowledge. Mods that need multi-map routing build their own graph over (context, position) pairs. A helper may be added later if multiple mods hand-roll the same thing — not on speculation.
 
@@ -282,7 +282,7 @@ Composability is safe because the library never mutates between the mod's calls:
 ## 9. FFI conventions
 
 - **Opaque handles** (`LsContext*`, path IDs). Every function's first parameter is the context (except geometry utilities, which are free functions).
-- **Flat data only**: ints, floats, packed structs, caller-visible arrays. No callbacks. No strings anywhere in the ABI.
+- **Flat data only**: ints, floats, packed structs, caller-visible arrays. No callbacks. No strings anywhere in the core or audio ABI; the speech surface (`lv_*`) is the explicit exception and carries them as UTF-8 pointer + length (`speech-spec.md` §7).
 - **Buffers**: two-call pattern (call with null buffer → required count) or caller-provided buffer + capacity → written count. Library-owned results (paths) are handle-addressed and freed via `ls_path_free` / freed wholesale with the context.
 - **Errors**: every function returns a status code; results via out-params. No panics across the boundary (catch_unwind at the ABI edge).
 - **Versioning**: `ls_abi_version()` checked by companions at load.
@@ -300,7 +300,7 @@ Pure-C# first (validated against CSTW), pure-C++ later:
 - Idiomatic wrapper over the P/Invoke surface (safe handles, spans).
 - **Default English formatters**: direction enum → "east"; segments → "north 5, east 2"; `TrackerResult` + mod's label table → "Shopkeeper, NPC, 3 of 7, east, 4 tiles". Overridable for other languages/phrasings; the core is never involved.
 - JSON persistence store for labels/custom names/hidden/links (the `CustomNameStore` pattern), keyed by entity ID.
-- Speech helper (Tolk binding) — desktop Windows only, optional.
+- Speech wrapper over `lv_*` (`speech-spec.md`): profiles, speak/output, positioned speech. No Tolk binding of its own.
 - Convenience builders: category-default application, entity-record construction, terrain-rule → edge-table baking helpers.
 
 ---
