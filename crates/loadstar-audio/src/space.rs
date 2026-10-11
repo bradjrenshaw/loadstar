@@ -1,12 +1,16 @@
 //! An audio space (spec §3): a listener, buses, and sources with geometry. This module is the
 //! audio-thread side; commands arrive already built (chains, buses) so the period loop does
-//! not allocate. Voices themselves are created on command application (a pool is a follow-up).
+//! not allocate. Voices come from a per-space pool that is pre-warmed on the game thread and
+//! grows only when more sources are alive at once than ever before; a retiring voice goes back
+//! to the pool and hands anything it owned that must be freed (its buffer reference, any effect
+//! nodes) to the garbage ring, so the callback never calls the allocator in steady state.
 
 use std::sync::Arc;
 
 use loadstar_core::geometry::{Bounds, Vec3};
 
 use crate::chain::{Chain, DistanceParams};
+use crate::commands::Garbage;
 use crate::dsp::{Noise, NoiseColor, Oscillator, Ramp, Waveform};
 use crate::render::{Placement, Renderer, SpatializerParams, VoiceRenderer};
 
@@ -206,6 +210,8 @@ pub struct SourceState {
     pub plays_remaining: u16,
 }
 
+/// One playing (or pooled) source. Pool-recycled: `blank` allocates once, `arm` rebinds it to
+/// a record without allocating, `disarm` strips what must be freed off the audio thread.
 struct Voice {
     desc: SourceDesc,
     declared: bool,
@@ -217,6 +223,9 @@ struct Voice {
     plays_done: u16,
     phase: Phase,
     level: Ramp,
+    /// Started from silence this period: the level primes to its target instead of ramping
+    /// up from zero, so a short cue keeps its attack.
+    fresh: bool,
     stopping: bool,
     /// Muted by the voice cap.
     stolen: bool,
@@ -227,11 +236,57 @@ struct Voice {
 }
 
 impl Voice {
+    /// A pooled, idle voice. Allocates (chains, renderer state): game thread, or the one-time
+    /// growth path when more voices are alive than the pool was warmed for.
+    fn blank(rate: f32, block: usize, renderer: &dyn Renderer) -> Voice {
+        Voice {
+            desc: SourceDesc::base(0, SourceKind::Buffer, Bounds::Point(Vec3::default())),
+            declared: false,
+            remove_when_done: true,
+            buffer: None,
+            pos: 0.0,
+            osc: Oscillator::default(),
+            noise: Noise::new(1),
+            plays_done: 0,
+            phase: Phase::Idle,
+            level: Ramp::new(0.0),
+            fresh: false,
+            stopping: false,
+            stolen: false,
+            seen: true,
+            pre: Chain::empty(rate, 1, block),
+            post: Chain::empty(rate, 2, block),
+            render: renderer.make_voice(rate, block),
+        }
+    }
+
+    /// Bind a pooled voice to a record. No allocation.
+    fn arm(&mut self, desc: SourceDesc, declared: bool, buffer: Option<Arc<Buffer>>) {
+        self.desc = desc;
+        self.declared = declared;
+        self.remove_when_done = !declared || desc.flags & flags::AUTO_REMOVE != 0;
+        self.buffer = buffer;
+        self.pos = 0.0;
+        self.osc = Oscillator::default();
+        self.noise = Noise::new(desc.id as u32 ^ 0x9E37_79B9);
+        self.plays_done = 0;
+        self.phase = Phase::Idle;
+        self.level = Ramp::new(0.0);
+        self.fresh = false;
+        self.stopping = false;
+        self.stolen = false;
+        self.seen = true;
+        if desc.playing() {
+            self.start();
+        }
+    }
+
     fn active(&self) -> bool {
         self.phase != Phase::Idle && !self.stopping && !self.stolen
     }
 
     fn start(&mut self) {
+        self.fresh = self.phase == Phase::Idle;
         self.pos = 0.0;
         self.plays_done = 0;
         self.phase = Phase::Playing;
@@ -255,7 +310,11 @@ pub struct Space {
     listener: Listener,
     buses: Vec<Bus>,
     voices: Vec<Voice>,
+    /// Idle voices ready to be armed. Warmed on the game thread; grows only on a new peak.
+    pool: Vec<Voice>,
     finished: Vec<u64>,
+    /// What retiring voices gave up, for the engine to hand to the game thread.
+    released: Vec<Garbage>,
     renderer: Box<dyn Renderer>,
     default_spatializer: SpatializerParams,
     mono: Vec<f32>,
@@ -264,7 +323,19 @@ pub struct Space {
 }
 
 impl Space {
+    /// A space with an empty pool: voices allocate on first use (tests; the device always
+    /// warms the pool with [`Space::with_pool`]).
     pub fn new(cfg: SpaceConfig, rate: f32, block: usize, renderer: Box<dyn Renderer>) -> Space {
+        Space::with_pool(cfg, rate, block, renderer, 0)
+    }
+
+    /// A space with `prewarm` voices ready, so the audio thread allocates nothing until more
+    /// than that many sources are alive at once. Game thread.
+    pub fn with_pool(cfg: SpaceConfig, rate: f32, block: usize, renderer: Box<dyn Renderer>, prewarm: usize) -> Space {
+        let mut pool = Vec::with_capacity(prewarm);
+        for _ in 0..prewarm {
+            pool.push(Voice::blank(rate, block, renderer.as_ref()));
+        }
         Space {
             cfg,
             rate,
@@ -273,8 +344,10 @@ impl Space {
             chain: Chain::empty(rate, 2, block),
             listener: Listener::default(),
             buses: vec![Bus::new(1.0, rate, block)],
-            voices: Vec::new(),
-            finished: Vec::new(),
+            voices: Vec::with_capacity(prewarm),
+            pool,
+            finished: Vec::with_capacity(prewarm.max(16)),
+            released: Vec::with_capacity(prewarm.max(16) * 2),
             renderer,
             default_spatializer: SpatializerParams::default(),
             mono: vec![0.0; block],
@@ -293,10 +366,6 @@ impl Space {
 
     pub fn set_gain(&mut self, gain: f32) {
         self.gain.set_target(gain);
-    }
-
-    pub fn set_chain(&mut self, chain: Chain) -> Chain {
-        std::mem::replace(&mut self.chain, chain)
     }
 
     pub fn chain_mut(&mut self) -> &mut Chain {
@@ -328,10 +397,6 @@ impl Space {
         }
     }
 
-    pub fn set_bus_chain(&mut self, bus: u32, chain: Chain) -> Option<Chain> {
-        self.buses.get_mut(bus as usize).map(|b| std::mem::replace(&mut b.chain, chain))
-    }
-
     pub fn bus_chain_mut(&mut self, bus: u32) -> Option<&mut Chain> {
         self.buses.get_mut(bus as usize).map(|b| &mut b.chain)
     }
@@ -347,29 +412,33 @@ impl Space {
 
     fn create_voice(&mut self, desc: SourceDesc, declared: bool, buffers: &[Option<Arc<Buffer>>]) -> usize {
         let buffer = if desc.kind == SourceKind::Buffer { buffers.get(desc.buffer as usize).cloned().flatten() } else { None };
-        let mut voice = Voice {
-            desc,
-            declared,
-            remove_when_done: !declared || desc.flags & flags::AUTO_REMOVE != 0,
-            buffer,
-            pos: 0.0,
-            osc: Oscillator::default(),
-            noise: Noise::new(desc.id as u32 ^ 0x9E37_79B9),
-            plays_done: 0,
-            phase: Phase::Idle,
-            level: Ramp::new(0.0),
-            stopping: false,
-            stolen: false,
-            seen: true,
-            pre: Chain::empty(self.rate, 1, self.block),
-            post: Chain::empty(self.rate, 2, self.block),
-            render: self.renderer.make_voice(self.rate, self.block),
+        let mut voice = match self.pool.pop() {
+            Some(v) => v,
+            None => Voice::blank(self.rate, self.block, self.renderer.as_ref()),
         };
-        if desc.playing() {
-            voice.start();
-        }
+        voice.arm(desc, declared, buffer);
         self.voices.push(voice);
         self.voices.len() - 1
+    }
+
+    /// Return voice `index` to the pool, routing its buffer reference and any effect nodes to
+    /// the garbage ring so nothing is freed on this thread.
+    fn retire(&mut self, index: usize) {
+        let mut v = self.voices.swap_remove(index);
+        if let Some(b) = v.buffer.take() {
+            self.released.push(Garbage::Buffer(b));
+        }
+        if !v.pre.is_empty() {
+            self.released.push(Garbage::Nodes(v.pre.take_nodes()));
+        }
+        if !v.post.is_empty() {
+            self.released.push(Garbage::Nodes(v.post.take_nodes()));
+        }
+        v.pre.reset();
+        v.post.reset();
+        v.render.reset();
+        v.phase = Phase::Idle;
+        self.pool.push(v);
     }
 
     fn apply_desc(&mut self, index: usize, desc: SourceDesc, buffers: &[Option<Arc<Buffer>>]) {
@@ -382,7 +451,10 @@ impl Space {
         voice.desc = SourceDesc { flags: desc.flags & !flags::RESTART, ..desc };
         voice.remove_when_done = !voice.declared || desc.flags & flags::AUTO_REMOVE != 0;
         if buffer_changed {
-            voice.buffer = if desc.kind == SourceKind::Buffer { buffers.get(desc.buffer as usize).cloned().flatten() } else { None };
+            let next = if desc.kind == SourceKind::Buffer { buffers.get(desc.buffer as usize).cloned().flatten() } else { None };
+            if let Some(old) = std::mem::replace(&mut voice.buffer, next) {
+                self.released.push(Garbage::Buffer(old));
+            }
         }
         if stopped {
             voice.stop();
@@ -465,15 +537,6 @@ impl Space {
         any
     }
 
-    pub fn set_source_chain(&mut self, id: u64, stage: Stage, chain: Chain) -> Option<Chain> {
-        let i = self.voices.iter().position(|v| v.desc.id == id && id != 0)?;
-        let v = &mut self.voices[i];
-        Some(match stage {
-            Stage::Pre => std::mem::replace(&mut v.pre, chain),
-            Stage::Post => std::mem::replace(&mut v.post, chain),
-        })
-    }
-
     pub fn source_chain_mut(&mut self, id: u64, stage: Stage) -> Option<&mut Chain> {
         let v = self.voices.iter_mut().find(|v| v.desc.id == id && id != 0)?;
         Some(match stage {
@@ -495,9 +558,32 @@ impl Space {
         self.voices.len()
     }
 
-    /// Ids (nonzero) whose sequences ended since the last call.
+    /// Idle voices waiting in the pool.
+    pub fn pool_len(&self) -> usize {
+        self.pool.len()
+    }
+
+    /// Ids (nonzero) whose sequences ended since the last call, in order. No allocation.
+    pub fn drain_finished(&mut self, mut f: impl FnMut(u64)) {
+        for id in self.finished.drain(..) {
+            f(id);
+        }
+    }
+
+    /// Ids (nonzero) whose sequences ended since the last call (tests; allocates).
     pub fn take_finished(&mut self) -> Vec<u64> {
         std::mem::take(&mut self.finished)
+    }
+
+    /// Hand released state to `sink` until it is empty or the sink refuses (ring full); a
+    /// refused item is kept for the next call.
+    pub fn drain_garbage(&mut self, mut sink: impl FnMut(Garbage) -> Result<(), Garbage>) {
+        while let Some(g) = self.released.pop() {
+            if let Err(g) = sink(g) {
+                self.released.push(g);
+                break;
+            }
+        }
     }
 
     /// `(index, priority, level)` of every audible voice, for the engine's voice cap.
@@ -572,7 +658,7 @@ impl Space {
                 true
             }
             SourceKind::Buffer => {
-                let Some(buf) = v.buffer.clone() else {
+                let Some(buf) = v.buffer.as_ref() else {
                     v.phase = Phase::Idle;
                     return false;
                 };
@@ -650,8 +736,11 @@ impl Space {
                 v.pre.distance().or(space_distance).unwrap_or_else(|| DistanceParams::default_for(unit_scale)).gain(placement.distance)
             };
             if !v.stopping && !v.stolen {
-                v.level.set_target(v.desc.gain.max(0.0) * distance_gain);
+                let target = v.desc.gain.max(0.0) * distance_gain;
+                // A voice starting from silence lands on its level at once; only changes ramp.
+                if v.fresh { v.level.set_now(target) } else { v.level.set_target(target) }
             }
+            v.fresh = false;
 
             let mono = &mut self.mono[..frames];
             let produced = Self::generate(v, mono, rate, &mut self.finished);
@@ -683,7 +772,7 @@ impl Space {
                     i += 1;
                     continue;
                 }
-                self.voices.swap_remove(i);
+                self.retire(i);
                 continue;
             }
             if v.stopping && v.level.is_settled() && v.level.target() == 0.0 {
@@ -841,6 +930,55 @@ mod tests {
         let _ = render(&mut s, 3);
         assert!(s.take_finished().is_empty());
         assert_eq!(s.source_count(), 0);
+    }
+
+    #[test]
+    fn retired_voices_return_to_the_pool_and_release_their_buffer_as_garbage() {
+        let mut s = Space::with_pool(SpaceConfig::default(), RATE, BLOCK, Box::new(HeadModel), 2);
+        assert_eq!(s.pool_len(), 2);
+        let b = buffers(BLOCK);
+        s.fire(SourceDesc::buffer(1, 0, point(0.0, -2.0)), &b);
+        s.fire(SourceDesc::buffer(2, 0, point(1.0, -2.0)), &b);
+        assert_eq!((s.source_count(), s.pool_len()), (2, 0), "both came from the pool");
+        assert_eq!(Arc::strong_count(b[0].as_ref().unwrap()), 3, "two voices hold the buffer");
+        let _ = render(&mut s, 3);
+        assert_eq!((s.source_count(), s.pool_len()), (0, 2), "both went back");
+        let mut released = Vec::new();
+        s.drain_garbage(|g| {
+            released.push(g);
+            Ok(())
+        });
+        assert_eq!(released.len(), 2, "each retiring voice released its buffer reference");
+        assert!(released.iter().all(|g| matches!(g, Garbage::Buffer(_))));
+        drop(released);
+        assert_eq!(Arc::strong_count(b[0].as_ref().unwrap()), 1, "no reference left on the audio side");
+        // A refused sink keeps the item for next time.
+        s.fire(SourceDesc::buffer(3, 0, point(0.0, -2.0)), &b);
+        let _ = render(&mut s, 3);
+        s.drain_garbage(Err);
+        let mut kept = 0;
+        s.drain_garbage(|_| {
+            kept += 1;
+            Ok(())
+        });
+        assert_eq!(kept, 1);
+    }
+
+    #[test]
+    fn a_fresh_voice_starts_at_full_level_and_a_stop_still_ramps() {
+        let mut s = space();
+        let b = buffers(BLOCK * 4);
+        s.fire(SourceDesc::buffer(4, 0, point(0.0, -1.0)).looping(), &b);
+        let mut out = vec![0.0; BLOCK * 2];
+        s.process(&mut out);
+        // Constant 0.5 input, centred: the very first sample is already at level (no fade-in).
+        let first = out[0].abs() + out[1].abs();
+        let last = out[BLOCK * 2 - 2].abs() + out[BLOCK * 2 - 1].abs();
+        assert!((first - last).abs() < last * 0.05, "no ramp across the first block: {first} vs {last}");
+        s.stop(4);
+        let mut out = vec![0.0; BLOCK * 2];
+        s.process(&mut out);
+        assert!(out[0].abs() > out[BLOCK * 2 - 2].abs() * 10.0, "stopping ramps down over the block");
     }
 
     #[test]

@@ -59,7 +59,14 @@ pub struct Device {
     finished: Vec<(u32, u64)>,
     spaces: Vec<Option<u32>>, // bus count per space id
     buffers: Vec<bool>,
+    /// Voices pre-built per space on this thread (the voice cap), so the audio thread never
+    /// allocates until more sources than that are alive at once.
+    pool: usize,
     backend: Backend,
+}
+
+fn pool_size(cfg: &DeviceConfig) -> usize {
+    if cfg.voice_cap == 0 { 64 } else { cfg.voice_cap }
 }
 
 impl Device {
@@ -73,7 +80,7 @@ impl Device {
             master_gain: cfg.master_gain,
             voice_cap: cfg.voice_cap,
         });
-        Device { info, commands, finished: Vec::new(), spaces: Vec::new(), buffers: Vec::new(), backend: Backend::Null { engine, inbox } }
+        Device { info, commands, finished: Vec::new(), spaces: Vec::new(), buffers: Vec::new(), pool: pool_size(&cfg), backend: Backend::Null { engine, inbox } }
     }
 
     /// Open the default Windows render endpoint on its own audio thread (spec §2).
@@ -97,6 +104,7 @@ impl Device {
             finished: Vec::new(),
             spaces: Vec::new(),
             buffers: Vec::new(),
+            pool: pool_size(&cfg),
             backend: Backend::Wasapi { stream, garbage: garbage_rx, finished: finished_rx },
         })
     }
@@ -123,6 +131,7 @@ impl Device {
             finished: Vec::new(),
             spaces: Vec::new(),
             buffers: Vec::new(),
+            pool: pool_size(&cfg),
             backend: Backend::Miniaudio { stream, garbage: garbage_rx, finished: finished_rx },
         })
     }
@@ -205,7 +214,7 @@ impl Device {
     pub fn space_create_with(&mut self, mode: SpaceMode, gain: f32, unit_scale: f32, renderer: Box<dyn Renderer>) -> Result<u32, DeviceError> {
         let id = self.spaces.iter().position(Option::is_none).unwrap_or(self.spaces.len()) as u32;
         let cfg = SpaceConfig { mode, gain, unit_scale: if unit_scale > 0.0 { unit_scale } else { 1.0 } };
-        let space = Box::new(Space::new(cfg, self.rate(), self.block(), renderer));
+        let space = Box::new(Space::with_pool(cfg, self.rate(), self.block(), renderer, self.pool));
         self.send(Command::SpaceCreate { id, space })?;
         if self.spaces.len() <= id as usize {
             self.spaces.resize(id as usize + 1, None);
@@ -388,10 +397,15 @@ impl Device {
     pub fn render(&mut self, out: &mut [f32]) {
         if let Backend::Null { engine, inbox } = &mut self.backend {
             while let Ok(cmd) = inbox.pop() {
-                drop(engine.apply(cmd));
+                drop(engine.apply(cmd)); // this IS the game thread: dropping here is the point
             }
             engine.process(out);
-            self.finished.extend(engine.take_finished());
+            engine.drain_garbage(|g| {
+                drop(g);
+                Ok(())
+            });
+            let finished = &mut self.finished;
+            engine.drain_finished(|f| finished.push(f));
         }
     }
 

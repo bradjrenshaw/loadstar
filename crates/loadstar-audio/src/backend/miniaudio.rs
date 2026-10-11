@@ -96,9 +96,7 @@ unsafe extern "C" fn data_callback(user: *mut c_void, out: *mut f32, frames: u32
     let Some(engine) = state.engine.as_mut() else { return };
 
     while let Ok(cmd) = state.inbox.pop() {
-        if let Some(g) = engine.apply(cmd) {
-            let _ = state.garbage.push(g);
-        }
+        engine.run(cmd);
     }
     // SAFETY: miniaudio guarantees `out` holds `frames` interleaved stereo f32 samples.
     let out = unsafe { std::slice::from_raw_parts_mut(out, frames as usize * 2) };
@@ -106,9 +104,14 @@ unsafe extern "C" fn data_callback(user: *mut c_void, out: *mut f32, frames: u32
     for chunk in out.chunks_mut(block) {
         engine.process(chunk);
     }
-    for f in engine.take_finished() {
-        let _ = state.finished.push(f);
-    }
+    // Nothing below allocates or frees: finished ids and released objects move into the rings;
+    // what a full ring refuses waits for the next period.
+    let finished = &mut state.finished;
+    engine.drain_finished(|f| {
+        let _ = finished.push(f);
+    });
+    let garbage = &mut state.garbage;
+    engine.drain_garbage(|g| garbage.push(g).map_err(|rtrb::PushError::Full(g)| g));
 }
 
 /// MMCSS "Pro Audio" for miniaudio's thread — the same scheduling the direct backend uses.

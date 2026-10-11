@@ -6,7 +6,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::chain::Chain;
+use crate::chain::{Chain, ChainNodes};
 use crate::space::{Buffer, Bus, Listener, SourceDesc, Space, Stage};
 
 /// Which chain an effect operation addresses.
@@ -38,5 +38,23 @@ pub enum Command {
     MasterGain(f32),
 }
 
-/// Anything the audio thread no longer needs, dropped on the game thread.
-pub type Garbage = Box<dyn Any + Send>;
+/// Anything the audio thread no longer needs, handed back for the game thread to drop. Every
+/// variant is a plain move into a preallocated ring slot: the audio thread never boxes anything
+/// to return it. `Any` carries the box a command arrived in (a displaced chain, space or bus
+/// rides back in the box that brought its replacement).
+pub enum Garbage {
+    Any(Box<dyn Any + Send>),
+    /// A sample buffer reference released by a retiring voice, a replaced or freed buffer.
+    Buffer(Arc<Buffer>),
+    /// Effect nodes taken off a retiring voice's chain.
+    Nodes(ChainNodes),
+    /// A consumed snapshot.
+    Descs(Vec<SourceDesc>),
+}
+
+impl Garbage {
+    /// Box a value on the game thread for later disposal there.
+    pub fn boxed<T: Any + Send>(value: T) -> Garbage {
+        Garbage::Any(Box::new(value))
+    }
+}

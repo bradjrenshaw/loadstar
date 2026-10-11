@@ -247,9 +247,7 @@ unsafe fn run(stream: &Stream, engine: &mut Engine, inbox: &mut rtrb::Consumer<C
 
         // Commands land together at a period boundary.
         while let Ok(cmd) = inbox.pop() {
-            if let Some(g) = engine.apply(cmd) {
-                let _ = garbage.push(g);
-            }
+            engine.run(cmd);
         }
 
         let padding = match unsafe { stream.client.GetCurrentPadding() } {
@@ -274,9 +272,10 @@ unsafe fn run(stream: &Stream, engine: &mut Engine, inbox: &mut rtrb::Consumer<C
             if unsafe { stream.render.ReleaseBuffer(block, 0) }.is_err() {
                 return Exit::DeviceLost;
             }
-            for f in engine.take_finished() {
+            engine.drain_finished(|f| {
                 let _ = finished.push(f);
-            }
+            });
+            engine.drain_garbage(|g| garbage.push(g).map_err(|rtrb::PushError::Full(g)| g));
             available -= block;
         }
     }

@@ -1,6 +1,8 @@
 //! Audio-thread state (spec §4.7, §5): buffers, spaces, the master chain and the voice cap.
-//! [`Engine::process`] is the period callback; [`Engine::apply`] runs commands at the start
-//! of a period.
+//! [`Engine::process`] is the period callback; [`Engine::run`] applies commands at the start
+//! of a period. Nothing here allocates or frees in steady state: displaced objects travel back
+//! to the game thread in the very boxes the commands arrived in, and what voices release goes
+//! through [`Engine::drain_garbage`].
 
 use std::sync::Arc;
 
@@ -25,11 +27,12 @@ impl Default for EngineConfig {
 
 pub struct Engine {
     cfg: EngineConfig,
-    spaces: Vec<Option<Space>>,
+    spaces: Vec<Option<Box<Space>>>,
     buffers: Vec<Option<Arc<Buffer>>>,
     master_gain: Ramp,
     master: Chain,
-    finished: Vec<(u32, u64)>,
+    /// Garbage the ring refused last time, retried next period rather than dropped here.
+    garbage: Vec<Garbage>,
     audible: Vec<(u32, usize, u8, f32)>,
 }
 
@@ -38,11 +41,11 @@ impl Engine {
         let cfg = EngineConfig { block_frames: cfg.block_frames.max(1), voice_cap: if cfg.voice_cap == 0 { 64 } else { cfg.voice_cap }, ..cfg };
         Engine {
             cfg,
-            spaces: Vec::new(),
-            buffers: Vec::new(),
+            spaces: Vec::with_capacity(8),
+            buffers: Vec::with_capacity(64),
             master_gain: Ramp::new(cfg.master_gain),
             master: Chain::empty(cfg.sample_rate as f32, 2, cfg.block_frames),
-            finished: Vec::new(),
+            garbage: Vec::with_capacity(64),
             audible: Vec::with_capacity(256),
         }
     }
@@ -52,7 +55,7 @@ impl Engine {
     }
 
     fn space_mut(&mut self, id: u32) -> Option<&mut Space> {
-        self.spaces.get_mut(id as usize).and_then(Option::as_mut)
+        self.spaces.get_mut(id as usize).and_then(|s| s.as_deref_mut())
     }
 
     fn chain_mut(&mut self, target: ChainTarget) -> Option<&mut Chain> {
@@ -64,17 +67,27 @@ impl Engine {
         }
     }
 
-    /// Apply one command. Returns anything displaced that must be dropped off the audio thread.
+    /// Apply one command. Returns anything displaced that must be dropped off the audio thread —
+    /// always carried in an allocation the command itself brought, never one made here.
     pub fn apply(&mut self, cmd: Command) -> Option<Garbage> {
         match cmd {
-            Command::SpaceCreate { id, space } => {
+            Command::SpaceCreate { id, mut space } => {
                 let idx = id as usize;
                 if self.spaces.len() <= idx {
                     self.spaces.resize_with(idx + 1, || None);
                 }
-                self.spaces[idx].replace(*space).map(|old| Box::new(old) as Garbage)
+                match &mut self.spaces[idx] {
+                    Some(old) => {
+                        std::mem::swap(old, &mut space);
+                        Some(Garbage::Any(space))
+                    }
+                    slot @ None => {
+                        *slot = Some(space);
+                        None
+                    }
+                }
             }
-            Command::SpaceDestroy(id) => self.spaces.get_mut(id as usize).and_then(Option::take).map(|s| Box::new(s) as Garbage),
+            Command::SpaceDestroy(id) => self.spaces.get_mut(id as usize).and_then(Option::take).map(|s| Garbage::Any(s)),
             Command::SpaceGain { space, gain } => {
                 if let Some(s) = self.space_mut(space) {
                     s.set_gain(gain);
@@ -87,15 +100,13 @@ impl Engine {
                 }
                 None
             }
-            Command::BusCreate { space, bus } => {
-                match self.space_mut(space) {
-                    Some(s) => {
-                        s.add_bus(*bus);
-                        None
-                    }
-                    None => Some(bus as Garbage),
+            Command::BusCreate { space, bus } => match self.space_mut(space) {
+                Some(s) => {
+                    s.add_bus(*bus);
+                    None
                 }
-            }
+                None => Some(Garbage::Any(bus)),
+            },
             Command::BusGain { space, bus, gain } => {
                 if let Some(s) = self.space_mut(space) {
                     s.set_bus_gain(bus, gain);
@@ -108,7 +119,7 @@ impl Engine {
                     s.sync(&descs, &buffers);
                 }
                 self.buffers = buffers;
-                Some(Box::new(descs) as Garbage)
+                Some(Garbage::Descs(descs))
             }
             Command::Upsert { space, desc } => {
                 let buffers = std::mem::take(&mut self.buffers);
@@ -138,14 +149,13 @@ impl Engine {
                 }
                 None
             }
-            Command::SetChain { target, chain } => match target {
-                ChainTarget::Master => Some(Box::new(std::mem::replace(&mut self.master, *chain)) as Garbage),
-                ChainTarget::Space(s) => self.space_mut(s).map(|sp| Box::new(sp.set_chain(*chain)) as Garbage),
-                ChainTarget::Bus(s, b) => self.space_mut(s).and_then(|sp| sp.set_bus_chain(b, *chain)).map(|c| Box::new(c) as Garbage),
-                ChainTarget::Source(s, id, stage) => {
-                    self.space_mut(s).and_then(|sp| sp.set_source_chain(id, stage, *chain)).map(|c| Box::new(c) as Garbage)
+            Command::SetChain { target, mut chain } => {
+                // Swap the new chain into place and send the old one back in the same box.
+                if let Some(current) = self.chain_mut(target) {
+                    std::mem::swap(current, &mut *chain);
                 }
-            },
+                Some(Garbage::Any(chain))
+            }
             Command::SetEffectParam { target, index, param, value } => {
                 if let Some(c) = self.chain_mut(target) {
                     c.set_param(index, param, value);
@@ -163,14 +173,53 @@ impl Engine {
                 if self.buffers.len() <= idx {
                     self.buffers.resize_with(idx + 1, || None);
                 }
-                self.buffers[idx].replace(buffer).map(|old| Box::new(old) as Garbage)
+                self.buffers[idx].replace(buffer).map(Garbage::Buffer)
             }
-            Command::BufferFree(id) => self.buffers.get_mut(id as usize).and_then(Option::take).map(|b| Box::new(b) as Garbage),
+            Command::BufferFree(id) => self.buffers.get_mut(id as usize).and_then(Option::take).map(Garbage::Buffer),
             Command::MasterGain(g) => {
                 self.master_gain.set_target(g);
                 None
             }
         }
+    }
+
+    /// Apply a command and keep its garbage for [`Engine::drain_garbage`]. What the period
+    /// callbacks use.
+    pub fn run(&mut self, cmd: Command) {
+        if let Some(g) = self.apply(cmd) {
+            self.garbage.push(g);
+        }
+    }
+
+    /// Hand every released object to `sink` (the garbage ring). A refused item — the ring is
+    /// full — is kept and retried next period; nothing is ever freed on this thread.
+    pub fn drain_garbage(&mut self, mut sink: impl FnMut(Garbage) -> Result<(), Garbage>) {
+        while let Some(g) = self.garbage.pop() {
+            if let Err(g) = sink(g) {
+                self.garbage.push(g);
+                return;
+            }
+        }
+        for space in self.spaces.iter_mut().flatten() {
+            space.drain_garbage(&mut sink);
+        }
+    }
+
+    /// `(space, id)` pairs whose sequences ended since the last call, in order. No allocation.
+    pub fn drain_finished(&mut self, mut f: impl FnMut((u32, u64))) {
+        for (si, space) in self.spaces.iter_mut().enumerate() {
+            if let Some(s) = space {
+                s.drain_finished(|id| f((si as u32, id)));
+            }
+        }
+    }
+
+    /// `(space, id)` pairs whose sequences ended since the last call (tests and the null
+    /// backend, where the caller is the game thread; allocates).
+    pub fn take_finished(&mut self) -> Vec<(u32, u64)> {
+        let mut out = Vec::new();
+        self.drain_finished(|f| out.push(f));
+        out
     }
 
     /// Enforce the voice cap: the quietest, lowest-priority voices beyond it are muted.
@@ -202,13 +251,8 @@ impl Engine {
         let out = &mut out[..frames * 2];
         out.iter_mut().for_each(|s| *s = 0.0);
         self.enforce_voice_cap();
-        for (si, space) in self.spaces.iter_mut().enumerate() {
-            if let Some(s) = space {
-                s.process(out);
-                for id in s.take_finished() {
-                    self.finished.push((si as u32, id));
-                }
-            }
+        for space in self.spaces.iter_mut().flatten() {
+            space.process(out);
         }
         let (g0, gs) = self.master_gain.block(frames);
         for f in 0..frames {
@@ -219,13 +263,8 @@ impl Engine {
         self.master.process(out);
     }
 
-    /// `(space, id)` pairs whose sequences ended since the last call.
-    pub fn take_finished(&mut self) -> Vec<(u32, u64)> {
-        std::mem::take(&mut self.finished)
-    }
-
     pub fn space(&self, id: u32) -> Option<&Space> {
-        self.spaces.get(id as usize).and_then(Option::as_ref)
+        self.spaces.get(id as usize).and_then(|s| s.as_deref())
     }
 }
 
@@ -281,5 +320,38 @@ mod tests {
         assert_eq!(e.take_finished(), vec![(0, 5)]);
         let garbage = e.apply(Command::SpaceDestroy(0));
         assert!(garbage.is_some(), "displaced state comes back to be dropped on the game thread");
+    }
+
+    #[test]
+    fn displaced_chains_travel_back_in_their_own_box_and_voice_garbage_drains() {
+        let mut e = Engine::new(EngineConfig::default());
+        e.run(Command::SpaceCreate { id: 0, space: space(&e) });
+        let chain = Box::new(Chain::empty(48000.0, 2, 128));
+        let addr = &*chain as *const Chain;
+        e.run(Command::SetChain { target: ChainTarget::Master, chain });
+        let mut got = Vec::new();
+        e.drain_garbage(|g| {
+            got.push(g);
+            Ok(())
+        });
+        assert_eq!(got.len(), 1);
+        match &got[0] {
+            Garbage::Any(b) => assert_eq!(b.downcast_ref::<Chain>().map(|c| c as *const Chain), Some(addr), "the incoming box carries the old chain out"),
+            _ => panic!("expected a boxed chain"),
+        }
+        // A fired voice's buffer reference surfaces through the same drain.
+        e.run(Command::BufferAdd { id: 0, buffer: Arc::new(Buffer { samples: vec![0.5; 128], rate: 48000 }) });
+        e.run(Command::Fire { space: 0, desc: SourceDesc::buffer(5, 0, Bounds::Point(Vec3::new(0.0, 0.0, -1.0))) });
+        let mut out = vec![0.0; 256];
+        e.process(&mut out);
+        e.process(&mut out);
+        let mut buffers = 0;
+        e.drain_garbage(|g| {
+            if matches!(g, Garbage::Buffer(_)) {
+                buffers += 1;
+            }
+            Ok(())
+        });
+        assert_eq!(buffers, 1);
     }
 }

@@ -271,7 +271,23 @@ public sealed class AudioDevice : IDisposable
     public void Render(float[] interleavedStereo) =>
         NativeAudio.la_device_render(_h, interleavedStereo, (UIntPtr)(interleavedStereo.Length / 2)).ThrowIfError(nameof(NativeAudio.la_device_render));
 
-    /// <summary>Sequences that ended since the last call.</summary>
+    /// <summary>Sequences that ended since the last call, written into <paramref name="buffer"/>
+    /// (grown if too small, so pass the same array every frame): one native call and no allocation
+    /// in steady state. Returns the count.</summary>
+    public int TakeFinished(ref Finished[] buffer)
+    {
+        if (buffer == null || buffer.Length == 0) buffer = new Finished[16];
+        for (;;)
+        {
+            var status = NativeAudio.la_device_finished(_h, buffer, (UIntPtr)buffer.Length, out var written);
+            if (status == Status.Ok) return (int)(ulong)written;
+            if (status != Status.BufferTooSmall) throw new LoadstarException(status, nameof(NativeAudio.la_device_finished));
+            buffer = new Finished[Math.Max((int)(ulong)written, buffer.Length * 2)];
+        }
+    }
+
+    /// <summary>Sequences that ended since the last call, as a fresh array (allocates; prefer the
+    /// <c>ref</c> overload on a per-frame path).</summary>
     public Finished[] TakeFinished()
     {
         var status = NativeAudio.la_device_finished(_h, null, UIntPtr.Zero, out var needed);

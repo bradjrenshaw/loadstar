@@ -184,6 +184,21 @@ struct Node {
     state: NodeState,
 }
 
+/// Effect nodes moved out of a chain with [`Chain::take_nodes`], opaque to callers: exists so a
+/// retiring voice can hand its effect state to the garbage ring instead of freeing it in the
+/// period callback.
+pub struct ChainNodes(Vec<Node>);
+
+impl ChainNodes {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// An ordered list of effect nodes processing interleaved audio of a fixed channel count.
 pub struct Chain {
     nodes: Vec<Node>,
@@ -230,6 +245,11 @@ impl Chain {
 
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
+    }
+
+    /// Move the nodes out without allocating, leaving an empty chain with its scratch intact.
+    pub fn take_nodes(&mut self) -> ChainNodes {
+        ChainNodes(std::mem::take(&mut self.nodes))
     }
 
     pub fn descs(&self) -> impl Iterator<Item = &EffectDesc> {
@@ -312,13 +332,15 @@ impl Chain {
             if wet_start == 0.0 && wet_step == 0.0 {
                 continue; // fully bypassed and settled
             }
-            let fully_wet = wet_start == 1.0 && wet_step == 0.0;
+            if wet_start == 1.0 && wet_step == 0.0 {
+                // Fully wet and settled: process in place, no scratch round-trip.
+                Self::run(&mut node.state, &node.desc, buf, channels, frames, rate);
+                continue;
+            }
             let scratch = &mut self.scratch[..buf.len()];
             scratch.copy_from_slice(buf);
             Self::run(&mut node.state, &node.desc, scratch, channels, frames, rate);
-            if fully_wet {
-                buf.copy_from_slice(scratch);
-            } else {
+            {
                 for f in 0..frames {
                     let w = wet_start + wet_step * f as f32;
                     for c in 0..channels {
@@ -372,7 +394,10 @@ impl Chain {
                         lines[li] = x + delayed * feedback;
                         buf[i] = x + delayed * mix;
                     }
-                    *pos = (*pos + 1) % *len;
+                    *pos += 1;
+                    if *pos >= *len {
+                        *pos = 0;
+                    }
                 }
             }
             NodeState::Limiter { env } => {
