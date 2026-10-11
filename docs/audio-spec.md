@@ -271,7 +271,7 @@ The backend boundary is minimal on purpose: open a stream at a format and period
 
 Identical to `spec.md` §9: `la_` prefix, `LsStatus` return codes (shared enum, extended with `DeviceUnavailable`, `BufferInUse`), opaque handles, flat structs with pinned sizes, no callbacks, no strings, cdecl, `[Out]` on output arrays in .NET. Same lessons, same rules.
 
-Threading contract: the device and its spaces are driven from one game thread; the audio thread is internal and never calls out.
+Threading contract: the device and its spaces are driven from one *external* control thread (the game thread) through the ABI; the audio thread is internal and never calls out. In-process crates (the speech worker, `speech-spec.md` §6) may additionally submit commands through a locked intake — the command producer behind a mutex, buffer ids from an atomic — so the ring stays single-producer underneath and the game thread's calls pay only an uncontended lock. Added 2026-10 for positional speech; no ABI change.
 
 ---
 
