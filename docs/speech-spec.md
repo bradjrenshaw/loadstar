@@ -14,6 +14,21 @@
 
 It follows the crate's rules — tools not a framework, no callbacks across the ABI, no update loop, the mod decides *what* is said — with **one deliberate exception, text crosses the ABI** (§9). Nothing else about the FFI conventions changes.
 
+### Latency is first-class
+
+A blind player hears the startup delay of every utterance thousands of times a session, so per-call latency is a design metric here, not a nicety, and "imperceptible" is never a reason to add a stage. The budget this document designs to, measured from the ABI call:
+
+| stage | target |
+|---|---|
+| `lv_speak` returns (resolve, feature check, enqueue) | < 50 µs, no heap allocation beyond one copy of the text |
+| worker wakes and dispatches to a backend | < 200 µs (park/unpark on the inbox; the worker never sleeps on a timer) |
+| screen reader hand-off | same frame as the call |
+| synthesizer first audio | the backend's own start latency, nothing added |
+| positional: queued behind another item | **zero render wait** — rendered ahead while the previous item plays (§6) |
+| positional: first in a burst | the render itself; streaming playback (§11) is the roadmap item that cuts it to first-chunk |
+
+Where a simpler design and a faster one exist, this spec takes the faster one and keeps the complexity inside the library (the per-frame pump was rejected on exactly this ground, §6). Per-utterance work the game thread never sees: voice selection (instance cache), resampling (worker, at the device rate), COM calls (worker). The smoke harness measures every row above and a regression fails it.
+
 ### In scope (v1)
 
 - **The voice tree**: everything that can speak, as leaves grouped into categories (screen readers, SAPI 5, clipboard, …), each leaf with a stable id and a feature set. Screen readers found through Prism (§4) and the crate's own backends (§5) are leaves in the same tree; the user never sees a backend.
@@ -229,7 +244,7 @@ lv_speak_at(ctx, queue, profile*, text, flags, device, space, bus, bounds*, gain
 The utterance enters its queue like any other and honours the same flags and `max_concurrent`. The pipeline, per utterance:
 
 1. **Call** (game thread): resolve the profile, check `RENDER`, allocate the utterance id and a source id, push the command. Nothing touches the audio device.
-2. **Render** (worker): the backend produces PCM; the worker converts it to mono f32 *at the device's rate* (queried once via `la_device_info`), so the resample never runs on the game thread.
+2. **Render** (worker): the backend produces PCM; the worker converts it to mono f32 *at the device's rate* (queried once via `la_device_info`), so the resample never runs on the game thread. **Render-ahead**: on a sequential queue the worker renders pending positional items *while the current one plays*, on a spare backend instance, so that when an item reaches the head its audio is already in memory and it fires at once. On an unlimited-concurrency queue every item renders immediately on arrival. An item that is flushed or cancelled while rendering ahead is discarded; the only wasted work is one render. The first item of a burst still waits for its own render — the streaming source (§11) is what removes that.
 3. **Hand-off** (worker, directly): `buffer_create` → `fire` a one-shot `SourceDesc` with the given bounds, bus, gain and `AUTO_REMOVE` → `buffer_free` immediately, through the audio device's in-process intake (below). The free is safe because playing voices hold an `Arc` to the buffer; it only drops the registry's reference.
 4. **State**: `Speaking` from the fire; `Done` once the buffer's duration (frames ÷ rate ÷ pitch) has elapsed. The speech crate does **not** consume the device's finished ring — that is single-consumer and the mod already drains it for its own sources.
 
@@ -271,7 +286,7 @@ Strings **in**: NUL-terminated UTF-8 `const char*`, no length (§3). Strings **o
 
 ## 8. Threading
 
-The context is driven from one game thread. The ABI verbs resolve, check and push commands onto queue inboxes (lock-free where it matters, as the audio crate's `rtrb` rings are). The crate owns one **worker thread** that drains the inboxes, sequences each queue, talks to every backend, runs render jobs and fires positioned sources through the audio device's locked in-process intake (§6); the worker never calls the host. Nothing in the speech crate requires a per-frame call from the mod. Prism's audio callback runs on whatever thread Prism chooses and only appends to a job buffer under a lock the game thread never takes. COM is initialized on the worker (MTA); the game thread never touches a backend, so its apartment is irrelevant and the crate never initializes or uninitializes COM there. Tree refresh runs on the worker too; the ABI call returns the previous snapshot until the new one is swapped in atomically.
+The context is driven from one game thread. The ABI verbs resolve, check and push commands onto queue inboxes (lock-free where it matters, as the audio crate's `rtrb` rings are). The crate owns one **worker thread** that drains the inboxes, sequences each queue, talks to every backend, runs render jobs and fires positioned sources through the audio device's locked in-process intake (§6); the worker never calls the host. Nothing in the speech crate requires a per-frame call from the mod. **The worker never polls**: it parks on the inbox and is unparked by every push; its only timers are `gap_ms` expiries and duration-based `Done` transitions, armed exactly, and a backend whose completion must be polled (SAPI's stream end) is polled at the backend's own event, not on a tick. Render-ahead runs on the same worker between dispatches, and is pre-empted by any new command so a flat `lv_speak` never waits behind a render — if a backend's render call cannot be interrupted, renders run on a second thread dedicated to them. Prism's audio callback runs on whatever thread Prism chooses and only appends to a job buffer under a lock the game thread never takes. COM is initialized on the worker (MTA); the game thread never touches a backend, so its apartment is irrelevant and the crate never initializes or uninitializes COM there. Tree refresh runs on the worker too; the ABI call returns the previous snapshot until the new one is swapped in atomically.
 
 ---
 
@@ -301,7 +316,8 @@ Two lines in `spec.md` move:
 3. **SAPI 5 native** (speak + render + instance cache), the fallback walk, `lv_speak_at` and the two positional flags against the audio crate; wotr's `SapiHandler` and `PositionalSpeech` retired behind it.
 4. **NVDA direct + the 32-bit validation**; Say the Spire 2 moves over.
 5. **OneCore**, SSML passthrough.
-6. Later: `lv_submit` batches if a mod hits the ordering race; the plugin ABI for third-party backends (the tree already has room); speech-dispatcher and AVSpeech natively; priorities only if two mods converge on the same scheme.
+6. **Streaming positional speech**: a ring-fed source kind in the audio crate so a render plays from its first chunk instead of its last — cuts first-in-burst positional latency from the whole render to one chunk. The largest remaining latency item once render-ahead is in; wants the audio crate's streaming source, which is also what long ambiences need.
+7. Later: `lv_submit` batches if a mod hits the ordering race; the plugin ABI for third-party backends (the tree already has room); speech-dispatcher and AVSpeech natively; priorities only if two mods converge on the same scheme.
 
 ## 12. Open questions
 
