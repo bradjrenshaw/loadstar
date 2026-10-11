@@ -1,6 +1,6 @@
 # Loadstar Speech — Design Specification
 
-*Companion to `spec.md` and `audio-spec.md`. Status: draft 3, for review. Pre-implementation.*
+*Companion to `spec.md` and `audio-spec.md`. Status: implemented 2026-10-11 (`crates/loadstar-speech`, `lv_*` in `loadstar-ffi`, `Loadstar.Net/Speech.cs`); roadmap items 2–3 shipped, wotr migrated.*
 
 *Distilled from the Wrath of the Righteous mod's speech layer (`wotr-access/src/Speech`, ~2,000 lines of C# that went through two refactors before it settled) and Say the Spire 2's, which it was ported from. Those are the validated behaviours; this document turns them into a crate so a new mod has them on day one.*
 
@@ -311,8 +311,8 @@ Two lines in `spec.md` move:
 
 ## 11. Roadmap
 
-1. **This document reviewed.**
-2. **Crate skeleton: backend trait, the tree (categories, leaves, autos, refresh), queues and the worker, utterance states, `clipboard`**, with the Prism loader and generated bindings against the pinned header; smoke harness speaks through NVDA via Prism from x64 net472 and checks state degradation.
+1. ~~This document reviewed.~~ Done.
+2. ~~Crate skeleton~~ **Shipped 2026-10-11** with step 3 (SAPI 5, fallback walk, `lv_speak_at` through the audio intake; wotr's `SapiHandler`/`PrismHandler`/`PositionalSpeech` deleted). Measured on the author's machine: `lv_speak` 8–14 µs, NVDA hand-over 21 ms, SAPI render 65 ms for 3 s of audio, resolve 70–150 ns. — Crate skeleton: backend trait, the tree (categories, leaves, autos, refresh), queues and the worker, utterance states, `clipboard`**, with the Prism loader and generated bindings against the pinned header; smoke harness speaks through NVDA via Prism from x64 net472 and checks state degradation.
 3. **SAPI 5 native** (speak + render + instance cache), the fallback walk, `lv_speak_at` and the two positional flags against the audio crate; wotr's `SapiHandler` and `PositionalSpeech` retired behind it.
 4. **NVDA direct + the 32-bit validation**; Say the Spire 2 moves over.
 5. **OneCore**, SSML passthrough.
