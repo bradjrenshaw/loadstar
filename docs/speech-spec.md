@@ -226,7 +226,16 @@ With the `audio` feature on, positioned speech is an ordinary queued utterance:
 lv_speak_at(ctx, queue, profile*, text, flags, device, space, bus, bounds*, gain, out utterance, out source_id)
 ```
 
-The utterance enters its queue like any other and honours the same flags and `max_concurrent`. When the queue starts it, the worker renders → `la_buffer_create` → `la_space_fire` a one-shot source with the given bounds on the given bus, `AUTO_REMOVE`, buffer freed when the source finishes. The source id is allocated immediately (the source exists, silent, until the render lands — a few hundred milliseconds for SAPI), so the mod can stop or reposition it like any other, and `lv_utterance_state` tracks it through `Speaking` to `Done` off the source's lifetime. This is wotr's `PositionalSpeech` plus `SpatialSources` plus the render path collapsed into a line, and it is why the speech crate belongs next to the audio crate rather than in a companion. An events queue with `max_concurrent = 0` is the intended home for it.
+The utterance enters its queue like any other and honours the same flags and `max_concurrent`. The pipeline, per utterance:
+
+1. **Call** (game thread): resolve the profile, check `RENDER`, allocate the utterance id and a source id, push the command. Nothing touches the audio device.
+2. **Render** (worker): the backend produces PCM; the worker converts it to mono f32 *at the device's rate* (queried once via `la_device_info`), so the resample never runs on the game thread.
+3. **Hand-off** (game thread, inside `lv_pump`): `la_buffer_create` → `la_space_fire` a one-shot `SourceDesc` with the given bounds, bus, gain and `AUTO_REMOVE` → `la_buffer_free` immediately. The free is safe because playing voices hold an `Arc` to the buffer; it only drops the registry's reference.
+4. **State**: `Speaking` from the fire; `Done` once the buffer's duration (frames ÷ rate ÷ pitch) has elapsed. The speech crate does **not** consume the device's finished ring — that is single-consumer and the mod already drains it for its own sources.
+
+**Why a pump.** The audio device is a single-control-thread object: its command ring is a single-producer `rtrb` ring and every method takes `&mut`. The worker therefore cannot upload or fire. `lv_pump(ctx, device)` is called by the mod once per frame from wherever it already calls `la_space_update`; it drains the worker's completed renders and performs step 3 on the calling thread, which is the device's control thread by construction. Cost: up to one frame of latency on top of a render that already takes a few hundred milliseconds. It also keeps the core principle that the library never acts spontaneously — the device changes only when the mod asks. Making the device ring multi-producer would serve one consumer by changing the audio crate's contract, so it is not done.
+
+The source id is allocated at call time and is the mod's handle from then on: `la_source_stop` cuts it, and `la_source_upsert` with fresh bounds on that id each frame makes the line follow a unit that walks while it speaks (the audio crate accepts upserts on fired voices). That replaces wotr's live-tracked `SpatialSources` for speech. Bounds are in the space's frame and units — right-handed, north on −Z, `unit_scale` — exactly as for every other source. This is wotr's `PositionalSpeech` plus `SpatialSources` plus the render path collapsed into one queued item, and it is why the speech crate belongs next to the audio crate rather than in a companion. An events queue with `max_concurrent = 0` is the intended home for it.
 
 ### Positioning a voice that cannot render
 
@@ -254,7 +263,7 @@ Prefix `lv_` (voice). `LsStatus` return codes, extended with `VoiceUnavailable` 
 | Queues | `lv_queue_create(options*)`, `lv_queue_destroy`, `lv_queue_set(queue, option, value)`, `lv_queue_depth(queue, out pending, out speaking)` |
 | Speaking | `lv_speak`, `lv_output`, `lv_braille`, `lv_gap`, `lv_stop`, `lv_flush`, `lv_pause`, `lv_resume`, `lv_cancel`, `lv_stop_all` |
 | Utterances | `lv_utterance_state(id, out state)`, `lv_utterance_voice(id, out voice)` |
-| Rendering | `lv_render`, `lv_render_poll`, `lv_render_take`, `lv_render_free`, `lv_speak_at` (audio feature) |
+| Rendering | `lv_render`, `lv_render_poll`, `lv_render_take`, `lv_render_free`, `lv_speak_at`, `lv_pump(device)` (audio feature; once per frame on the device's control thread) |
 
 Strings **in**: NUL-terminated UTF-8 `const char*`, no length (§3). Strings **out**: the two-call buffer pattern — null buffer returns the required capacity *including* the terminator; a real buffer is filled, always NUL-terminated within capacity, and the reported length excludes the terminator, so a C caller reads the buffer directly and a .NET caller makes one `PtrToStringUTF8` call. No other string crosses.
 
@@ -262,7 +271,7 @@ Strings **in**: NUL-terminated UTF-8 `const char*`, no length (§3). Strings **o
 
 ## 8. Threading
 
-The context is driven from one game thread. The ABI verbs resolve, check and push commands onto queue inboxes (lock-free where it matters, as the audio crate's `rtrb` rings are). The crate owns one **worker thread** that drains the inboxes, sequences each queue, talks to every backend, runs render jobs and fires positioned sources; the worker never calls the host. Prism's audio callback runs on whatever thread Prism chooses and only appends to a job buffer under a lock the game thread never takes. COM is initialized on the worker (MTA); the game thread never touches a backend, so its apartment is irrelevant and the crate never initializes or uninitializes COM there. Tree refresh runs on the worker too; the ABI call returns the previous snapshot until the new one is swapped in atomically.
+The context is driven from one game thread. The ABI verbs resolve, check and push commands onto queue inboxes (lock-free where it matters, as the audio crate's `rtrb` rings are). The crate owns one **worker thread** that drains the inboxes, sequences each queue, talks to every backend and runs render jobs; the worker never calls the host and never touches the audio device. Rendered positional audio crosses back to the game thread through a completed-renders ring and is uploaded and fired inside `lv_pump` (§6), so the audio crate keeps its single-control-thread contract. Prism's audio callback runs on whatever thread Prism chooses and only appends to a job buffer under a lock the game thread never takes. COM is initialized on the worker (MTA); the game thread never touches a backend, so its apartment is irrelevant and the crate never initializes or uninitializes COM there. Tree refresh runs on the worker too; the ABI call returns the previous snapshot until the new one is swapped in atomically.
 
 ---
 
