@@ -180,6 +180,15 @@ pub trait Backend: Send {
     fn release(&mut self, _slot: Slot) {}
 }
 
+/// Where streamed render output goes (speech-spec §6, streaming). Called from whatever thread the
+/// synthesizer produces audio on, chunk by chunk, as soon as each exists.
+pub trait StreamSink: Send + Sync {
+    /// Interleaved f32 at the backend's native rate. `false` = stop, the consumer is gone.
+    fn write(&self, samples: &[f32], channels: u32, rate: u32) -> bool;
+    /// No more audio will come.
+    fn finish(&self);
+}
+
 /// A source of rendered speech. Lives on the render thread with its own instances.
 pub trait RenderBackend: Send {
     fn name(&self) -> &'static str;
@@ -190,6 +199,25 @@ pub trait RenderBackend: Send {
         params: &Params,
         ssml: bool,
     ) -> Result<Pcm, BackendError>;
+
+    /// Pay the first-use cost for a voice now (instance creation, first synthesis) so the first
+    /// real utterance does not. Called on the render thread after a probe. Default: nothing.
+    fn warm(&mut self, _selector: u64) {}
+
+    /// Render into `sink` as audio is produced. Backends that can only render whole hand the
+    /// finished buffer over in one write; the caller still calls `sink.finish()`.
+    fn render_streaming(
+        &mut self,
+        selector: u64,
+        text: &str,
+        params: &Params,
+        ssml: bool,
+        sink: std::sync::Arc<dyn StreamSink>,
+    ) -> Result<(), BackendError> {
+        let pcm = self.render(selector, text, params, ssml)?;
+        sink.write(&pcm.samples, pcm.channels, pcm.rate);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

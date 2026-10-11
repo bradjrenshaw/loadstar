@@ -18,10 +18,15 @@ use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, IStream,
     STATFLAG_NONAME, STATSTG, STREAM_SEEK_SET,
 };
+use windows::Win32::System::Com::{
+    ISequentialStream_Impl, IStream_Impl, LOCKTYPE, STATFLAG, STGC, STREAM_SEEK,
+};
 use windows::Win32::UI::Shell::SHCreateMemStream;
-use windows::core::{GUID, IUnknown, PCWSTR, PWSTR, w};
+use windows::core::{GUID, HRESULT, IUnknown, PCWSTR, PWSTR, implement, w};
 
-use crate::backend::{Backend, BackendError, LeafSpec, Params, Pcm, RenderBackend, Slot};
+use crate::backend::{
+    Backend, BackendError, LeafSpec, Params, Pcm, RenderBackend, Slot, StreamSink,
+};
 use crate::features;
 use crate::ids;
 use crate::tree;
@@ -383,18 +388,126 @@ impl Default for SapiRender {
     }
 }
 
-impl RenderBackend for SapiRender {
-    fn name(&self) -> &'static str {
-        "sapi"
+/// The IStream SAPI writes into when rendering: every `Write` forwards the PCM16 chunk to the
+/// sink as f32, on SAPI's synthesis thread, while `Speak` blocks the render thread. SAPI only
+/// writes and asks for the position; the rest of the interface is accepted and ignored.
+#[implement(windows::Win32::System::Com::IStream)]
+struct ForwardingStream {
+    sink: std::sync::Arc<dyn StreamSink>,
+    rate: u32,
+    state: std::sync::Mutex<(u64, bool)>, // (bytes written, consumer gone)
+    /// Set `LOADSTAR_SPEECH_TRACE` to log every chunk SAPI hands over (size, time since creation).
+    trace: Option<std::time::Instant>,
+}
+
+impl ISequentialStream_Impl for ForwardingStream_Impl {
+    fn Read(&self, _pv: *mut c_void, _cb: u32, _pcbread: *mut u32) -> HRESULT {
+        HRESULT(0x80004001u32 as i32) // E_NOTIMPL
     }
 
-    fn render(
-        &mut self,
-        selector: u64,
-        text: &str,
-        params: &Params,
-        ssml: bool,
-    ) -> Result<Pcm, BackendError> {
+    fn Write(&self, pv: *const c_void, cb: u32, pcbwritten: *mut u32) -> HRESULT {
+        // SAFETY: SAPI hands us `cb` readable bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(pv as *const u8, cb as usize) };
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let start = if st.0 == 0 && bytes.len() > 44 && &bytes[..4] == b"RIFF" {
+            44
+        } else {
+            0
+        };
+        let samples: Vec<f32> = bytes[start..]
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+            .collect();
+        st.0 += cb as u64;
+        if let Some(t0) = self.trace {
+            eprintln!(
+                "[sapi-stream] +{:?}: {} bytes ({:.1} ms of audio), total {} bytes",
+                t0.elapsed(),
+                cb,
+                samples.len() as f32 * 1000.0 / self.rate as f32,
+                st.0
+            );
+        }
+        if !st.1 && !self.sink.write(&samples, 1, self.rate) {
+            st.1 = true; // consumer gone: keep accepting so SAPI finishes quietly, write nowhere
+        }
+        if !pcbwritten.is_null() {
+            // SAFETY: SAPI passes a valid out pointer or null.
+            unsafe { *pcbwritten = cb };
+        }
+        HRESULT(0)
+    }
+}
+
+impl IStream_Impl for ForwardingStream_Impl {
+    fn Seek(
+        &self,
+        _dlibmove: i64,
+        _dworigin: STREAM_SEEK,
+        plibnewposition: *mut u64,
+    ) -> windows::core::Result<()> {
+        if !plibnewposition.is_null() {
+            // SAFETY: valid out pointer or null.
+            unsafe { *plibnewposition = self.state.lock().unwrap_or_else(|e| e.into_inner()).0 };
+        }
+        Ok(())
+    }
+    fn SetSize(&self, _libnewsize: u64) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn CopyTo(
+        &self,
+        _pstm: windows::core::Ref<'_, IStream>,
+        _cb: u64,
+        _pcbread: *mut u64,
+        _pcbwritten: *mut u64,
+    ) -> windows::core::Result<()> {
+        Err(windows::core::Error::from_hresult(HRESULT(
+            0x80004001u32 as i32,
+        )))
+    }
+    fn Commit(&self, _grfcommitflags: &STGC) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn Revert(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn LockRegion(
+        &self,
+        _liboffset: u64,
+        _cb: u64,
+        _dwlocktype: &LOCKTYPE,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn UnlockRegion(
+        &self,
+        _liboffset: u64,
+        _cb: u64,
+        _dwlocktype: u32,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn Stat(&self, pstatstg: *mut STATSTG, _grfstatflag: &STATFLAG) -> windows::core::Result<()> {
+        if !pstatstg.is_null() {
+            // SAFETY: valid out struct.
+            unsafe {
+                let mut st = STATSTG::default();
+                st.cbSize = self.state.lock().unwrap_or_else(|e| e.into_inner()).0;
+                *pstatstg = st;
+            }
+        }
+        Ok(())
+    }
+    fn Clone(&self) -> windows::core::Result<IStream> {
+        Err(windows::core::Error::from_hresult(HRESULT(
+            0x80004001u32 as i32,
+        )))
+    }
+}
+
+impl SapiRender {
+    fn voice_for(&mut self, selector: u64) -> Result<&ISpVoice, BackendError> {
         if !self.probed {
             com_init();
             self.tokens = enumerate().unwrap_or_default();
@@ -410,11 +523,19 @@ impl RenderBackend for SapiRender {
                 .clone();
             self.voices.insert(selector, make_voice(&id)?);
         }
-        let voice = &self.voices[&selector];
+        Ok(&self.voices[&selector])
+    }
+
+    /// Bind `voice`'s output to `target` in our PCM format, speak synchronously, unbind.
+    fn speak_into(
+        voice: &ISpVoice,
+        target: &IStream,
+        text: &str,
+        params: &Params,
+        ssml: bool,
+    ) -> Result<(), BackendError> {
         // SAFETY: documented SAPI render-to-stream sequence; every object is released by drop.
         unsafe {
-            let mem: IStream = SHCreateMemStream(None)
-                .ok_or_else(|| BackendError::Failed("SHCreateMemStream".into()))?;
             let stream: ISpStream = CoCreateInstance(&SpStream, None, CLSCTX_ALL).map_err(fail)?;
             let wfx = WAVEFORMATEX {
                 wFormatTag: WAVE_FORMAT_PCM as u16,
@@ -426,7 +547,7 @@ impl RenderBackend for SapiRender {
                 cbSize: 0,
             };
             stream
-                .SetBaseStream(&mem, &SPDFID_WAVEFORMATEX, &wfx)
+                .SetBaseStream(target, &SPDFID_WAVEFORMATEX, &wfx)
                 .map_err(fail)?;
             voice.SetOutput(&stream, false).map_err(fail)?;
             apply(voice, params);
@@ -435,8 +556,60 @@ impl RenderBackend for SapiRender {
             let spoke = voice.Speak(PCWSTR(w.as_ptr()), flags, None); // synchronous: data complete on return
             let _ = voice.SetOutput(None::<&IUnknown>, true);
             let _ = stream.Close();
-            spoke.map_err(fail)?;
+            spoke.map_err(fail)
+        }
+    }
+}
 
+impl RenderBackend for SapiRender {
+    fn name(&self) -> &'static str {
+        "sapi"
+    }
+
+    fn warm(&mut self, selector: u64) {
+        let Ok(voice) = self.voice_for(selector).cloned() else {
+            return;
+        };
+        // SAFETY: a throwaway memory stream; the render is a single space.
+        unsafe {
+            if let Some(mem) = SHCreateMemStream(None) {
+                let _ = Self::speak_into(&voice, &mem, " ", &Params::default(), false);
+            }
+        }
+    }
+
+    fn render_streaming(
+        &mut self,
+        selector: u64,
+        text: &str,
+        params: &Params,
+        ssml: bool,
+        sink: std::sync::Arc<dyn StreamSink>,
+    ) -> Result<(), BackendError> {
+        let voice = self.voice_for(selector)?.clone();
+        let target: IStream = ForwardingStream {
+            sink,
+            rate: RENDER_RATE,
+            state: std::sync::Mutex::new((0, false)),
+            trace: std::env::var_os("LOADSTAR_SPEECH_TRACE").map(|_| std::time::Instant::now()),
+        }
+        .into();
+        Self::speak_into(&voice, &target, text, params, ssml)
+    }
+
+    fn render(
+        &mut self,
+        selector: u64,
+        text: &str,
+        params: &Params,
+        ssml: bool,
+    ) -> Result<Pcm, BackendError> {
+        let voice = self.voice_for(selector)?.clone();
+        // SAFETY: a memory stream we own; read back after the synchronous speak.
+        unsafe {
+            let mem: IStream = SHCreateMemStream(None)
+                .ok_or_else(|| BackendError::Failed("SHCreateMemStream".into()))?;
+            Self::speak_into(&voice, &mem, text, params, ssml)?;
             mem.Seek(0, STREAM_SEEK_SET, None).map_err(fail)?;
             let mut stat = STATSTG::default();
             mem.Stat(&mut stat, STATFLAG_NONAME).map_err(fail)?;

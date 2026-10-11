@@ -13,6 +13,7 @@ use crate::chain::{Chain, DistanceParams};
 use crate::commands::Garbage;
 use crate::dsp::{Noise, NoiseColor, Oscillator, Ramp, Waveform};
 use crate::render::{Placement, Renderer, SpatializerParams, VoiceRenderer};
+use crate::stream::{Pull, StreamSource};
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -30,6 +31,8 @@ pub enum SourceKind {
     Buffer = 0,
     Oscillator = 1,
     Noise = 2,
+    /// Plays from a ring filled while it plays (`buffer` = the stream id). Plays once.
+    Stream = 3,
 }
 
 impl SourceKind {
@@ -37,6 +40,7 @@ impl SourceKind {
         match v {
             1 => SourceKind::Oscillator,
             2 => SourceKind::Noise,
+            3 => SourceKind::Stream,
             _ => SourceKind::Buffer,
         }
     }
@@ -247,6 +251,8 @@ struct Voice {
     declared: bool,
     remove_when_done: bool,
     buffer: Option<Arc<Buffer>>,
+    /// A streaming source this voice took from the registry (Stream kind).
+    stream: Option<StreamSource>,
     pos: f64,
     osc: Oscillator,
     noise: Noise,
@@ -274,6 +280,7 @@ impl Voice {
             declared: false,
             remove_when_done: true,
             buffer: None,
+            stream: None,
             pos: 0.0,
             osc: Oscillator::default(),
             noise: Noise::new(1),
@@ -291,11 +298,18 @@ impl Voice {
     }
 
     /// Bind a pooled voice to a record. No allocation.
-    fn arm(&mut self, desc: SourceDesc, declared: bool, buffer: Option<Arc<Buffer>>) {
+    fn arm(
+        &mut self,
+        desc: SourceDesc,
+        declared: bool,
+        buffer: Option<Arc<Buffer>>,
+        stream: Option<StreamSource>,
+    ) {
         self.desc = desc;
         self.declared = declared;
         self.remove_when_done = !declared || desc.flags & flags::AUTO_REMOVE != 0;
         self.buffer = buffer;
+        self.stream = stream;
         self.pos = 0.0;
         self.osc = Oscillator::default();
         self.noise = Noise::new(desc.id as u32 ^ 0x9E37_79B9);
@@ -453,9 +467,15 @@ impl Space {
         desc: SourceDesc,
         declared: bool,
         buffers: &[Option<Arc<Buffer>>],
+        streams: &mut [Option<StreamSource>],
     ) -> usize {
         let buffer = if desc.kind == SourceKind::Buffer {
             buffers.get(desc.buffer as usize).cloned().flatten()
+        } else {
+            None
+        };
+        let stream = if desc.kind == SourceKind::Stream {
+            streams.get_mut(desc.buffer as usize).and_then(Option::take)
         } else {
             None
         };
@@ -463,7 +483,7 @@ impl Space {
             Some(v) => v,
             None => Voice::blank(self.rate, self.block, self.renderer.as_ref()),
         };
-        voice.arm(desc, declared, buffer);
+        voice.arm(desc, declared, buffer, stream);
         self.voices.push(voice);
         self.voices.len() - 1
     }
@@ -474,6 +494,9 @@ impl Space {
         let mut v = self.voices.swap_remove(index);
         if let Some(b) = v.buffer.take() {
             self.released.push(Garbage::Buffer(b));
+        }
+        if let Some(s) = v.stream.take() {
+            self.released.push(Garbage::Stream(s));
         }
         if !v.pre.is_empty() {
             self.released.push(Garbage::Nodes(v.pre.take_nodes()));
@@ -488,14 +511,21 @@ impl Space {
         self.pool.push(v);
     }
 
-    fn apply_desc(&mut self, index: usize, desc: SourceDesc, buffers: &[Option<Arc<Buffer>>]) {
+    fn apply_desc(
+        &mut self,
+        index: usize,
+        desc: SourceDesc,
+        buffers: &[Option<Arc<Buffer>>],
+        streams: &mut [Option<StreamSource>],
+    ) {
         let voice = &mut self.voices[index];
         let old = voice.desc;
         let restart = desc.flags & flags::RESTART != 0;
         let started = !old.playing() && desc.playing();
         let stopped = old.playing() && !desc.playing();
-        let buffer_changed =
-            desc.kind != old.kind || (desc.kind == SourceKind::Buffer && desc.buffer != old.buffer);
+        let buffer_changed = desc.kind != old.kind
+            || ((desc.kind == SourceKind::Buffer || desc.kind == SourceKind::Stream)
+                && desc.buffer != old.buffer);
         voice.desc = SourceDesc {
             flags: desc.flags & !flags::RESTART,
             ..desc
@@ -510,6 +540,14 @@ impl Space {
             if let Some(old) = std::mem::replace(&mut voice.buffer, next) {
                 self.released.push(Garbage::Buffer(old));
             }
+            let next_stream = if desc.kind == SourceKind::Stream {
+                streams.get_mut(desc.buffer as usize).and_then(Option::take)
+            } else {
+                None
+            };
+            if let Some(old) = std::mem::replace(&mut voice.stream, next_stream) {
+                self.released.push(Garbage::Stream(old));
+            }
         }
         if stopped {
             voice.stop();
@@ -520,28 +558,48 @@ impl Space {
 
     /// Insert or update a declared source.
     pub fn upsert(&mut self, desc: SourceDesc, buffers: &[Option<Arc<Buffer>>]) {
+        self.upsert_with(desc, buffers, &mut []);
+    }
+
+    /// `upsert` with the stream registry (Stream-kind sources take their consumer from it).
+    pub fn upsert_with(
+        &mut self,
+        desc: SourceDesc,
+        buffers: &[Option<Arc<Buffer>>],
+        streams: &mut [Option<StreamSource>],
+    ) {
         match self.find(desc.id, true) {
             Some(i) => {
                 self.voices[i].seen = true;
                 if !self.voices[i].desc.same_record(&desc) || desc.flags & flags::RESTART != 0 {
-                    self.apply_desc(i, desc, buffers);
+                    self.apply_desc(i, desc, buffers, streams);
                 }
             }
             None => {
-                self.create_voice(desc, true, buffers);
+                self.create_voice(desc, true, buffers, streams);
             }
         }
     }
 
     /// Declarative snapshot: upsert all, stop-and-remove declared sources absent from it.
     pub fn sync(&mut self, descs: &[SourceDesc], buffers: &[Option<Arc<Buffer>>]) {
+        self.sync_with(descs, buffers, &mut []);
+    }
+
+    /// `sync` with the stream registry.
+    pub fn sync_with(
+        &mut self,
+        descs: &[SourceDesc],
+        buffers: &[Option<Arc<Buffer>>],
+        streams: &mut [Option<StreamSource>],
+    ) {
         for v in &mut self.voices {
             if v.declared {
                 v.seen = false;
             }
         }
         for &d in descs {
-            self.upsert(d, buffers);
+            self.upsert_with(d, buffers, streams);
         }
         for v in &mut self.voices {
             if v.declared && !v.seen {
@@ -572,14 +630,24 @@ impl Space {
     /// Play a sequence and remove the source when it drains. Id 0 is anonymous; a nonzero id
     /// retriggers an existing fired voice with that id instead of stacking a new one.
     pub fn fire(&mut self, desc: SourceDesc, buffers: &[Option<Arc<Buffer>>]) {
+        self.fire_with(desc, buffers, &mut []);
+    }
+
+    /// `fire` with the stream registry.
+    pub fn fire_with(
+        &mut self,
+        desc: SourceDesc,
+        buffers: &[Option<Arc<Buffer>>],
+        streams: &mut [Option<StreamSource>],
+    ) {
         let desc = SourceDesc {
             flags: desc.flags | flags::PLAYING | flags::RESTART,
             ..desc
         };
         match self.find(desc.id, false) {
-            Some(i) => self.apply_desc(i, desc, buffers),
+            Some(i) => self.apply_desc(i, desc, buffers, streams),
             None => {
-                self.create_voice(desc, false, buffers);
+                self.create_voice(desc, false, buffers, streams);
             }
         }
     }
@@ -725,6 +793,26 @@ impl Space {
                     *s = v.noise.next(c);
                 }
                 true
+            }
+            SourceKind::Stream => {
+                let Some(s) = v.stream.as_mut() else {
+                    v.phase = Phase::Idle;
+                    return false;
+                };
+                match s.pull(mono) {
+                    Pull::Prefilling => true, // silent but alive
+                    Pull::Produced(n) => {
+                        v.pos += n as f64;
+                        true
+                    }
+                    Pull::Finished => {
+                        v.phase = Phase::Idle;
+                        if v.desc.id != 0 {
+                            finished.push(v.desc.id);
+                        }
+                        false
+                    }
+                }
             }
             SourceKind::Buffer => {
                 let Some(buf) = v.buffer.as_ref() else {

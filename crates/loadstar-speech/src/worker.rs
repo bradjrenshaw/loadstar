@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::time::{Duration, Instant};
 
-use crate::backend::{Backend, BackendError, Params, Pcm, RenderBackend, Slot};
+use crate::backend::{Backend, BackendError, Params, Pcm, RenderBackend, Slot, StreamSink};
 use crate::features;
 use crate::state::{UtteranceState, UtteranceTable};
 use crate::tree::Tree;
@@ -74,6 +74,8 @@ pub struct Item {
 pub enum RenderToken {
     Job(u64),
     Utterance(u64),
+    /// Pre-warm only; the result is discarded.
+    Warm,
 }
 
 pub struct RenderReq {
@@ -84,6 +86,106 @@ pub struct RenderReq {
     pub params: Params,
     pub ssml: bool,
     pub trim: bool,
+    /// Stream into this as audio is produced instead of returning a whole buffer.
+    pub stream: Option<Arc<dyn StreamSink>>,
+}
+
+/// The sink for positional speech: resamples each chunk to the mixer rate on the synthesis
+/// thread and pushes it into the audio stream's ring, blocking (sleeping) when the ring is full.
+#[cfg(feature = "audio")]
+pub struct AudioStreamSink {
+    inner: Mutex<AudioSinkInner>,
+}
+
+#[cfg(feature = "audio")]
+struct AudioSinkInner {
+    writer: loadstar_audio::stream::StreamWriter,
+    resampler: Option<loadstar_audio::dsp::resample::Streaming>,
+    format: (u32, u32),
+    scratch: Vec<f32>,
+    /// Trim on: leading silence is skipped, trailing silence held back until something loud
+    /// follows (then released) or `finish` (then dropped past a short tail).
+    trim: bool,
+    leading: bool,
+    held: Vec<f32>,
+}
+
+const TRIM_THRESHOLD: f32 = 0.002;
+const TRIM_TAIL_MS: usize = 50;
+
+#[cfg(feature = "audio")]
+impl AudioStreamSink {
+    pub fn new(writer: loadstar_audio::stream::StreamWriter, trim: bool) -> AudioStreamSink {
+        AudioStreamSink {
+            inner: Mutex::new(AudioSinkInner {
+                writer,
+                resampler: None,
+                format: (0, 0),
+                scratch: Vec::with_capacity(8192),
+                trim,
+                leading: trim,
+                held: Vec::new(),
+            }),
+        }
+    }
+}
+
+#[cfg(feature = "audio")]
+impl StreamSink for AudioStreamSink {
+    fn write(&self, samples: &[f32], channels: u32, rate: u32) -> bool {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let g = &mut *g;
+        if g.resampler.is_none() || g.format != (channels, rate) {
+            g.resampler = Some(loadstar_audio::dsp::resample::Streaming::new(
+                channels as usize,
+                rate,
+                g.writer.rate(),
+            ));
+            g.format = (channels, rate);
+        }
+        g.scratch.clear();
+        g.resampler
+            .as_mut()
+            .unwrap()
+            .process(samples, &mut g.scratch);
+        if !g.trim {
+            return g.writer.write_all(&g.scratch);
+        }
+        let mut out: &[f32] = &g.scratch;
+        if g.leading {
+            match out.iter().position(|s| s.abs() > TRIM_THRESHOLD) {
+                Some(i) => {
+                    out = &out[i..];
+                    g.leading = false;
+                }
+                None => return !g.writer.abandoned(),
+            }
+        }
+        // Everything after the last loud sample is held back; it goes out only if more sound follows.
+        match out.iter().rposition(|s| s.abs() > TRIM_THRESHOLD) {
+            Some(last) => {
+                let held = std::mem::take(&mut g.held);
+                let ok = g.writer.write_all(&held) && g.writer.write_all(&out[..=last]);
+                g.held.extend_from_slice(&out[last + 1..]);
+                ok
+            }
+            None => {
+                g.held.extend_from_slice(out);
+                !g.writer.abandoned()
+            }
+        }
+    }
+
+    fn finish(&self) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let g = &mut *g;
+        if !g.held.is_empty() {
+            let tail = (g.writer.rate() as usize * TRIM_TAIL_MS / 1000).min(g.held.len());
+            let held = std::mem::take(&mut g.held);
+            let _ = g.writer.write_all(&held[..tail]);
+        }
+        g.writer.finish();
+    }
 }
 
 pub enum Msg {
@@ -149,6 +251,20 @@ struct Active {
     next_poll: Option<Instant>,
     #[cfg(feature = "audio")]
     positional: Option<(loadstar_audio::device::DeviceIntake, u32, u64)>,
+    /// A streaming positional utterance: `(stream id, progress)`; done when drained.
+    #[cfg(feature = "audio")]
+    stream: Option<(u32, Arc<loadstar_audio::stream::StreamProgress>)>,
+}
+
+impl Active {
+    #[cfg(feature = "audio")]
+    fn stream_drained(&self) -> bool {
+        self.stream.as_ref().is_some_and(|(_, p)| p.drained())
+    }
+    #[cfg(not(feature = "audio"))]
+    fn stream_drained(&self) -> bool {
+        false
+    }
 }
 
 struct Queue {
@@ -283,8 +399,34 @@ impl Worker {
         self.install(tree);
     }
 
+    /// Ask the render thread to pay each render-capable category's first-use cost now, so the
+    /// first positional utterance of the session starts as fast as the hundredth.
+    fn warm_renderers(&self, tree: &Tree) {
+        let Some(tx) = &self.render_tx else { return };
+        for c in &tree.categories {
+            if let Some(i) = tree.category_auto_leaf(c.id) {
+                let leaf = &tree.leaves[i];
+                if leaf.features & features::RENDER != 0 {
+                    let _ = tx.send(RenderReq {
+                        token: RenderToken::Warm,
+                        backend: leaf.backend,
+                        selector: leaf.selector,
+                        text: String::new(),
+                        params: Params::default(),
+                        ssml: false,
+                        trim: false,
+                        stream: None,
+                    });
+                }
+            }
+        }
+    }
+
     fn install(&mut self, tree: Tree) {
         let changed = !self.tree().same_shape(&tree);
+        if changed {
+            self.warm_renderers(&tree);
+        }
         self.shared
             .generation
             .store(tree.generation, Ordering::Release);
@@ -441,6 +583,7 @@ impl Worker {
                             params,
                             ssml,
                             trim,
+                            stream: None,
                         });
                     }
                     _ => {
@@ -466,6 +609,7 @@ impl Worker {
                     }
                 }
                 RenderToken::Utterance(id) => self.rendered_for(id, result),
+                RenderToken::Warm => {}
             },
             Msg::Refresh => self.probe(),
             Msg::Shutdown => return false,
@@ -509,7 +653,18 @@ impl Worker {
         if let Some((intake, space, source)) = &a.positional {
             let _ = intake.stop(*space, *source);
         }
+        Self::free_stream(a);
     }
+
+    #[cfg(feature = "audio")]
+    fn free_stream(a: &Active) {
+        if let (Some((intake, _, _)), Some((stream, _))) = (&a.positional, &a.stream) {
+            let _ = intake.stream_free(*stream);
+        }
+    }
+
+    #[cfg(not(feature = "audio"))]
+    fn free_stream(_a: &Active) {}
 
     fn cut_actives(q: &mut Queue, backends: &mut [Box<dyn Backend>], table: &UtteranceTable) {
         for a in q.active.drain(..) {
@@ -548,6 +703,14 @@ impl Worker {
         while i < q.active.len() {
             let a = &mut q.active[i];
             let mut done = a.expected_end.is_some_and(|e| e <= now);
+            if !done && a.next_poll.is_some_and(|p| p <= now) && a.backend.is_none() {
+                // A streaming positional utterance: done once the producer finished and the ring drained.
+                if a.stream_drained() {
+                    done = true;
+                } else {
+                    a.next_poll = Some(now + Duration::from_millis(10));
+                }
+            }
             if !done {
                 if let (Some(b), Some(poll)) = (a.backend, a.next_poll) {
                     if poll <= now {
@@ -569,6 +732,7 @@ impl Worker {
                 if let Some(b) = a.backend {
                     self.backends[b].release(a.slot);
                 }
+                Self::free_stream(&a);
                 self.shared.table.set(a.id, UtteranceState::Done, false);
                 self.owner.remove(&a.id);
                 finished_any = true;
@@ -604,7 +768,9 @@ impl Worker {
                     #[cfg(feature = "audio")]
                     // Waiting for PCM only if a render is actually coming; otherwise start() decides
                     // (SPEAK_FLAT speaks through the reader, anything else is refused).
-                    Kind::Positional { pcm, .. } => pcm.is_some() || !self.will_render(item, tree),
+                    Kind::Positional { pcm, requested, .. } => {
+                        pcm.is_some() || !*requested || !self.will_render(item, tree)
+                    }
                     _ => true,
                 };
                 if ready && self.channel_free(q, item, tree) {
@@ -676,6 +842,8 @@ impl Worker {
                     next_poll: None,
                     #[cfg(feature = "audio")]
                     positional: None,
+                    #[cfg(feature = "audio")]
+                    stream: None,
                 });
                 true
             }
@@ -714,6 +882,8 @@ impl Worker {
                                     next_poll: Some(now + interval),
                                     #[cfg(feature = "audio")]
                                     positional: None,
+                                    #[cfg(feature = "audio")]
+                                    stream: None,
                                 });
                                 true
                             }
@@ -782,10 +952,66 @@ impl Worker {
                 let leaf = &tree.leaves[li];
                 table.set_voice(item.id, leaf.id);
                 let Some(mut pcm) = pcm else {
-                    // Not rendered yet (unlimited queue path requested it; sequential waits in start_ready).
-                    table.set(item.id, UtteranceState::Cancelled, false);
-                    self.owner.remove(&item.id);
-                    return false;
+                    // Not rendered ahead: STREAM it. Fire a stream-kind source now (silent until its
+                    // prefill is in) and have the render thread fill the ring chunk by chunk, so the
+                    // first sound follows the first synthesized chunk, not the last.
+                    let rate = target.intake.info().sample_rate as usize;
+                    let created = target.intake.stream_create(rate * 8, rate / 100).and_then(
+                        |(stream_id, writer)| {
+                            use loadstar_audio::space::{SourceKind, flags};
+                            let progress = Arc::clone(writer.progress());
+                            let mut desc = target.desc;
+                            desc.kind = SourceKind::Stream;
+                            desc.buffer = stream_id;
+                            desc.repeat_count = 1;
+                            desc.flags |= flags::PLAYING | flags::AUTO_REMOVE;
+                            match target.intake.fire(target.space, desc) {
+                                Ok(()) => Ok((stream_id, writer, progress)),
+                                Err(e) => {
+                                    let _ = target.intake.stream_free(stream_id);
+                                    Err(e)
+                                }
+                            }
+                        },
+                    );
+                    let Ok((stream_id, writer, progress)) = created else {
+                        table.set(item.id, UtteranceState::Cancelled, false);
+                        self.owner.remove(&item.id);
+                        return false;
+                    };
+                    let sink: Arc<dyn StreamSink> = Arc::new(AudioStreamSink::new(writer, trim));
+                    let sent = self.render_tx.as_ref().map(|tx| {
+                        tx.send(RenderReq {
+                            token: RenderToken::Utterance(item.id),
+                            backend: leaf.backend,
+                            selector: leaf.selector,
+                            text,
+                            params: item.params,
+                            ssml,
+                            trim,
+                            stream: Some(Arc::clone(&sink)),
+                        })
+                        .is_ok()
+                    });
+                    if sent != Some(true) {
+                        sink.finish();
+                        let _ = target.intake.stop(target.space, target.desc.id);
+                        let _ = target.intake.stream_free(stream_id);
+                        table.set(item.id, UtteranceState::Cancelled, false);
+                        self.owner.remove(&item.id);
+                        return false;
+                    }
+                    table.set(item.id, UtteranceState::Speaking, false);
+                    self.queues.get_mut(&queue).unwrap().active.push(Active {
+                        id: item.id,
+                        backend: None,
+                        slot: 0,
+                        expected_end: None,
+                        next_poll: Some(now + Duration::from_millis(10)),
+                        positional: Some((target.intake.clone(), target.space, target.desc.id)),
+                        stream: Some((stream_id, progress)),
+                    });
+                    return true;
                 };
                 if trim {
                     pcm.trim_silence(0.002);
@@ -814,6 +1040,7 @@ impl Worker {
                             expected_end: Some(now + duration),
                             next_poll: None,
                             positional: Some((target.intake.clone(), target.space, target.desc.id)),
+                            stream: None,
                         });
                         true
                     }
@@ -827,8 +1054,9 @@ impl Worker {
         }
     }
 
-    /// Request renders for pending positional items (all of them on an unlimited queue; the
-    /// next two on a sequential one) so that reaching the head costs no render wait.
+    /// Pre-render the positional items queued BEHIND the head of a sequential queue (the next two)
+    /// into buffers, so reaching the head costs no render wait at all. The head itself, and every
+    /// item on an unlimited queue, streams instead — audible after its first chunk.
     #[cfg(feature = "audio")]
     fn render_ahead(&mut self, queue: u32, tree: &Tree) {
         let Some(tx) = self.render_tx.clone() else {
@@ -837,10 +1065,13 @@ impl Worker {
         let Some(q) = self.queues.get_mut(&queue) else {
             return;
         };
-        let limit = if q.cap() == 1 { 2 } else { usize::MAX };
+        if q.cap() != 1 {
+            return;
+        }
+        let limit = 2;
         let mut requested = 0;
         let mut failed = Vec::new();
-        for item in q.pending.iter_mut() {
+        for item in q.pending.iter_mut().skip(1) {
             if requested >= limit {
                 break;
             }
@@ -886,6 +1117,7 @@ impl Worker {
                 params: item.params,
                 ssml: *ssml,
                 trim: *trim,
+                stream: None,
             });
         }
         for id in failed {
@@ -907,8 +1139,25 @@ pub fn render_loop(
     mut renderers: HashMap<usize, Box<dyn RenderBackend>>,
 ) {
     for req in rx {
-        let result = match renderers.get_mut(&req.backend) {
-            Some(r) => r
+        if matches!(req.token, RenderToken::Warm) {
+            if let Some(r) = renderers.get_mut(&req.backend) {
+                r.warm(req.selector);
+            }
+            continue;
+        }
+        let result = match (renderers.get_mut(&req.backend), &req.stream) {
+            (Some(r), Some(sink)) => {
+                let r = r.render_streaming(
+                    req.selector,
+                    &req.text,
+                    &req.params,
+                    req.ssml,
+                    Arc::clone(sink),
+                );
+                sink.finish(); // whatever happened, the voice may end
+                r.map(|_| Pcm::default())
+            }
+            (Some(r), None) => r
                 .render(req.selector, &req.text, &req.params, req.ssml)
                 .map(|mut p| {
                     if req.trim {
@@ -916,7 +1165,11 @@ pub fn render_loop(
                     }
                     p
                 }),
-            None => Err(BackendError::NotSupported),
+            (None, Some(sink)) => {
+                sink.finish();
+                Err(BackendError::NotSupported)
+            }
+            (None, None) => Err(BackendError::NotSupported),
         };
         if tx
             .send(Msg::Rendered {

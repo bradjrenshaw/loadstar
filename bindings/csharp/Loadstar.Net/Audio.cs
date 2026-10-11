@@ -9,7 +9,14 @@ namespace Loadstar.Audio;
 
 public enum SpaceMode : uint { Planar = 0, Spatial = 1 }
 
-public enum SourceKind : byte { Buffer = 0, Oscillator = 1, Noise = 2 }
+public enum SourceKind : byte
+{
+    Buffer = 0,
+    Oscillator = 1,
+    Noise = 2,
+    /// <summary>Plays from a stream fed while it plays (Buffer = the stream id from CreateStream).</summary>
+    Stream = 3,
+}
 
 public enum Waveform : byte { Sine = 0, Triangle = 1, Square = 2, Saw = 3 }
 
@@ -220,6 +227,12 @@ internal static class NativeAudio
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status la_buffer_tone(AudioDeviceHandle device, float hz, float ms, float attackMs, float releaseMs, out uint buffer);
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status la_buffer_free(AudioDeviceHandle device, uint buffer);
 
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status la_stream_create(AudioDeviceHandle device, UIntPtr capacity, UIntPtr prefill, out uint stream);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status la_stream_write(AudioDeviceHandle device, uint stream, float[] samples, UIntPtr samplesLen, out UIntPtr written);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status la_stream_progress(AudioDeviceHandle device, uint stream, out ulong written, out ulong played, [MarshalAs(UnmanagedType.U1)] out bool finished);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status la_stream_finish(AudioDeviceHandle device, uint stream);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status la_stream_free(AudioDeviceHandle device, uint stream);
+
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status la_space_sync(AudioDeviceHandle device, uint space, SourceDesc[]? descs, UIntPtr descsLen);
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status la_source_upsert(AudioDeviceHandle device, uint space, in SourceDesc desc);
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status la_source_remove(AudioDeviceHandle device, uint space, ulong id);
@@ -349,6 +362,31 @@ public sealed class AudioDevice : IDisposable
     }
 
     public void FreeBuffer(uint buffer) => NativeAudio.la_buffer_free(_h, buffer).ThrowIfError(nameof(NativeAudio.la_buffer_free));
+
+    // --- Streams ---
+
+    /// <summary>A source fed while it plays: <paramref name="capacity"/> mono frames of ring at the mixer
+    /// rate, audible once <paramref name="prefill"/> frames are in. Reference it from a
+    /// <see cref="SourceKind.Stream"/> record whose Buffer is the returned id.</summary>
+    public uint CreateStream(uint capacity, uint prefill)
+    {
+        NativeAudio.la_stream_create(_h, (UIntPtr)capacity, (UIntPtr)prefill, out var id).ThrowIfError(nameof(NativeAudio.la_stream_create));
+        return id;
+    }
+
+    /// <summary>Write mono samples at the mixer rate; returns how many were taken (the rest did not fit yet).</summary>
+    public int StreamWrite(uint stream, float[] samples, int count)
+    {
+        NativeAudio.la_stream_write(_h, stream, samples, (UIntPtr)count, out var written).ThrowIfError(nameof(NativeAudio.la_stream_write));
+        return (int)(ulong)written;
+    }
+
+    public void StreamProgress(uint stream, out ulong written, out ulong played, out bool finished)
+        => NativeAudio.la_stream_progress(_h, stream, out written, out played, out finished).ThrowIfError(nameof(NativeAudio.la_stream_progress));
+
+    /// <summary>No more samples: the voice ends once the ring drains.</summary>
+    public void StreamFinish(uint stream) => NativeAudio.la_stream_finish(_h, stream).ThrowIfError(nameof(NativeAudio.la_stream_finish));
+    public void FreeStream(uint stream) => NativeAudio.la_stream_free(_h, stream).ThrowIfError(nameof(NativeAudio.la_stream_free));
 
     // --- Sources ---
 

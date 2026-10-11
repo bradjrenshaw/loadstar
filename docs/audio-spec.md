@@ -41,6 +41,8 @@ It follows the same rules as the navigation core: tools not a framework, data in
 
 Effective cue latency is *game frame time + audio period + engine overhead*; a mod issues commands once per frame, so ~3 ms periods put the audio path well under the frame. **The design goal is zero glitches at the smallest period the driver offers**, not the headline number: the crackling under NAudio comes from mixing on a managed thread (GC pauses, scheduler preemption), which a native MMCSS thread removes.
 
+**Streaming sources** (added 2026-10 for speech): a source of `kind = Stream` plays from a ring the producer fills while it plays — `la_stream_create(capacity, prefill)` makes the ring (mono at the mixer rate) and returns an id a `SourceDesc` references through `buffer`; `la_stream_write` pushes what fits; `la_stream_progress` reports frames written and played; `la_stream_finish` ends the sequence once the ring drains; `la_stream_free` releases the id. The voice is silent until `prefill` frames are in, holds silence (not an end) when the producer falls behind, and ends only after `finish`. The consumer end moves into the voice on the audio thread and comes back through the garbage ring; the producer end is `Send` and lives wherever the audio is made (the speech render thread writes into it from SAPI's own callback). Streams play once.
+
 Rules the mixer thread lives by:
 
 - Pinned to MMCSS task `"Pro Audio"` (`AvSetMmThreadCharacteristicsW`).

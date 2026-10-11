@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::chain::{Chain, ChainNodes};
 use crate::space::{Buffer, Bus, Listener, SourceDesc, Space, Stage};
+use crate::stream::StreamSource;
 
 /// Which chain an effect operation addresses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +82,13 @@ pub enum Command {
         buffer: Arc<Buffer>,
     },
     BufferFree(u32),
+    /// Register a streaming source under a stream id; the first voice that references it takes it.
+    StreamAdd {
+        id: u32,
+        source: StreamSource,
+    },
+    /// Drop a stream nobody took.
+    StreamFree(u32),
     MasterGain(f32),
 }
 
@@ -96,6 +104,8 @@ pub enum Garbage {
     Nodes(ChainNodes),
     /// A consumed snapshot.
     Descs(Vec<SourceDesc>),
+    /// A streaming consumer end, released by a retiring voice or an unused registry slot.
+    Stream(StreamSource),
 }
 
 impl Garbage {

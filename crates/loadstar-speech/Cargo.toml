@@ -23,6 +23,8 @@ loadstar-audio = { workspace = true, optional = true }
 libloading = { version = "0.9", optional = true }
 
 [target.'cfg(windows)'.dependencies]
+# The implement macro expands to paths through windows_core.
+windows-core = "0.61"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Com",

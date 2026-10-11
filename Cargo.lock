@@ -65,6 +65,7 @@ dependencies = [
  "loadstar-audio",
  "loadstar-core",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

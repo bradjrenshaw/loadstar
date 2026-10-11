@@ -13,6 +13,7 @@ use crate::dsp::{click, resample::to_mono_at_rate, tone};
 use crate::engine::{Engine, EngineConfig};
 use crate::render::{HeadModel, Renderer};
 use crate::space::{Buffer, Bus, Listener, SourceDesc, Space, SpaceConfig, SpaceMode, Stage};
+use crate::stream::{StreamWriter, stream_pair};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DeviceConfig {
@@ -78,10 +79,35 @@ pub struct Device {
     spaces: Vec<Option<u32>>, // bus count per space id
     /// Buffer id allocation, shared with intakes.
     buffers: Arc<Mutex<Vec<bool>>>,
+    /// Stream id allocation, shared with intakes.
+    streams: Arc<Mutex<Vec<bool>>>,
+    /// Writers for streams created through this handle (the FFI path keeps them here).
+    writers: std::collections::HashMap<u32, StreamWriter>,
     /// Voices pre-built per space on this thread (the voice cap), so the audio thread never
     /// allocates until more sources than that are alive at once.
     pool: usize,
     backend: Backend,
+}
+
+fn alloc_id(ids: &Arc<Mutex<Vec<bool>>>) -> u32 {
+    let mut used = ids.lock().unwrap_or_else(|e| e.into_inner());
+    let id = used.iter().position(|u| !u).unwrap_or(used.len());
+    if used.len() <= id {
+        used.resize(id + 1, false);
+    }
+    used[id] = true;
+    id as u32
+}
+
+fn release_id(ids: &Arc<Mutex<Vec<bool>>>, id: u32) -> bool {
+    let mut used = ids.lock().unwrap_or_else(|e| e.into_inner());
+    match used.get_mut(id as usize) {
+        Some(u) if *u => {
+            *u = false;
+            true
+        }
+        _ => false,
+    }
 }
 
 fn pool_size(cfg: &DeviceConfig) -> usize {
@@ -101,6 +127,7 @@ pub struct DeviceIntake {
     info: StreamInfo,
     commands: Arc<Mutex<rtrb::Producer<Command>>>,
     buffers: Arc<Mutex<Vec<bool>>>,
+    streams: Arc<Mutex<Vec<bool>>>,
 }
 
 impl DeviceIntake {
@@ -180,6 +207,33 @@ impl DeviceIntake {
         self.send(Command::Upsert { space, desc })
     }
 
+    /// Create a streaming source: a ring of `capacity` frames that plays once `prefill` frames
+    /// are in (both at the mixer rate). Reference it from a `Stream`-kind source record via its
+    /// id; write mono samples at the mixer rate through the returned writer from any thread.
+    pub fn stream_create(
+        &self,
+        capacity: usize,
+        prefill: usize,
+    ) -> Result<(u32, StreamWriter), DeviceError> {
+        let id = alloc_id(&self.streams);
+        let (source, writer) = stream_pair(capacity, prefill, self.info.sample_rate);
+        match self.send(Command::StreamAdd { id, source }) {
+            Ok(()) => Ok((id, writer)),
+            Err(e) => {
+                release_id(&self.streams, id);
+                Err(e)
+            }
+        }
+    }
+
+    /// Release a stream id (after its voice finished, or if nothing ever took it).
+    pub fn stream_free(&self, stream: u32) -> Result<(), DeviceError> {
+        if !release_id(&self.streams, stream) {
+            return Err(DeviceError::InvalidArgument);
+        }
+        self.send(Command::StreamFree(stream))
+    }
+
     pub fn stop(&self, space: u32, id: u64) -> Result<(), DeviceError> {
         self.send(Command::Stop { space, id })
     }
@@ -206,6 +260,8 @@ impl Device {
             finished: Vec::new(),
             spaces: Vec::new(),
             buffers: Arc::default(),
+            streams: Arc::default(),
+            writers: std::collections::HashMap::new(),
             pool: pool_size(&cfg),
             backend: Backend::Null { engine, inbox },
         }
@@ -236,6 +292,8 @@ impl Device {
             finished: Vec::new(),
             spaces: Vec::new(),
             buffers: Arc::default(),
+            streams: Arc::default(),
+            writers: std::collections::HashMap::new(),
             pool: pool_size(&cfg),
             backend: Backend::Wasapi {
                 stream,
@@ -272,6 +330,8 @@ impl Device {
             finished: Vec::new(),
             spaces: Vec::new(),
             buffers: Arc::default(),
+            streams: Arc::default(),
+            writers: std::collections::HashMap::new(),
             pool: pool_size(&cfg),
             backend: Backend::Miniaudio {
                 stream,
@@ -356,7 +416,54 @@ impl Device {
             info: self.info,
             commands: Arc::clone(&self.commands),
             buffers: Arc::clone(&self.buffers),
+            streams: Arc::clone(&self.streams),
         }
+    }
+
+    // --- Streams (the game-thread path; in-process crates use the intake directly) ---
+
+    /// Create a streaming source and keep its writer here; feed it with [`Device::stream_write`].
+    pub fn stream_create(&mut self, capacity: usize, prefill: usize) -> Result<u32, DeviceError> {
+        self.collect_garbage();
+        let (id, writer) = self.intake().stream_create(capacity, prefill)?;
+        self.writers.insert(id, writer);
+        Ok(id)
+    }
+
+    /// Write what fits now (mono, mixer rate); returns how many samples were taken.
+    pub fn stream_write(&mut self, stream: u32, samples: &[f32]) -> Result<usize, DeviceError> {
+        match self.writers.get_mut(&stream) {
+            Some(w) => Ok(w.write(samples)),
+            None => Err(DeviceError::InvalidArgument),
+        }
+    }
+
+    /// Frames played so far and whether the producer has finished.
+    pub fn stream_progress(&self, stream: u32) -> Result<(u64, u64, bool), DeviceError> {
+        match self.writers.get(&stream) {
+            Some(w) => {
+                let p = w.progress();
+                Ok((p.written(), p.played(), p.is_done()))
+            }
+            None => Err(DeviceError::InvalidArgument),
+        }
+    }
+
+    /// No more samples: the voice ends once the ring drains. The id stays valid until `stream_free`.
+    pub fn stream_finish(&mut self, stream: u32) -> Result<(), DeviceError> {
+        match self.writers.get(&stream) {
+            Some(w) => {
+                w.finish();
+                Ok(())
+            }
+            None => Err(DeviceError::InvalidArgument),
+        }
+    }
+
+    pub fn stream_free(&mut self, stream: u32) -> Result<(), DeviceError> {
+        self.collect_garbage();
+        self.writers.remove(&stream);
+        self.intake().stream_free(stream)
     }
 
     /// Drop whatever the audio thread handed back. Called on every API call; harmless to call more.
@@ -773,6 +880,41 @@ mod tests {
         );
         let _ = render(&mut d, 40);
         assert!(d.take_finished().contains(&(space, 42)));
+    }
+
+    #[test]
+    fn a_stream_plays_as_it_is_written_and_finishes_when_told() {
+        let mut d = device();
+        let space = d.space_create(SpaceMode::Planar, 1.0, 1.0).unwrap();
+        let stream = d.stream_create(48000, 256).unwrap();
+        let mut desc = SourceDesc::buffer(5, stream, Bounds::Point(Vec3::new(0.0, 0.0, -1.0)));
+        desc.kind = crate::space::SourceKind::Stream;
+        d.fire(space, desc).unwrap();
+        // Nothing written yet: the voice exists, prefilling, silent.
+        let before = energy(&render(&mut d, 2), 0);
+        assert_eq!(before, 0.0);
+        let tone: Vec<f32> = (0..2400).map(|i| ((i as f32) * 0.1).sin() * 0.5).collect();
+        assert_eq!(d.stream_write(stream, &tone).unwrap(), 2400);
+        let playing = energy(&render(&mut d, 4), 0);
+        assert!(playing > 0.0, "audible as soon as the prefill is in");
+        let (written, played, done) = d.stream_progress(stream).unwrap();
+        assert!(written == 2400 && played > 0 && !done);
+        // Starve it: silence, but not finished.
+        let _ = render(&mut d, 20);
+        assert!(
+            d.take_finished().is_empty(),
+            "a starving stream is not a finished one"
+        );
+        d.stream_write(stream, &tone).unwrap();
+        d.stream_finish(stream).unwrap();
+        let _ = render(&mut d, 40);
+        assert!(
+            d.take_finished().contains(&(space, 5)),
+            "finished once the ring drained"
+        );
+        assert!(d.stream_progress(stream).unwrap().2);
+        d.stream_free(stream).unwrap();
+        assert_eq!(d.stream_free(stream), Err(DeviceError::InvalidArgument));
     }
 
     #[test]

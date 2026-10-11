@@ -951,6 +951,55 @@ enum LsStatus la_buffer_free(struct LsAudioDevice *dev, uint32_t buffer);
 
 #if defined(LOADSTAR_AUDIO)
 /**
+ * Create a streaming source (audio spec §3): a ring of `capacity` mono frames at the mixer rate
+ * that starts playing once `prefill` frames are in. Reference it from a source record with
+ * `kind = Stream` and `buffer = id`; feed it with `la_stream_write`.
+ */
+enum LsStatus la_stream_create(struct LsAudioDevice *dev,
+                               uintptr_t capacity,
+                               uintptr_t prefill,
+                               uint32_t *out);
+#endif
+
+#if defined(LOADSTAR_AUDIO)
+/**
+ * Write mono samples at the mixer rate; `written` receives how many were taken (the rest did not
+ * fit — come back next frame).
+ */
+enum LsStatus la_stream_write(struct LsAudioDevice *dev,
+                              uint32_t stream,
+                              const float *samples,
+                              uintptr_t samples_len,
+                              uintptr_t *written);
+#endif
+
+#if defined(LOADSTAR_AUDIO)
+/**
+ * Frames written and played so far, and whether the producer has finished.
+ */
+enum LsStatus la_stream_progress(struct LsAudioDevice *dev,
+                                 uint32_t stream,
+                                 uint64_t *written,
+                                 uint64_t *played,
+                                 bool *finished);
+#endif
+
+#if defined(LOADSTAR_AUDIO)
+/**
+ * No more samples will come: the voice ends once the ring drains.
+ */
+enum LsStatus la_stream_finish(struct LsAudioDevice *dev, uint32_t stream);
+#endif
+
+#if defined(LOADSTAR_AUDIO)
+/**
+ * Release the stream id (after its voice finished).
+ */
+enum LsStatus la_stream_free(struct LsAudioDevice *dev, uint32_t stream);
+#endif
+
+#if defined(LOADSTAR_AUDIO)
+/**
  * Declarative snapshot of a space's declared sources (audio spec §3). `InvalidArgument`
  * rejects the whole snapshot on any bad bounds kind.
  */

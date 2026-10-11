@@ -908,7 +908,7 @@ mod tests {
         assert!(src & (1 << 62) != 0);
         wait_until(
             || s.utterance(a).0 == UtteranceState::Speaking,
-            "rendered and fired",
+            "fired (streaming)",
         );
         assert!(
             ss.lock()
@@ -917,17 +917,20 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, Call::Render { .. }))
         );
+        // Pump the null device at the mixer's pace: the render thread fills the stream while we play.
         let mut out = vec![0.0f32; 512];
         let mut energy = 0.0;
-        for _ in 0..8 {
+        let t = Instant::now();
+        while s.utterance(a).0 != UtteranceState::Done {
+            assert!(
+                t.elapsed() < Duration::from_secs(5),
+                "streamed utterance never drained"
+            );
             dev.render(&mut out);
             energy += out.iter().map(|x| x * x).sum::<f32>();
+            std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(energy > 0.0, "the utterance plays on the device");
-        wait_until(
-            || s.utterance(a).0 == UtteranceState::Done,
-            "done after its duration",
-        );
+        assert!(energy > 0.0, "the utterance played on the device");
         // A reader voice cannot be positioned: refused unless told what to do instead.
         let (s2, _, _) = open(true);
         assert_eq!(

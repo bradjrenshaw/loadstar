@@ -27,6 +27,8 @@ pub enum AudioSourceKind {
     Buffer = 0,
     Oscillator = 1,
     Noise = 2,
+    /// Plays from a stream (`buffer` = the stream id from `la_stream_create`).
+    Stream = 3,
 }
 
 /// `LaSourceDesc.flags` bits.
@@ -509,6 +511,93 @@ pub extern "C" fn la_buffer_tone(
 #[unsafe(no_mangle)]
 pub extern "C" fn la_buffer_free(dev: *mut AudioDevice, buffer: u32) -> Status {
     with_device(dev, |d| status(d.buffer_free(buffer)))
+}
+
+// ---------------------------------------------------------------------------
+// Streams
+// ---------------------------------------------------------------------------
+
+/// Create a streaming source (audio spec §3): a ring of `capacity` mono frames at the mixer rate
+/// that starts playing once `prefill` frames are in. Reference it from a source record with
+/// `kind = Stream` and `buffer = id`; feed it with `la_stream_write`.
+#[unsafe(no_mangle)]
+pub extern "C" fn la_stream_create(
+    dev: *mut AudioDevice,
+    capacity: usize,
+    prefill: usize,
+    out: *mut u32,
+) -> Status {
+    with_device(dev, |d| {
+        if out.is_null() {
+            return Status::NullPointer;
+        }
+        out_u32(out, d.stream_create(capacity, prefill))
+    })
+}
+
+/// Write mono samples at the mixer rate; `written` receives how many were taken (the rest did not
+/// fit — come back next frame).
+#[unsafe(no_mangle)]
+pub extern "C" fn la_stream_write(
+    dev: *mut AudioDevice,
+    stream: u32,
+    samples: *const f32,
+    samples_len: usize,
+    written: *mut usize,
+) -> Status {
+    with_device(dev, |d| {
+        if samples.is_null() || written.is_null() {
+            return Status::NullPointer;
+        }
+        // SAFETY: non-null checked; caller guarantees `samples` is readable for `samples_len` floats.
+        let pcm = unsafe { std::slice::from_raw_parts(samples, samples_len) };
+        match d.stream_write(stream, pcm) {
+            Ok(n) => {
+                // SAFETY: non-null checked.
+                unsafe { *written = n };
+                Status::Ok
+            }
+            Err(e) => status(Err(e)),
+        }
+    })
+}
+
+/// Frames written and played so far, and whether the producer has finished.
+#[unsafe(no_mangle)]
+pub extern "C" fn la_stream_progress(
+    dev: *mut AudioDevice,
+    stream: u32,
+    written: *mut u64,
+    played: *mut u64,
+    finished: *mut bool,
+) -> Status {
+    with_device(dev, |d| match d.stream_progress(stream) {
+        Ok((w, p, done)) => {
+            if written.is_null() || played.is_null() || finished.is_null() {
+                return Status::NullPointer;
+            }
+            // SAFETY: all three out-pointers checked.
+            unsafe {
+                *written = w;
+                *played = p;
+                *finished = done;
+            }
+            Status::Ok
+        }
+        Err(e) => status(Err(e)),
+    })
+}
+
+/// No more samples will come: the voice ends once the ring drains.
+#[unsafe(no_mangle)]
+pub extern "C" fn la_stream_finish(dev: *mut AudioDevice, stream: u32) -> Status {
+    with_device(dev, |d| status(d.stream_finish(stream)))
+}
+
+/// Release the stream id (after its voice finished).
+#[unsafe(no_mangle)]
+pub extern "C" fn la_stream_free(dev: *mut AudioDevice, stream: u32) -> Status {
+    with_device(dev, |d| status(d.stream_free(stream)))
 }
 
 // ---------------------------------------------------------------------------

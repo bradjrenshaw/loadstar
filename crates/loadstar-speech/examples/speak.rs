@@ -105,6 +105,31 @@ fn main() {
         }
     }
 
+    // Render latency anatomy: cold (instance creation + synthesis) vs warm (synthesis only), short phrase.
+    if let Some(v) = synth {
+        let p = Profile {
+            voice: v,
+            ..Profile::default()
+        };
+        for label in ["cold", "warm", "warm"] {
+            let t = Instant::now();
+            if let Ok(job) = s.render(&p, "Left side.", false) {
+                while s.render_poll(job) == RenderState::Pending
+                    && t.elapsed() < Duration::from_secs(5)
+                {
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+                let took = t.elapsed();
+                if let Some(pcm) = s.render_take_owned(job) {
+                    println!(
+                        "render \"Left side.\" {label}: {took:?} for {:?} of audio",
+                        pcm.duration()
+                    );
+                }
+            }
+        }
+    }
+
     // Game-thread cost of the calls that run every frame.
     let n = 10_000;
     let t = Instant::now();

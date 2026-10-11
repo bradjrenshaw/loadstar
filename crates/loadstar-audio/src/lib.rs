@@ -22,5 +22,6 @@ pub mod dsp;
 pub mod engine;
 pub mod render;
 pub mod space;
+pub mod stream;
 
 pub use loadstar_core::geometry::{Bounds, Vec3};

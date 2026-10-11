@@ -10,6 +10,7 @@ use crate::chain::Chain;
 use crate::commands::{ChainTarget, Command, Garbage};
 use crate::dsp::Ramp;
 use crate::space::{Buffer, Space};
+use crate::stream::StreamSource;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EngineConfig {
@@ -34,6 +35,8 @@ pub struct Engine {
     cfg: EngineConfig,
     spaces: Vec<Option<Box<Space>>>,
     buffers: Vec<Option<Arc<Buffer>>>,
+    /// Streaming sources waiting for the voice that will take them.
+    streams: Vec<Option<StreamSource>>,
     master_gain: Ramp,
     master: Chain,
     /// Garbage the ring refused last time, retried next period rather than dropped here.
@@ -56,6 +59,7 @@ impl Engine {
             cfg,
             spaces: Vec::with_capacity(8),
             buffers: Vec::with_capacity(64),
+            streams: Vec::with_capacity(16),
             master_gain: Ramp::new(cfg.master_gain),
             master: Chain::empty(cfg.sample_rate as f32, 2, cfg.block_frames),
             garbage: Vec::with_capacity(64),
@@ -136,18 +140,22 @@ impl Engine {
             }
             Command::Sync { space, descs } => {
                 let buffers = std::mem::take(&mut self.buffers);
+                let mut streams = std::mem::take(&mut self.streams);
                 if let Some(s) = self.space_mut(space) {
-                    s.sync(&descs, &buffers);
+                    s.sync_with(&descs, &buffers, &mut streams);
                 }
                 self.buffers = buffers;
+                self.streams = streams;
                 Some(Garbage::Descs(descs))
             }
             Command::Upsert { space, desc } => {
                 let buffers = std::mem::take(&mut self.buffers);
+                let mut streams = std::mem::take(&mut self.streams);
                 if let Some(s) = self.space_mut(space) {
-                    s.upsert(desc, &buffers);
+                    s.upsert_with(desc, &buffers, &mut streams);
                 }
                 self.buffers = buffers;
+                self.streams = streams;
                 None
             }
             Command::Remove { space, id } => {
@@ -158,10 +166,12 @@ impl Engine {
             }
             Command::Fire { space, desc } => {
                 let buffers = std::mem::take(&mut self.buffers);
+                let mut streams = std::mem::take(&mut self.streams);
                 if let Some(s) = self.space_mut(space) {
-                    s.fire(desc, &buffers);
+                    s.fire_with(desc, &buffers, &mut streams);
                 }
                 self.buffers = buffers;
+                self.streams = streams;
                 None
             }
             Command::Stop { space, id } => {
@@ -210,6 +220,18 @@ impl Engine {
                 .get_mut(id as usize)
                 .and_then(Option::take)
                 .map(Garbage::Buffer),
+            Command::StreamAdd { id, source } => {
+                let idx = id as usize;
+                if self.streams.len() <= idx {
+                    self.streams.resize_with(idx + 1, || None);
+                }
+                self.streams[idx].replace(source).map(Garbage::Stream)
+            }
+            Command::StreamFree(id) => self
+                .streams
+                .get_mut(id as usize)
+                .and_then(Option::take)
+                .map(Garbage::Stream),
             Command::MasterGain(g) => {
                 self.master_gain.set_target(g);
                 None
