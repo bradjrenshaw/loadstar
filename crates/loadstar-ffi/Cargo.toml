@@ -11,9 +11,13 @@ name = "loadstar"
 crate-type = ["cdylib"]
 
 [features]
-default = ["audio"]
+default = ["audio", "speech", "speech-prism"]
 audio = ["dep:loadstar-audio"]
+# The speech surface (lv_*); positional speech needs both `speech` and `audio`.
+speech = ["dep:loadstar-speech"]
+speech-prism = ["speech", "loadstar-speech/prism"]
 
 [dependencies]
 loadstar-core.workspace = true
 loadstar-audio = { workspace = true, optional = true }
+loadstar-speech = { workspace = true, optional = true, default-features = false, features = ["sapi", "clipboard", "audio"] }

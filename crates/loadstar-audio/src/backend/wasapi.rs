@@ -15,11 +15,18 @@ use std::time::Duration;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
     AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
-    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, IAudioClient, IAudioClient3,
-    IAudioRenderClient, IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eConsole, eRender,
+    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, IAudioClient,
+    IAudioClient3, IAudioRenderClient, IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX,
+    WAVEFORMATEXTENSIBLE, eConsole, eRender,
 };
-use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize};
-use windows::Win32::System::Threading::{AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW, WaitForSingleObject};
+use windows::Win32::System::Com::{
+    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+    CoUninitialize,
+};
+use windows::Win32::System::Threading::{
+    AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW,
+    WaitForSingleObject,
+};
 use windows::core::{GUID, Interface, w};
 
 use super::{StreamInfo, StreamStatus};
@@ -28,7 +35,8 @@ use crate::engine::{Engine, EngineConfig};
 
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
-const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: GUID = GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
+const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: GUID =
+    GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WasapiConfig {
@@ -99,7 +107,12 @@ pub fn spawn(
             .map_err(|e| WasapiError(format!("could not start the audio thread: {e}")))?
     };
     match report_rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(Ok(info)) => Ok(WasapiStream { info, stop, status, thread: Some(thread) }),
+        Ok(Ok(info)) => Ok(WasapiStream {
+            info,
+            stop,
+            status,
+            thread: Some(thread),
+        }),
         Ok(Err(e)) => {
             let _ = thread.join();
             Err(e)
@@ -140,7 +153,9 @@ fn float_stereo(rate: u32) -> WAVEFORMATEXTENSIBLE {
             wBitsPerSample: 32,
             cbSize: 22,
         },
-        Samples: windows::Win32::Media::Audio::WAVEFORMATEXTENSIBLE_0 { wValidBitsPerSample: 32 },
+        Samples: windows::Win32::Media::Audio::WAVEFORMATEXTENSIBLE_0 {
+            wValidBitsPerSample: 32,
+        },
         dwChannelMask: 0x3,
         SubFormat: KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
     }
@@ -157,7 +172,11 @@ unsafe fn is_float_stereo(fmt: *const WAVEFORMATEX) -> bool {
     }
     if f.wFormatTag == WAVE_FORMAT_EXTENSIBLE && f.cbSize >= 22 {
         // Copy the packed field out before comparing (no reference into a packed struct).
-        let sub: GUID = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!((*(fmt as *const WAVEFORMATEXTENSIBLE)).SubFormat)) };
+        let sub: GUID = unsafe {
+            std::ptr::read_unaligned(std::ptr::addr_of!(
+                (*(fmt as *const WAVEFORMATEXTENSIBLE)).SubFormat
+            ))
+        };
         return sub == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
     }
     false
@@ -166,14 +185,17 @@ unsafe fn is_float_stereo(fmt: *const WAVEFORMATEX) -> bool {
 /// Open the stream. `engine_rate` pins the format to an existing engine's rate on reopen.
 unsafe fn open_stream(cfg: &WasapiConfig, engine_rate: Option<u32>) -> Result<Stream, WasapiError> {
     unsafe {
-        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
         let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
         let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
 
         let mix = client.GetMixFormat()?;
         let mix_rate = std::ptr::read_unaligned(mix).nSamplesPerSec;
         let mix_is_ours = is_float_stereo(mix);
-        let flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+        let flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+            | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+            | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
 
         let mut low_latency = false;
         let mut rate = engine_rate.unwrap_or(mix_rate);
@@ -183,7 +205,16 @@ unsafe fn open_stream(cfg: &WasapiConfig, engine_rate: Option<u32>) -> Result<St
         if mix_is_ours && engine_rate.is_none_or(|r| r == mix_rate) {
             if let Ok(client3) = client.cast::<IAudioClient3>() {
                 let (mut default, mut fundamental, mut min, mut max) = (0u32, 0u32, 0u32, 0u32);
-                if client3.GetSharedModeEnginePeriod(mix, &mut default, &mut fundamental, &mut min, &mut max).is_ok() {
+                if client3
+                    .GetSharedModeEnginePeriod(
+                        mix,
+                        &mut default,
+                        &mut fundamental,
+                        &mut min,
+                        &mut max,
+                    )
+                    .is_ok()
+                {
                     let fundamental = fundamental.max(1);
                     let want = if cfg.period_frames == 0 {
                         min
@@ -191,7 +222,15 @@ unsafe fn open_stream(cfg: &WasapiConfig, engine_rate: Option<u32>) -> Result<St
                         let p = (cfg.period_frames as u32).clamp(min, max);
                         (p / fundamental * fundamental).max(min)
                     };
-                    if client3.InitializeSharedAudioStream(AUDCLNT_STREAMFLAGS_EVENTCALLBACK, want, mix, None).is_ok() {
+                    if client3
+                        .InitializeSharedAudioStream(
+                            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                            want,
+                            mix,
+                            None,
+                        )
+                        .is_ok()
+                    {
                         low_latency = true;
                         rate = mix_rate;
                         period_frames = want;
@@ -207,7 +246,9 @@ unsafe fn open_stream(cfg: &WasapiConfig, engine_rate: Option<u32>) -> Result<St
             client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, &format.Format, None)?;
             let mut default_period = 0i64;
             client.GetDevicePeriod(Some(&mut default_period), None)?;
-            period_frames = ((default_period as f64) * 1e-7 * rate as f64).round().max(1.0) as u32;
+            period_frames = ((default_period as f64) * 1e-7 * rate as f64)
+                .round()
+                .max(1.0) as u32;
         }
 
         let buffer_frames = client.GetBufferSize()?;
@@ -221,7 +262,11 @@ unsafe fn open_stream(cfg: &WasapiConfig, engine_rate: Option<u32>) -> Result<St
             render,
             event,
             buffer_frames,
-            info: StreamInfo { sample_rate: rate, period_frames: period_frames as usize, channels: 2 },
+            info: StreamInfo {
+                sample_rate: rate,
+                period_frames: period_frames as usize,
+                channels: 2,
+            },
             low_latency,
         })
     }
@@ -233,7 +278,15 @@ enum Exit {
 }
 
 /// Render periods until told to stop or the device goes away.
-unsafe fn run(stream: &Stream, engine: &mut Engine, inbox: &mut rtrb::Consumer<Command>, garbage: &mut rtrb::Producer<Garbage>, finished: &mut rtrb::Producer<(u32, u64)>, stop: &AtomicBool, status: &StreamStatus) -> Exit {
+unsafe fn run(
+    stream: &Stream,
+    engine: &mut Engine,
+    inbox: &mut rtrb::Consumer<Command>,
+    garbage: &mut rtrb::Producer<Garbage>,
+    finished: &mut rtrb::Producer<(u32, u64)>,
+    stop: &AtomicBool,
+    status: &StreamStatus,
+) -> Exit {
     let block = engine.config().block_frames as u32;
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -254,7 +307,11 @@ unsafe fn run(stream: &Stream, engine: &mut Engine, inbox: &mut rtrb::Consumer<C
             Ok(p) => p,
             Err(e) => {
                 status.last_hresult.store(e.code().0, Ordering::Relaxed);
-                return if e.code() == AUDCLNT_E_DEVICE_INVALIDATED { Exit::DeviceLost } else { Exit::DeviceLost };
+                return if e.code() == AUDCLNT_E_DEVICE_INVALIDATED {
+                    Exit::DeviceLost
+                } else {
+                    Exit::DeviceLost
+                };
             }
         };
         let mut available = stream.buffer_frames.saturating_sub(padding);
@@ -267,7 +324,8 @@ unsafe fn run(stream: &Stream, engine: &mut Engine, inbox: &mut rtrb::Consumer<C
                 }
             };
             // SAFETY: WASAPI hands us `block` frames of our 32-bit float stereo format.
-            let out = unsafe { std::slice::from_raw_parts_mut(ptr as *mut f32, block as usize * 2) };
+            let out =
+                unsafe { std::slice::from_raw_parts_mut(ptr as *mut f32, block as usize * 2) };
             engine.process(out);
             if unsafe { stream.render.ReleaseBuffer(block, 0) }.is_err() {
                 return Exit::DeviceLost;
@@ -305,7 +363,9 @@ fn audio_thread(
         let engine_rate = engine.as_ref().map(|e| e.config().sample_rate);
         match unsafe { open_stream(&cfg, engine_rate) } {
             Ok(stream) => {
-                status.low_latency.store(stream.low_latency, Ordering::Relaxed);
+                status
+                    .low_latency
+                    .store(stream.low_latency, Ordering::Relaxed);
                 let engine = engine.get_or_insert_with(|| {
                     Engine::new(EngineConfig {
                         sample_rate: stream.info.sample_rate,
@@ -320,7 +380,17 @@ fn audio_thread(
                     status.reopen_count.fetch_add(1, Ordering::Relaxed);
                 }
                 status.running.store(true, Ordering::Relaxed);
-                let exit = unsafe { run(&stream, engine, &mut inbox, &mut garbage, &mut finished, &stop, &status) };
+                let exit = unsafe {
+                    run(
+                        &stream,
+                        engine,
+                        &mut inbox,
+                        &mut garbage,
+                        &mut finished,
+                        &stop,
+                        &status,
+                    )
+                };
                 status.running.store(false, Ordering::Relaxed);
                 drop(stream);
                 if matches!(exit, Exit::Stopped) {

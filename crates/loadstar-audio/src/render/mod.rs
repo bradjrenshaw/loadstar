@@ -2,7 +2,7 @@
 //! per voice; the voice receives a [`Placement`] every period and renders a mono block into an
 //! interleaved stereo block. [`HeadModel`] is the built-in implementation.
 
-use crate::chain::{EffectDesc, EffectKind, ENABLED};
+use crate::chain::{ENABLED, EffectDesc, EffectKind};
 
 pub mod head_model;
 pub use head_model::HeadModel;
@@ -25,7 +25,16 @@ pub struct Placement {
 
 impl Placement {
     pub fn relative(pan: f32) -> Placement {
-        Placement { right: 0.0, up: 0.0, forward: 0.0, distance: 0.0, inside: false, pan_width: 1.0, relative: true, pan }
+        Placement {
+            right: 0.0,
+            up: 0.0,
+            forward: 0.0,
+            distance: 0.0,
+            inside: false,
+            pan_width: 1.0,
+            relative: true,
+            pan,
+        }
     }
 }
 
@@ -116,6 +125,12 @@ pub trait Renderer: Send {
 pub trait VoiceRenderer: Send {
     /// Render `mono` into interleaved stereo `out` (`out.len() == 2 * mono.len()`), overwriting.
     /// Must not allocate; all parameter motion is smoothed internally.
-    fn process(&mut self, mono: &[f32], placement: &Placement, params: &SpatializerParams, out: &mut [f32]);
+    fn process(
+        &mut self,
+        mono: &[f32],
+        placement: &Placement,
+        params: &SpatializerParams,
+        out: &mut [f32],
+    );
     fn reset(&mut self);
 }

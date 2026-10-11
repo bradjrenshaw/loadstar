@@ -18,7 +18,10 @@ impl FracDelay {
     pub const MAX_DELAY: f32 = (Self::SIZE - 2) as f32;
 
     pub fn new() -> FracDelay {
-        FracDelay { ring: [0.0; Self::SIZE], pos: 0 }
+        FracDelay {
+            ring: [0.0; Self::SIZE],
+            pos: 0,
+        }
     }
 
     pub fn reset(&mut self) {

@@ -87,7 +87,11 @@ impl Default for Noise {
 
 impl Noise {
     pub fn new(seed: u32) -> Noise {
-        Noise { state: if seed == 0 { 1 } else { seed }, b: [0.0; 7], brown: 0.0 }
+        Noise {
+            state: if seed == 0 { 1 } else { seed },
+            b: [0.0; 7],
+            brown: 0.0,
+        }
     }
 
     #[inline]
@@ -174,13 +178,19 @@ mod tests {
         let mut n = Noise::default();
         let mut energy = [0.0f32; 3];
         for _ in 0..20000 {
-            for (i, c) in [NoiseColor::White, NoiseColor::Pink, NoiseColor::Brown].iter().enumerate() {
+            for (i, c) in [NoiseColor::White, NoiseColor::Pink, NoiseColor::Brown]
+                .iter()
+                .enumerate()
+            {
                 let s = n.next(*c);
                 assert!(s.abs() <= 1.5, "{c:?} out of range: {s}");
                 energy[i] += s * s;
             }
         }
-        assert!(energy.iter().all(|&e| e > 1.0), "all colours produce signal: {energy:?}");
+        assert!(
+            energy.iter().all(|&e| e > 1.0),
+            "all colours produce signal: {energy:?}"
+        );
     }
 
     #[test]

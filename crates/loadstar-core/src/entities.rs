@@ -101,7 +101,12 @@ impl Registry {
                 Change::Unchanged => {}
             }
         }
-        let removed: Vec<EntityId> = self.entities.keys().filter(|id| !present.contains(id)).copied().collect();
+        let removed: Vec<EntityId> = self
+            .entities
+            .keys()
+            .filter(|id| !present.contains(id))
+            .copied()
+            .collect();
         for id in &removed {
             self.entities.remove(id);
         }
@@ -119,7 +124,13 @@ mod tests {
         Entity {
             id,
             category: 1,
-            bounds: Bounds::TileRect { col, row: 0, width: 1, height: 1, layer: Some(0) },
+            bounds: Bounds::TileRect {
+                col,
+                row: 0,
+                width: 1,
+                height: 1,
+                layer: Some(0),
+            },
             blocking: 1,
             flags: flags::PATHFIND_ADJACENT,
             sort_key: 0,
@@ -141,17 +152,38 @@ mod tests {
     fn sync_diffs_against_the_store() {
         let mut r = Registry::default();
         let (s, changed, removed) = r.sync(&[npc(1, 0), npc(2, 0)]);
-        assert_eq!(s, SyncStats { added: 2, updated: 0, removed: 0 });
+        assert_eq!(
+            s,
+            SyncStats {
+                added: 2,
+                updated: 0,
+                removed: 0
+            }
+        );
         assert_eq!((changed.len(), removed.len()), (2, 0));
 
         // Entity 1 unchanged, 2 moved, 3 new, and 1 then absent in a later frame.
         let (s, mut changed, removed) = r.sync(&[npc(1, 0), npc(2, 5), npc(3, 9)]);
         changed.sort_unstable();
-        assert_eq!(s, SyncStats { added: 1, updated: 1, removed: 0 });
+        assert_eq!(
+            s,
+            SyncStats {
+                added: 1,
+                updated: 1,
+                removed: 0
+            }
+        );
         assert_eq!((changed, removed), (vec![2, 3], vec![]));
 
         let (s, _, removed) = r.sync(&[npc(2, 5), npc(3, 9)]);
-        assert_eq!(s, SyncStats { added: 0, updated: 0, removed: 1 });
+        assert_eq!(
+            s,
+            SyncStats {
+                added: 0,
+                updated: 0,
+                removed: 1
+            }
+        );
         assert_eq!(removed, vec![1]);
         assert_eq!(r.len(), 2);
 

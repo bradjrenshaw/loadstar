@@ -83,7 +83,10 @@ pub struct Link {
 pub enum GridError {
     ZeroSize,
     /// The dense array must hold exactly `width * height * layers` entries.
-    LengthMismatch { expected: usize, actual: usize },
+    LengthMismatch {
+        expected: usize,
+        actual: usize,
+    },
     InvalidNode(NodeId),
     InvalidLayer(u32),
     /// Costs must be finite and non-negative.
@@ -116,7 +119,12 @@ impl TileGrid {
     /// Build from per-cell walkability (tier-1 upload): an edge exists in both directions
     /// between adjacent walkable cells. Layout of `walkable` is layer-major, then row-major:
     /// index = `layer * width * height + row * width + col`; nonzero = walkable.
-    pub fn from_walkable(width: u32, height: u32, layers: u32, walkable: &[u8]) -> Result<TileGrid, GridError> {
+    pub fn from_walkable(
+        width: u32,
+        height: u32,
+        layers: u32,
+        walkable: &[u8],
+    ) -> Result<TileGrid, GridError> {
         let mut grid = Self::empty(width, height, layers, walkable.len())?;
         for node in 0..walkable.len() as NodeId {
             if walkable[node as usize] == 0 {
@@ -154,13 +162,21 @@ impl TileGrid {
         Ok(grid)
     }
 
-    fn empty(width: u32, height: u32, layers: u32, actual_len: usize) -> Result<TileGrid, GridError> {
+    fn empty(
+        width: u32,
+        height: u32,
+        layers: u32,
+        actual_len: usize,
+    ) -> Result<TileGrid, GridError> {
         if width == 0 || height == 0 || layers == 0 {
             return Err(GridError::ZeroSize);
         }
         let expected = width as usize * height as usize * layers as usize;
         if actual_len != expected {
-            return Err(GridError::LengthMismatch { expected, actual: actual_len });
+            return Err(GridError::LengthMismatch {
+                expected,
+                actual: actual_len,
+            });
         }
         Ok(TileGrid {
             width,
@@ -194,12 +210,19 @@ impl TileGrid {
     /// entirely standable (every cell has edges), on the node's layer. 0 for walls. Capped at
     /// 255. An agent with footprint `f` may occupy `node` iff `clearance(node) >= f`.
     pub fn clearance(&self, node: NodeId) -> u8 {
-        self.clearance_field().get(node as usize).copied().unwrap_or(0)
+        self.clearance_field()
+            .get(node as usize)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn clearance_field(&self) -> &[u8] {
         self.clearance.get_or_init(|| {
-            let (w, h, per_layer) = (self.width as usize, self.height as usize, (self.width * self.height) as usize);
+            let (w, h, per_layer) = (
+                self.width as usize,
+                self.height as usize,
+                (self.width * self.height) as usize,
+            );
             let mut field = vec![0u8; self.edges.len()];
             for layer in 0..self.layers as usize {
                 let base = layer * per_layer;
@@ -213,7 +236,11 @@ impl TileGrid {
                         }
                         let east = if c + 1 < w { field[i + 1] } else { 0 };
                         let south = if r + 1 < h { field[i + w] } else { 0 };
-                        let diag = if c + 1 < w && r + 1 < h { field[i + w + 1] } else { 0 };
+                        let diag = if c + 1 < w && r + 1 < h {
+                            field[i + w + 1]
+                        } else {
+                            0
+                        };
                         field[i] = east.min(south).min(diag).saturating_add(1);
                     }
                 }
@@ -299,7 +326,10 @@ impl TileGrid {
                 out.push(Segment::Link { link_id });
                 continue;
             }
-            let (Some((c0, r0, _)), Some((c1, r1, _))) = (self.node_coords(path.nodes[i - 1]), self.node_coords(path.nodes[i])) else {
+            let (Some((c0, r0, _)), Some((c1, r1, _))) = (
+                self.node_coords(path.nodes[i - 1]),
+                self.node_coords(path.nodes[i]),
+            ) else {
                 continue;
             };
             let dir = match (c1 as i64 - c0 as i64, r1 as i64 - r0 as i64) {
@@ -323,7 +353,13 @@ impl TileGrid {
         let mut out = Vec::new();
         match *bounds {
             Bounds::Point(p) => out.extend(self.node_from_position(p)),
-            Bounds::TileRect { col, row, width, height, layer } => {
+            Bounds::TileRect {
+                col,
+                row,
+                width,
+                height,
+                layer,
+            } => {
                 let layers: Vec<u32> = match layer {
                     Some(l) => vec![l],
                     None => (0..self.layers).collect(),
@@ -370,7 +406,12 @@ impl TileGrid {
     /// Nearest node to `from` (same layer, Manhattan rings up to `max_radius`) satisfying
     /// `pred`; `from` itself if it qualifies. Ties resolve to the lowest node id, so results
     /// are deterministic. Used for start snapping (spec §8).
-    pub fn nearest_node(&self, from: NodeId, max_radius: u32, pred: impl Fn(NodeId) -> bool) -> Option<NodeId> {
+    pub fn nearest_node(
+        &self,
+        from: NodeId,
+        max_radius: u32,
+        pred: impl Fn(NodeId) -> bool,
+    ) -> Option<NodeId> {
         if pred(from) {
             return Some(from);
         }
@@ -379,7 +420,11 @@ impl TileGrid {
             let mut best: Option<NodeId> = None;
             for dc in -radius..=radius {
                 let dr_abs = radius - dc.abs();
-                for dr in if dr_abs == 0 { vec![0] } else { vec![-dr_abs, dr_abs] } {
+                for dr in if dr_abs == 0 {
+                    vec![0]
+                } else {
+                    vec![-dr_abs, dr_abs]
+                } {
                     let (c, r) = (fc as i64 + dc, fr as i64 + dr);
                     if c < 0 || r < 0 {
                         continue;
@@ -408,11 +453,17 @@ impl TileGrid {
         let mut out = Vec::new();
         let mut scratch = Vec::with_capacity(8);
         for &t in targets {
-            let Some((_, _, t_layer)) = self.node_coords(t) else { continue };
+            let Some((_, _, t_layer)) = self.node_coords(t) else {
+                continue;
+            };
             for dir in Dir::ALL {
-                let Some((c, r)) = self.adjacent(t, dir) else { continue };
+                let Some((c, r)) = self.adjacent(t, dir) else {
+                    continue;
+                };
                 for layer in 0..self.layers {
-                    let Some(candidate) = self.node_id(c, r, layer) else { continue };
+                    let Some(candidate) = self.node_id(c, r, layer) else {
+                        continue;
+                    };
                     if target_set.contains(&candidate) {
                         continue;
                     }
@@ -437,16 +488,22 @@ impl TileGrid {
 
     /// Whether any edge leaves this node — i.e. it is somewhere an agent can actually stand.
     pub fn has_edges(&self, node: NodeId) -> bool {
-        self.edges.get(node as usize).is_some_and(|&m| m != 0) || self.link_index.contains_key(&node)
+        self.edges.get(node as usize).is_some_and(|&m| m != 0)
+            || self.link_index.contains_key(&node)
     }
 
     pub fn can_move(&self, node: NodeId, dir: Dir) -> bool {
-        self.edges.get(node as usize).is_some_and(|m| m & dir.bit() != 0)
+        self.edges
+            .get(node as usize)
+            .is_some_and(|m| m & dir.bit() != 0)
     }
 
     /// Patch one directed edge (doors, switches). Only affects `node -> neighbor`, not the reverse.
     pub fn set_edge(&mut self, node: NodeId, dir: Dir, passable: bool) -> Result<(), GridError> {
-        let mask = self.edges.get_mut(node as usize).ok_or(GridError::InvalidNode(node))?;
+        let mask = self
+            .edges
+            .get_mut(node as usize)
+            .ok_or(GridError::InvalidNode(node))?;
         if passable {
             *mask |= dir.bit();
         } else {
@@ -458,7 +515,12 @@ impl TileGrid {
 
     /// Set the layer/cost override for one directed edge. Does not change whether the edge
     /// is passable — set the mask bit separately.
-    pub fn set_edge_override(&mut self, node: NodeId, dir: Dir, ov: EdgeOverride) -> Result<(), GridError> {
+    pub fn set_edge_override(
+        &mut self,
+        node: NodeId,
+        dir: Dir,
+        ov: EdgeOverride,
+    ) -> Result<(), GridError> {
         if node as usize >= self.edges.len() {
             return Err(GridError::InvalidNode(node));
         }
@@ -557,7 +619,11 @@ fn cell_span(min: f32, max: f32) -> (u32, u32) {
 }
 
 fn check_cost(cost: f32) -> Result<(), GridError> {
-    if cost.is_finite() && cost >= 0.0 { Ok(()) } else { Err(GridError::InvalidCost(cost)) }
+    if cost.is_finite() && cost >= 0.0 {
+        Ok(())
+    } else {
+        Err(GridError::InvalidCost(cost))
+    }
 }
 
 fn manhattan((ac, ar): (u32, u32), (bc, br): (u32, u32)) -> f32 {
@@ -570,14 +636,20 @@ impl Graph for TileGrid {
     }
 
     fn neighbors(&self, node: NodeId, out: &mut Vec<Edge>) {
-        let Some(&mask) = self.edges.get(node as usize) else { return };
-        let Some((_, _, layer)) = self.node_coords(node) else { return };
+        let Some(&mask) = self.edges.get(node as usize) else {
+            return;
+        };
+        let Some((_, _, layer)) = self.node_coords(node) else {
+            return;
+        };
 
         for dir in Dir::ALL {
             if mask & dir.bit() == 0 {
                 continue;
             }
-            let Some((nc, nr)) = self.adjacent(node, dir) else { continue };
+            let Some((nc, nr)) = self.adjacent(node, dir) else {
+                continue;
+            };
             let (target_layer, cost) = match self.overrides.get(&(node, dir)) {
                 Some(ov) => (ov.target_layer, ov.cost),
                 None => (layer, 1.0),
@@ -605,7 +677,8 @@ impl Graph for TileGrid {
     /// plain straight-line estimate would over-estimate and break A*'s optimality.
     /// Layer differences are ignored (still admissible).
     fn heuristic(&self, a: NodeId, b: NodeId) -> f32 {
-        let (Some((ac, ar, _)), Some((bc, br, _))) = (self.node_coords(a), self.node_coords(b)) else {
+        let (Some((ac, ar, _)), Some((bc, br, _))) = (self.node_coords(a), self.node_coords(b))
+        else {
             return 0.0;
         };
         let mut steps = manhattan((ac, ar), (bc, br));
@@ -622,7 +695,13 @@ mod tests {
     use crate::graph::astar;
 
     fn open(width: u32, height: u32, layers: u32) -> TileGrid {
-        TileGrid::from_walkable(width, height, layers, &vec![1; (width * height * layers) as usize]).unwrap()
+        TileGrid::from_walkable(
+            width,
+            height,
+            layers,
+            &vec![1; (width * height * layers) as usize],
+        )
+        .unwrap()
     }
 
     /// 5x5 open grid with a vertical wall down column 2, gap at the bottom row.
@@ -636,10 +715,16 @@ mod tests {
 
     #[test]
     fn rejects_bad_dimensions() {
-        assert_eq!(TileGrid::from_walkable(0, 5, 1, &[]).unwrap_err(), GridError::ZeroSize);
+        assert_eq!(
+            TileGrid::from_walkable(0, 5, 1, &[]).unwrap_err(),
+            GridError::ZeroSize
+        );
         assert_eq!(
             TileGrid::from_walkable(2, 2, 1, &[1, 1, 1]).unwrap_err(),
-            GridError::LengthMismatch { expected: 4, actual: 3 }
+            GridError::LengthMismatch {
+                expected: 4,
+                actual: 3
+            }
         );
     }
 
@@ -662,7 +747,8 @@ mod tests {
         assert!(!g.can_move(wall, Dir::East));
         assert!(!g.can_move(g.node_id(1, 0, 0).unwrap(), Dir::East));
 
-        let path = astar(&g, g.node_id(0, 0, 0).unwrap(), g.node_id(4, 0, 0).unwrap()).expect("path around the wall");
+        let path = astar(&g, g.node_id(0, 0, 0).unwrap(), g.node_id(4, 0, 0).unwrap())
+            .expect("path around the wall");
         // Down 4, across 4, up 4 = 12 steps = 13 nodes, and it must pass through the gap.
         assert_eq!(path.nodes.len(), 13);
         assert_eq!(path.cost, 12.0);
@@ -676,7 +762,10 @@ mod tests {
         g.set_edge(b, Dir::West, false).unwrap(); // ledge: can go east, can't come back
         assert_eq!(astar(&g, a, b).unwrap().nodes, vec![a, b]);
         assert_eq!(astar(&g, b, a), None);
-        assert_eq!(g.set_edge(99, Dir::West, true), Err(GridError::InvalidNode(99)));
+        assert_eq!(
+            g.set_edge(99, Dir::West, true),
+            Err(GridError::InvalidNode(99))
+        );
     }
 
     #[test]
@@ -696,14 +785,29 @@ mod tests {
         let top_right = g.node_id(2, 0, 1).unwrap();
         assert_eq!(astar(&g, 0, top_right), None);
 
-        g.set_edge_override(1, Dir::East, EdgeOverride { target_layer: 1, cost: 1.0 }).unwrap();
+        g.set_edge_override(
+            1,
+            Dir::East,
+            EdgeOverride {
+                target_layer: 1,
+                cost: 1.0,
+            },
+        )
+        .unwrap();
         let p = astar(&g, 0, top_right).unwrap();
         assert_eq!(p.nodes, vec![0, 1, top_right]);
         // The reverse edge (West from the upper cell) still stays on layer 1.
         assert_eq!(astar(&g, top_right, 0), None);
 
         assert_eq!(
-            g.set_edge_override(1, Dir::East, EdgeOverride { target_layer: 5, cost: 1.0 }),
+            g.set_edge_override(
+                1,
+                Dir::East,
+                EdgeOverride {
+                    target_layer: 5,
+                    cost: 1.0
+                }
+            ),
             Err(GridError::InvalidLayer(5))
         );
         assert!(g.clear_edge_override(1, Dir::East));
@@ -714,8 +818,24 @@ mod tests {
     fn edge_costs_steer_the_path() {
         // 3x2: going along the top row costs 10 per step (swamp); the bottom row is free.
         let mut g = open(3, 2, 1);
-        g.set_edge_override(0, Dir::East, EdgeOverride { target_layer: 0, cost: 10.0 }).unwrap();
-        g.set_edge_override(1, Dir::East, EdgeOverride { target_layer: 0, cost: 10.0 }).unwrap();
+        g.set_edge_override(
+            0,
+            Dir::East,
+            EdgeOverride {
+                target_layer: 0,
+                cost: 10.0,
+            },
+        )
+        .unwrap();
+        g.set_edge_override(
+            1,
+            Dir::East,
+            EdgeOverride {
+                target_layer: 0,
+                cost: 10.0,
+            },
+        )
+        .unwrap();
         let p = astar(&g, 0, 2).unwrap();
         assert_eq!(p.nodes, vec![0, 3, 4, 5, 2]);
         assert_eq!(p.cost, 4.0);
@@ -733,13 +853,33 @@ mod tests {
         let mut g = TileGrid::from_walkable(10, 1, 1, &w).unwrap();
         assert_eq!(astar(&g, 0, 9), None);
 
-        g.add_link(42, Link { from: 2, to: 7, cost: 1.0, bidirectional: false, enabled: true }).unwrap();
+        g.add_link(
+            42,
+            Link {
+                from: 2,
+                to: 7,
+                cost: 1.0,
+                bidirectional: false,
+                enabled: true,
+            },
+        )
+        .unwrap();
         let p = astar(&g, 0, 9).unwrap();
         assert_eq!(p.nodes, vec![0, 1, 2, 7, 8, 9]);
         assert_eq!(p.links, vec![(3, 42)]);
         assert_eq!(astar(&g, 9, 0), None, "one-way link");
 
-        g.add_link(42, Link { from: 2, to: 7, cost: 1.0, bidirectional: true, enabled: true }).unwrap();
+        g.add_link(
+            42,
+            Link {
+                from: 2,
+                to: 7,
+                cost: 1.0,
+                bidirectional: true,
+                enabled: true,
+            },
+        )
+        .unwrap();
         assert_eq!(astar(&g, 9, 0).unwrap().links, vec![(3, 42)]);
 
         g.set_link_enabled(42, false).unwrap();
@@ -751,7 +891,16 @@ mod tests {
         assert_eq!(g.remove_link(42), Err(GridError::UnknownLink(42)));
         assert_eq!(astar(&g, 0, 9), None);
         assert_eq!(
-            g.add_link(1, Link { from: 0, to: 99, cost: 1.0, bidirectional: false, enabled: true }),
+            g.add_link(
+                1,
+                Link {
+                    from: 0,
+                    to: 99,
+                    cost: 1.0,
+                    bidirectional: false,
+                    enabled: true
+                }
+            ),
             Err(GridError::InvalidNode(99))
         );
     }
@@ -762,7 +911,17 @@ mod tests {
         // route go *away* from the goal first (5 steps + 0) instead of walking 14. A plain
         // Manhattan heuristic over-estimates near the entrance and A* would return the walk.
         let mut g = open(20, 1, 1);
-        g.add_link(7, Link { from: 0, to: 19, cost: 0.0, bidirectional: false, enabled: true }).unwrap();
+        g.add_link(
+            7,
+            Link {
+                from: 0,
+                to: 19,
+                cost: 0.0,
+                bidirectional: false,
+                enabled: true,
+            },
+        )
+        .unwrap();
         let p = astar(&g, 5, 19).unwrap();
         assert_eq!(p.nodes, vec![5, 4, 3, 2, 1, 0, 19]);
         assert_eq!(p.cost, 5.0);
@@ -775,7 +934,10 @@ mod tests {
         let center = g.node_id(2, 2, 0).unwrap();
         assert_eq!(g.nearest_node(center, 3, |_| true), Some(center));
         // Ring 1 has four cells; the lowest id is the north neighbour (row 1).
-        assert_eq!(g.nearest_node(center, 3, |n| n != center), g.node_id(2, 1, 0));
+        assert_eq!(
+            g.nearest_node(center, 3, |n| n != center),
+            g.node_id(2, 1, 0)
+        );
         // Only the far corner qualifies: found at radius 4, not within 3.
         let corner = g.node_id(4, 4, 0).unwrap();
         assert_eq!(g.nearest_node(center, 3, |n| n == corner), None);
@@ -789,7 +951,11 @@ mod tests {
         w[4] = 0;
         let mut g = TileGrid::from_walkable(3, 3, 1, &w).unwrap();
         assert!(!g.has_edges(4));
-        assert_eq!(g.adjacent_candidates(&[4]), vec![1, 3, 5, 7], "you interact from beside a chest you can't step on");
+        assert_eq!(
+            g.adjacent_candidates(&[4]),
+            vec![1, 3, 5, 7],
+            "you interact from beside a chest you can't step on"
+        );
         // A wall beside the target is not somewhere to stand.
         for d in Dir::ALL {
             g.set_edge(1, d, false).unwrap();
@@ -801,7 +967,17 @@ mod tests {
         g.set_edge(1, Dir::South, false).unwrap();
         assert_eq!(g.adjacent_candidates(&[4]), vec![1, 3, 5, 7]);
         // ...and a teleporter landing on it does not count as adjacency.
-        g.add_link(1, Link { from: 8, to: 4, cost: 1.0, bidirectional: false, enabled: true }).unwrap();
+        g.add_link(
+            1,
+            Link {
+                from: 8,
+                to: 4,
+                cost: 1.0,
+                bidirectional: false,
+                enabled: true,
+            },
+        )
+        .unwrap();
         assert_eq!(g.adjacent_candidates(&[4]), vec![1, 3, 5, 7]);
         // A 2-cell target excludes its own cells from the candidates.
         assert_eq!(g.adjacent_candidates(&[3, 4]), vec![0, 1, 5, 6, 7]);
@@ -809,7 +985,15 @@ mod tests {
         // Across a floor change: the cell at the bottom of a ramp has an edge into the upper
         // target, so it is a candidate even though it is on another layer.
         let mut g = open(3, 1, 2);
-        g.set_edge_override(1, Dir::East, EdgeOverride { target_layer: 1, cost: 1.0 }).unwrap();
+        g.set_edge_override(
+            1,
+            Dir::East,
+            EdgeOverride {
+                target_layer: 1,
+                cost: 1.0,
+            },
+        )
+        .unwrap();
         let upper = g.node_id(2, 0, 1).unwrap();
         assert!(g.adjacent_candidates(&[upper]).contains(&1));
     }
@@ -817,23 +1001,51 @@ mod tests {
     #[test]
     fn projection_clips_and_covers_each_bounds_kind() {
         let g = open(4, 4, 2);
-        assert_eq!(g.project(&Bounds::Point(Vec3::new(1.5, 1.0, 2.5))), vec![g.node_id(1, 2, 1).unwrap()]);
+        assert_eq!(
+            g.project(&Bounds::Point(Vec3::new(1.5, 1.0, 2.5))),
+            vec![g.node_id(1, 2, 1).unwrap()]
+        );
         assert_eq!(g.project(&Bounds::Point(Vec3::new(9.0, 0.0, 0.0))), vec![]);
 
-        let rect = Bounds::TileRect { col: 2, row: 3, width: 3, height: 3, layer: Some(0) };
-        assert_eq!(g.project(&rect), vec![g.node_id(2, 3, 0).unwrap(), g.node_id(3, 3, 0).unwrap()], "clipped at the edge");
-        let all = Bounds::TileRect { col: 0, row: 0, width: 1, height: 1, layer: None };
+        let rect = Bounds::TileRect {
+            col: 2,
+            row: 3,
+            width: 3,
+            height: 3,
+            layer: Some(0),
+        };
+        assert_eq!(
+            g.project(&rect),
+            vec![g.node_id(2, 3, 0).unwrap(), g.node_id(3, 3, 0).unwrap()],
+            "clipped at the edge"
+        );
+        let all = Bounds::TileRect {
+            col: 0,
+            row: 0,
+            width: 1,
+            height: 1,
+            layer: None,
+        };
         assert_eq!(g.project(&all), vec![0, 16], "one cell on both layers");
 
         // A box centered at (1.5, 0, 1.5) with half-size 1 spans cells 0..=2 in both axes.
-        let bx = Bounds::Box { center: Vec3::new(1.5, 0.0, 1.5), extents: Vec3::new(1.0, 0.0, 1.0) };
+        let bx = Bounds::Box {
+            center: Vec3::new(1.5, 0.0, 1.5),
+            extents: Vec3::new(1.0, 0.0, 1.0),
+        };
         assert_eq!(g.project(&bx).len(), 9);
         // Half-size 0.5 ends exactly on cell boundaries: only the center cell.
-        let tight = Bounds::Box { center: Vec3::new(1.5, 0.0, 1.5), extents: Vec3::new(0.5, 0.0, 0.5) };
+        let tight = Bounds::Box {
+            center: Vec3::new(1.5, 0.0, 1.5),
+            extents: Vec3::new(0.5, 0.0, 0.5),
+        };
         assert_eq!(g.project(&tight), vec![g.node_id(1, 1, 0).unwrap()]);
 
         // Radius 1 around a cell center covers the plus shape, not the diagonals.
-        let sp = Bounds::Sphere { center: Vec3::new(1.5, 0.0, 1.5), radius: 1.0 };
+        let sp = Bounds::Sphere {
+            center: Vec3::new(1.5, 0.0, 1.5),
+            radius: 1.0,
+        };
         assert_eq!(g.project(&sp), vec![1, 4, 5, 6, 9]);
     }
 
@@ -855,7 +1067,11 @@ mod tests {
             g.set_edge(g.node_id(2, 0, 0).unwrap(), d, false).unwrap();
         }
         assert_eq!(at(&g, 2, 0), 0, "cache was invalidated by the edit");
-        assert_eq!(at(&g, 2, 1), 2, "blocks that never used (2,0) are unaffected");
+        assert_eq!(
+            at(&g, 2, 1),
+            2,
+            "blocks that never used (2,0) are unaffected"
+        );
         assert_eq!(at(&g, 3, 0), 1);
     }
 
@@ -865,26 +1081,67 @@ mod tests {
         let mut w = vec![1u8; 10];
         w[5] = 0;
         let mut g = TileGrid::from_walkable(10, 1, 1, &w).unwrap();
-        g.add_link(42, Link { from: 2, to: 7, cost: 1.0, bidirectional: false, enabled: true }).unwrap();
+        g.add_link(
+            42,
+            Link {
+                from: 2,
+                to: 7,
+                cost: 1.0,
+                bidirectional: false,
+                enabled: true,
+            },
+        )
+        .unwrap();
         let p = astar(&g, 0, 9).unwrap();
         assert_eq!(
             g.segments(&p),
-            vec![Segment::Move { dir: Dir::East, count: 2 }, Segment::Link { link_id: 42 }, Segment::Move { dir: Dir::East, count: 2 }]
+            vec![
+                Segment::Move {
+                    dir: Dir::East,
+                    count: 2
+                },
+                Segment::Link { link_id: 42 },
+                Segment::Move {
+                    dir: Dir::East,
+                    count: 2
+                }
+            ]
         );
         // Around the wall on the 5x5 grid. Several routes tie at 12 steps; whichever A*
         // picks, the runs must total 12 and contain the 4-down / 4-up legs past the wall.
         let g = walled();
         let p = astar(&g, g.node_id(0, 0, 0).unwrap(), g.node_id(4, 0, 0).unwrap()).unwrap();
         let segs = g.segments(&p);
-        let total: u32 = segs.iter().map(|s| if let Segment::Move { count, .. } = s { *count } else { 0 }).sum();
+        let total: u32 = segs
+            .iter()
+            .map(|s| {
+                if let Segment::Move { count, .. } = s {
+                    *count
+                } else {
+                    0
+                }
+            })
+            .sum();
         assert_eq!(total, 12);
-        assert!(segs.contains(&Segment::Move { dir: Dir::South, count: 4 }));
-        assert!(segs.contains(&Segment::Move { dir: Dir::North, count: 4 }));
-        assert!(segs.windows(2).all(|w| match (w[0], w[1]) {
-            (Segment::Move { dir: a, .. }, Segment::Move { dir: b, .. }) => a != b,
-            _ => true,
-        }), "adjacent runs are merged: {segs:?}");
-        assert!(g.segments(&astar(&g, 3, 3).unwrap()).is_empty(), "already there");
+        assert!(segs.contains(&Segment::Move {
+            dir: Dir::South,
+            count: 4
+        }));
+        assert!(segs.contains(&Segment::Move {
+            dir: Dir::North,
+            count: 4
+        }));
+        assert!(
+            segs.windows(2).all(|w| match (w[0], w[1]) {
+                (Segment::Move { dir: a, .. }, Segment::Move { dir: b, .. }) => a != b,
+                _ => true,
+            }),
+            "adjacent runs are merged: {segs:?}"
+        );
+        assert!(
+            g.segments(&astar(&g, 3, 3).unwrap()).is_empty(),
+            "already there"
+        );
     }
 
     #[test]
@@ -897,6 +1154,9 @@ mod tests {
     #[test]
     fn layers_without_layer_edges_are_disconnected() {
         let g = open(2, 2, 2);
-        assert_eq!(astar(&g, g.node_id(0, 0, 0).unwrap(), g.node_id(0, 0, 1).unwrap()), None);
+        assert_eq!(
+            astar(&g, g.node_id(0, 0, 0).unwrap(), g.node_id(0, 0, 1).unwrap()),
+            None
+        );
     }
 }

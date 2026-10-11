@@ -24,11 +24,19 @@ pub struct Edge {
 
 impl Edge {
     pub const fn step(to: NodeId, cost: f32) -> Edge {
-        Edge { to, cost, link: None }
+        Edge {
+            to,
+            cost,
+            link: None,
+        }
     }
 
     pub const fn link(to: NodeId, cost: f32, id: LinkId) -> Edge {
-        Edge { to, cost, link: Some(id) }
+        Edge {
+            to,
+            cost,
+            link: Some(id),
+        }
     }
 }
 
@@ -90,14 +98,24 @@ pub struct Query<'a> {
 
 /// A* from `start` to `goal` with no blocking. `None` if unreachable or an id is out of range.
 pub fn astar(graph: &impl Graph, start: NodeId, goal: NodeId) -> Option<Path> {
-    astar_query(graph, &Query { start, goals: &[goal], is_blocked: &|_| false })
+    astar_query(
+        graph,
+        &Query {
+            start,
+            goals: &[goal],
+            is_blocked: &|_| false,
+        },
+    )
 }
 
 /// Multi-goal A* with blocking. Ties between equally cheap goals resolve deterministically.
 pub fn astar_query(graph: &impl Graph, query: &Query) -> Option<Path> {
     let n = graph.node_count();
     let start = query.start;
-    if (start as usize) >= n || query.goals.is_empty() || query.goals.iter().any(|&g| (g as usize) >= n) {
+    if (start as usize) >= n
+        || query.goals.is_empty()
+        || query.goals.iter().any(|&g| (g as usize) >= n)
+    {
         return None;
     }
     let mut is_goal = vec![false; n];
@@ -105,9 +123,19 @@ pub fn astar_query(graph: &impl Graph, query: &Query) -> Option<Path> {
         is_goal[g as usize] = true;
     }
     if is_goal[start as usize] {
-        return Some(Path { nodes: vec![start], links: Vec::new(), cost: 0.0 });
+        return Some(Path {
+            nodes: vec![start],
+            links: Vec::new(),
+            cost: 0.0,
+        });
     }
-    let h = |node: NodeId| query.goals.iter().map(|&g| graph.heuristic(node, g)).fold(f32::INFINITY, f32::min);
+    let h = |node: NodeId| {
+        query
+            .goals
+            .iter()
+            .map(|&g| graph.heuristic(node, g))
+            .fold(f32::INFINITY, f32::min)
+    };
 
     let mut g_score = vec![f32::INFINITY; n];
     let mut came_from = vec![NodeId::MAX; n];
@@ -117,11 +145,19 @@ pub fn astar_query(graph: &impl Graph, query: &Query) -> Option<Path> {
     let mut scratch: Vec<Edge> = Vec::with_capacity(8);
 
     g_score[start as usize] = 0.0;
-    open.push(Open { f: h(start), node: start });
+    open.push(Open {
+        f: h(start),
+        node: start,
+    });
 
     while let Some(Open { node, .. }) = open.pop() {
         if is_goal[node as usize] {
-            return Some(reconstruct(&came_from, &came_via, node, g_score[node as usize]));
+            return Some(reconstruct(
+                &came_from,
+                &came_via,
+                node,
+                g_score[node as usize],
+            ));
         }
         if closed[node as usize] {
             continue; // stale heap entry
@@ -139,7 +175,10 @@ pub fn astar_query(graph: &impl Graph, query: &Query) -> Option<Path> {
                 g_score[to as usize] = tentative;
                 came_from[to as usize] = node;
                 came_via[to as usize] = link;
-                open.push(Open { f: tentative + h(to), node: to });
+                open.push(Open {
+                    f: tentative + h(to),
+                    node: to,
+                });
             }
         }
     }
@@ -148,7 +187,11 @@ pub fn astar_query(graph: &impl Graph, query: &Query) -> Option<Path> {
 
 /// Every node reachable from `start` without entering a blocked node (the start itself is
 /// always reachable). Indexed by `NodeId`. Backs the reachability filter (spec §8).
-pub fn flood_fill(graph: &impl Graph, start: NodeId, is_blocked: &dyn Fn(NodeId) -> bool) -> Vec<bool> {
+pub fn flood_fill(
+    graph: &impl Graph,
+    start: NodeId,
+    is_blocked: &dyn Fn(NodeId) -> bool,
+) -> Vec<bool> {
     let n = graph.node_count();
     let mut reached = vec![false; n];
     if (start as usize) >= n {
@@ -181,7 +224,11 @@ fn reconstruct(came_from: &[NodeId], came_via: &[Option<LinkId>], goal: NodeId, 
     }
     nodes.reverse();
     via.reverse();
-    let links = via.iter().enumerate().filter_map(|(i, v)| v.map(|id| (i, id))).collect();
+    let links = via
+        .iter()
+        .enumerate()
+        .filter_map(|(i, v)| v.map(|id| (i, id)))
+        .collect();
     Path { nodes, links, cost }
 }
 
@@ -245,27 +292,67 @@ mod tests {
         let g = Line { link_cost: 5.0 };
         let blocked = |n: NodeId| n == 1;
         // 1 is blocked, so the only way to 3 is the expensive direct edge.
-        let p = astar_query(&g, &Query { start: 0, goals: &[3], is_blocked: &blocked }).unwrap();
+        let p = astar_query(
+            &g,
+            &Query {
+                start: 0,
+                goals: &[3],
+                is_blocked: &blocked,
+            },
+        )
+        .unwrap();
         assert_eq!(p.nodes, vec![0, 3]);
         assert_eq!(p.cost, 10.0);
         // Starting *on* the blocked node is fine — you're already there.
-        let p = astar_query(&g, &Query { start: 1, goals: &[2], is_blocked: &blocked }).unwrap();
+        let p = astar_query(
+            &g,
+            &Query {
+                start: 1,
+                goals: &[2],
+                is_blocked: &blocked,
+            },
+        )
+        .unwrap();
         assert_eq!(p.nodes, vec![1, 2]);
     }
 
     #[test]
     fn multi_goal_picks_the_cheapest_candidate() {
         let g = Line { link_cost: 5.0 };
-        let p = astar_query(&g, &Query { start: 0, goals: &[3, 2], is_blocked: &|_| false }).unwrap();
+        let p = astar_query(
+            &g,
+            &Query {
+                start: 0,
+                goals: &[3, 2],
+                is_blocked: &|_| false,
+            },
+        )
+        .unwrap();
         assert_eq!(p.nodes, vec![0, 1, 2]);
-        assert_eq!(astar_query(&g, &Query { start: 0, goals: &[], is_blocked: &|_| false }), None);
+        assert_eq!(
+            astar_query(
+                &g,
+                &Query {
+                    start: 0,
+                    goals: &[],
+                    is_blocked: &|_| false
+                }
+            ),
+            None
+        );
     }
 
     #[test]
     fn flood_fill_respects_blocking() {
         let g = Line { link_cost: 5.0 };
         assert_eq!(flood_fill(&g, 0, &|_| false), vec![true, true, true, true]);
-        assert_eq!(flood_fill(&g, 0, &|n| n == 1), vec![true, false, false, true]);
-        assert_eq!(flood_fill(&g, 3, &|_| false), vec![false, false, false, true]);
+        assert_eq!(
+            flood_fill(&g, 0, &|n| n == 1),
+            vec![true, false, false, true]
+        );
+        assert_eq!(
+            flood_fill(&g, 3, &|_| false),
+            vec![false, false, false, true]
+        );
     }
 }

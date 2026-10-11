@@ -5,7 +5,7 @@ include_version = true
 cpp_compat = true
 documentation = true
 style = "both"
-after_includes = "\n/* The audio surface (la_*) is compiled in by default. */\n#define LOADSTAR_AUDIO 1"
+after_includes = "\n/* The audio (la_*) and speech (lv_*) surfaces are compiled in by default. */\n#define LOADSTAR_AUDIO 1\n#define LOADSTAR_SPEECH 1"
 
 [export]
 prefix = "Ls"
@@ -20,3 +20,4 @@ include = ["loadstar-core"]
 
 [defines]
 "feature = audio" = "LOADSTAR_AUDIO"
+"feature = speech" = "LOADSTAR_SPEECH"

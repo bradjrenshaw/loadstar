@@ -28,6 +28,10 @@ public enum Status
     NoPath = 4,
     DeviceUnavailable = 5,
     Busy = 6,
+    /// <summary>Speech: the chosen voice is absent and NoFallback was set, or nothing at all can speak.</summary>
+    VoiceUnavailable = 7,
+    /// <summary>Speech: a feature the call needs is not in the resolved voice's set.</summary>
+    NotSupported = 8,
     Panic = 100,
 }
 

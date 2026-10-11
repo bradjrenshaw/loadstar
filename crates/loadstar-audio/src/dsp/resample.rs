@@ -7,7 +7,12 @@ pub fn to_mono_at_rate(samples: &[f32], channels: usize, from_rate: u32, to_rate
     let channels = channels.max(1);
     let frames = samples.len() / channels;
     let mono: Vec<f32> = (0..frames)
-        .map(|f| samples[f * channels..(f + 1) * channels].iter().sum::<f32>() / channels as f32)
+        .map(|f| {
+            samples[f * channels..(f + 1) * channels]
+                .iter()
+                .sum::<f32>()
+                / channels as f32
+        })
         .collect();
     if from_rate == to_rate || from_rate == 0 || to_rate == 0 || mono.len() < 2 {
         return mono;
@@ -33,7 +38,10 @@ mod tests {
     #[test]
     fn downmixes_and_resamples() {
         let stereo = [1.0, -1.0, 0.5, 0.5, 0.0, 1.0];
-        assert_eq!(to_mono_at_rate(&stereo, 2, 48000, 48000), vec![0.0, 0.5, 0.5]);
+        assert_eq!(
+            to_mono_at_rate(&stereo, 2, 48000, 48000),
+            vec![0.0, 0.5, 0.5]
+        );
         let up = to_mono_at_rate(&[0.0, 1.0, 0.0, 1.0], 1, 24000, 48000);
         assert_eq!(up.len(), 8);
         assert!((up[1] - 0.5).abs() < 1e-6, "interpolated midpoint");

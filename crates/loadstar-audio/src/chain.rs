@@ -61,7 +61,11 @@ pub struct EffectDesc {
 
 impl EffectDesc {
     pub fn new(kind: EffectKind, p: [f32; 8]) -> EffectDesc {
-        EffectDesc { kind, flags: ENABLED, p }
+        EffectDesc {
+            kind,
+            flags: ENABLED,
+            p,
+        }
     }
 
     pub fn gain(gain: f32) -> EffectDesc {
@@ -77,19 +81,31 @@ impl EffectDesc {
         Self::new(EffectKind::LowShelf, [hz, db, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     }
     pub fn highshelf(hz: f32, db: f32) -> EffectDesc {
-        Self::new(EffectKind::HighShelf, [hz, db, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        Self::new(
+            EffectKind::HighShelf,
+            [hz, db, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        )
     }
     pub fn peak(hz: f32, db: f32, q: f32) -> EffectDesc {
         Self::new(EffectKind::Peak, [hz, db, q, 0.0, 0.0, 0.0, 0.0, 0.0])
     }
     pub fn delay(ms: f32, feedback: f32, mix: f32) -> EffectDesc {
-        Self::new(EffectKind::Delay, [ms, feedback, mix, 0.0, 0.0, 0.0, 0.0, 0.0])
+        Self::new(
+            EffectKind::Delay,
+            [ms, feedback, mix, 0.0, 0.0, 0.0, 0.0, 0.0],
+        )
     }
     pub fn limiter(threshold_db: f32, release_ms: f32) -> EffectDesc {
-        Self::new(EffectKind::Limiter, [threshold_db, release_ms, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        Self::new(
+            EffectKind::Limiter,
+            [threshold_db, release_ms, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        )
     }
     pub fn distance(min: f32, max: f32, rolloff: f32, model: DistanceModel) -> EffectDesc {
-        Self::new(EffectKind::Distance, [min, max, rolloff, model as u32 as f32, 0.0, 0.0, 0.0, 0.0])
+        Self::new(
+            EffectKind::Distance,
+            [min, max, rolloff, model as u32 as f32, 0.0, 0.0, 0.0, 0.0],
+        )
     }
 
     pub fn enabled(&self) -> bool {
@@ -97,7 +113,11 @@ impl EffectDesc {
     }
 
     pub fn with_enabled(mut self, enabled: bool) -> EffectDesc {
-        if enabled { self.flags |= ENABLED } else { self.flags &= !ENABLED }
+        if enabled {
+            self.flags |= ENABLED
+        } else {
+            self.flags &= !ENABLED
+        }
         self
     }
 }
@@ -129,7 +149,12 @@ pub struct DistanceParams {
 impl DistanceParams {
     /// 1 metre of full gain, inverse falloff, no cutoff.
     pub fn default_for(unit_scale: f32) -> DistanceParams {
-        DistanceParams { min: unit_scale.max(1e-3), max: 0.0, rolloff: 1.0, model: DistanceModel::Inverse }
+        DistanceParams {
+            min: unit_scale.max(1e-3),
+            max: 0.0,
+            rolloff: 1.0,
+            model: DistanceModel::Inverse,
+        }
     }
 
     pub fn from_desc(d: &EffectDesc) -> DistanceParams {
@@ -139,7 +164,12 @@ impl DistanceParams {
             3 => DistanceModel::None,
             _ => DistanceModel::Inverse,
         };
-        DistanceParams { min: d.p[0].max(1e-3), max: d.p[1].max(0.0), rolloff: d.p[2].max(0.0), model }
+        DistanceParams {
+            min: d.p[0].max(1e-3),
+            max: d.p[1].max(0.0),
+            rolloff: d.p[2].max(0.0),
+            model,
+        }
     }
 
     pub fn gain(&self, distance: f32) -> f32 {
@@ -161,7 +191,11 @@ impl DistanceParams {
                 }
             }
             DistanceModel::Reference => {
-                let floor = if self.rolloff > 1.0 { 1.0 / self.rolloff } else { 0.0 };
+                let floor = if self.rolloff > 1.0 {
+                    1.0 / self.rolloff
+                } else {
+                    0.0
+                };
                 (self.min / (self.min + (d - self.min))).max(floor)
             }
         }
@@ -171,9 +205,18 @@ impl DistanceParams {
 enum NodeState {
     Gain(Ramp),
     /// One biquad per channel, retuned once per block toward the desc's parameters.
-    Filter { filters: [Biquad; 2], current: [f32; 3] },
-    Delay { lines: Vec<f32>, len: usize, pos: usize },
-    Limiter { env: f32 },
+    Filter {
+        filters: [Biquad; 2],
+        current: [f32; 3],
+    },
+    Delay {
+        lines: Vec<f32>,
+        len: usize,
+        pos: usize,
+    },
+    Limiter {
+        env: f32,
+    },
     /// Distance / Spatializer: configuration only.
     Config,
 }
@@ -216,7 +259,11 @@ impl Chain {
             .map(|&desc| {
                 let state = match desc.kind {
                     EffectKind::Gain => NodeState::Gain(Ramp::new(desc.p[0])),
-                    EffectKind::LowPass | EffectKind::HighPass | EffectKind::LowShelf | EffectKind::HighShelf | EffectKind::Peak => {
+                    EffectKind::LowPass
+                    | EffectKind::HighPass
+                    | EffectKind::LowShelf
+                    | EffectKind::HighShelf
+                    | EffectKind::Peak => {
                         let mut filters = [Biquad::identity(); 2];
                         let current = [desc.p[0], desc.p[1], desc.p[2]];
                         Self::tune(desc.kind, &mut filters, current, rate);
@@ -224,15 +271,28 @@ impl Chain {
                     }
                     EffectKind::Delay => {
                         let len = ((desc.p[0].max(0.0) / 1000.0 * rate) as usize).max(1);
-                        NodeState::Delay { lines: vec![0.0; len * channels], len, pos: 0 }
+                        NodeState::Delay {
+                            lines: vec![0.0; len * channels],
+                            len,
+                            pos: 0,
+                        }
                     }
                     EffectKind::Limiter => NodeState::Limiter { env: 1.0 },
                     EffectKind::Distance | EffectKind::Spatializer => NodeState::Config,
                 };
-                Node { desc, wet: Ramp::new(if desc.enabled() { 1.0 } else { 0.0 }), state }
+                Node {
+                    desc,
+                    wet: Ramp::new(if desc.enabled() { 1.0 } else { 0.0 }),
+                    state,
+                }
             })
             .collect();
-        Chain { nodes, channels, rate, scratch: vec![0.0; block.max(1) * channels] }
+        Chain {
+            nodes,
+            channels,
+            rate,
+            scratch: vec![0.0; block.max(1) * channels],
+        }
     }
 
     pub fn empty(rate: f32, channels: usize, block: usize) -> Chain {
@@ -258,18 +318,26 @@ impl Chain {
 
     /// The distance model configured in this chain, if any.
     pub fn distance(&self) -> Option<DistanceParams> {
-        self.nodes.iter().find(|n| n.desc.kind == EffectKind::Distance && n.desc.enabled()).map(|n| DistanceParams::from_desc(&n.desc))
+        self.nodes
+            .iter()
+            .find(|n| n.desc.kind == EffectKind::Distance && n.desc.enabled())
+            .map(|n| DistanceParams::from_desc(&n.desc))
     }
 
     /// The spatializer override configured in this chain, if any.
     pub fn spatializer(&self) -> Option<&EffectDesc> {
-        self.nodes.iter().find(|n| n.desc.kind == EffectKind::Spatializer && n.desc.enabled()).map(|n| &n.desc)
+        self.nodes
+            .iter()
+            .find(|n| n.desc.kind == EffectKind::Spatializer && n.desc.enabled())
+            .map(|n| &n.desc)
     }
 
     /// Change one parameter in place (no allocation). Delay length changes are ignored — the
     /// line was sized at build; send a new chain for that.
     pub fn set_param(&mut self, index: usize, param: usize, value: f32) -> bool {
-        let Some(node) = self.nodes.get_mut(index) else { return false };
+        let Some(node) = self.nodes.get_mut(index) else {
+            return false;
+        };
         if param >= node.desc.p.len() {
             return false;
         }
@@ -282,7 +350,9 @@ impl Chain {
 
     /// Crossfaded enable/disable — A/B by ear without clicks.
     pub fn set_enabled(&mut self, index: usize, enabled: bool) -> bool {
-        let Some(node) = self.nodes.get_mut(index) else { return false };
+        let Some(node) = self.nodes.get_mut(index) else {
+            return false;
+        };
         node.desc = node.desc.with_enabled(enabled);
         node.wet.set_target(if enabled { 1.0 } else { 0.0 });
         true
@@ -291,7 +361,9 @@ impl Chain {
     pub fn reset(&mut self) {
         for node in &mut self.nodes {
             match &mut node.state {
-                NodeState::Filter { filters, .. } => filters.iter_mut().for_each(Biquad::reset_state),
+                NodeState::Filter { filters, .. } => {
+                    filters.iter_mut().for_each(Biquad::reset_state)
+                }
                 NodeState::Delay { lines, pos, .. } => {
                     lines.iter_mut().for_each(|s| *s = 0.0);
                     *pos = 0;
@@ -305,11 +377,17 @@ impl Chain {
     fn tune(kind: EffectKind, filters: &mut [Biquad; 2], p: [f32; 3], rate: f32) {
         for f in filters.iter_mut() {
             match kind {
-                EffectKind::LowPass => f.set_lowpass(rate, p[0], if p[1] > 0.0 { p[1] } else { 0.707 }),
-                EffectKind::HighPass => f.set_highpass(rate, p[0], if p[1] > 0.0 { p[1] } else { 0.707 }),
+                EffectKind::LowPass => {
+                    f.set_lowpass(rate, p[0], if p[1] > 0.0 { p[1] } else { 0.707 })
+                }
+                EffectKind::HighPass => {
+                    f.set_highpass(rate, p[0], if p[1] > 0.0 { p[1] } else { 0.707 })
+                }
                 EffectKind::LowShelf => f.set_lowshelf(rate, p[0], p[1]),
                 EffectKind::HighShelf => f.set_highshelf(rate, p[0], p[1]),
-                EffectKind::Peak => f.set_peak(rate, p[0], p[1], if p[2] > 0.0 { p[2] } else { 1.0 }),
+                EffectKind::Peak => {
+                    f.set_peak(rate, p[0], p[1], if p[2] > 0.0 { p[2] } else { 1.0 })
+                }
                 _ => {}
             }
         }
@@ -352,7 +430,14 @@ impl Chain {
         }
     }
 
-    fn run(state: &mut NodeState, desc: &EffectDesc, buf: &mut [f32], channels: usize, frames: usize, rate: f32) {
+    fn run(
+        state: &mut NodeState,
+        desc: &EffectDesc,
+        buf: &mut [f32],
+        channels: usize,
+        frames: usize,
+        rate: f32,
+    ) {
         match state {
             NodeState::Gain(ramp) => {
                 let (start, step) = ramp.block(frames);
@@ -366,7 +451,11 @@ impl Chain {
             NodeState::Filter { filters, current } => {
                 // Retune once per block toward the target parameters, state preserved.
                 let target = [desc.p[0], desc.p[1], desc.p[2]];
-                if current.iter().zip(&target).any(|(c, t)| (c - t).abs() > 1e-3) {
+                if current
+                    .iter()
+                    .zip(&target)
+                    .any(|(c, t)| (c - t).abs() > 1e-3)
+                {
                     for (c, t) in current.iter_mut().zip(&target) {
                         *c += (t - *c) * 0.5;
                         if (*c - t).abs() < 1e-3 {
@@ -408,8 +497,16 @@ impl Chain {
                     for c in 0..channels {
                         peak = peak.max(buf[f * channels + c].abs());
                     }
-                    let needed = if peak > threshold { threshold / peak } else { 1.0 };
-                    *env = if needed <= *env { needed } else { *env + (1.0 - *env) * (1.0 - release) };
+                    let needed = if peak > threshold {
+                        threshold / peak
+                    } else {
+                        1.0
+                    };
+                    *env = if needed <= *env {
+                        needed
+                    } else {
+                        *env + (1.0 - *env) * (1.0 - release)
+                    };
                     for c in 0..channels {
                         buf[f * channels + c] *= *env;
                     }
@@ -445,7 +542,10 @@ mod tests {
         chain.process(&mut buf);
         assert_eq!(buf[0], 1.0);
         assert!(buf[255] < 0.01);
-        assert!(buf.windows(2).all(|w| (w[0] - w[1]).abs() < 0.01), "linear ramp");
+        assert!(
+            buf.windows(2).all(|w| (w[0] - w[1]).abs() < 0.01),
+            "linear ramp"
+        );
     }
 
     #[test]
@@ -457,14 +557,21 @@ mod tests {
             hi = sine(8000.0, 48000.0, 512, 2);
             chain.process(&mut hi);
         }
-        assert!(rms(&hi) < 0.05, "8 kHz through a 500 Hz lowpass: {}", rms(&hi));
+        assert!(
+            rms(&hi) < 0.05,
+            "8 kHz through a 500 Hz lowpass: {}",
+            rms(&hi)
+        );
 
         chain.set_enabled(0, false);
         let mut buf = sine(8000.0, 48000.0, 512, 2);
         chain.process(&mut buf);
         let dry_rms = std::f32::consts::FRAC_1_SQRT_2;
         let mid = rms(&buf);
-        assert!(mid > 0.1 && mid < dry_rms, "the crossfade block sits between wet and dry: {mid}");
+        assert!(
+            mid > 0.1 && mid < dry_rms,
+            "the crossfade block sits between wet and dry: {mid}"
+        );
         let mut buf = sine(8000.0, 48000.0, 512, 2);
         chain.process(&mut buf);
         assert!((rms(&buf) - dry_rms).abs() < 0.02, "bypassed once settled");
@@ -485,7 +592,10 @@ mod tests {
         chain.set_enabled(0, true);
         let mut buf = vec![1.0; 128];
         chain.process(&mut buf);
-        assert!((buf[0] - 1.0).abs() < 1e-4 && buf[127] < 0.01, "and back toward wet");
+        assert!(
+            (buf[0] - 1.0).abs() < 1e-4 && buf[127] < 0.01,
+            "and back toward wet"
+        );
     }
 
     #[test]
@@ -494,34 +604,78 @@ mod tests {
         let mut buf = vec![1.0; 1024];
         chain.process(&mut buf);
         let ceiling = db_to_gain(-6.0);
-        assert!(buf.iter().all(|&s| s <= ceiling + 1e-4), "max {}", buf.iter().cloned().fold(0.0, f32::max));
+        assert!(
+            buf.iter().all(|&s| s <= ceiling + 1e-4),
+            "max {}",
+            buf.iter().cloned().fold(0.0, f32::max)
+        );
     }
 
     #[test]
     fn distance_models() {
-        let inv = DistanceParams { min: 1.0, max: 0.0, rolloff: 1.0, model: DistanceModel::Inverse };
+        let inv = DistanceParams {
+            min: 1.0,
+            max: 0.0,
+            rolloff: 1.0,
+            model: DistanceModel::Inverse,
+        };
         assert_eq!(inv.gain(0.5), 1.0);
         assert_eq!(inv.gain(4.0), 0.25);
-        let lin = DistanceParams { min: 1.0, max: 5.0, rolloff: 1.0, model: DistanceModel::Linear };
+        let lin = DistanceParams {
+            min: 1.0,
+            max: 5.0,
+            rolloff: 1.0,
+            model: DistanceModel::Linear,
+        };
         assert_eq!(lin.gain(3.0), 0.5);
         assert_eq!(lin.gain(9.0), 0.0);
-        let reference = DistanceParams { min: 2.0, max: 0.0, rolloff: 5.0, model: DistanceModel::Reference };
+        let reference = DistanceParams {
+            min: 2.0,
+            max: 0.0,
+            rolloff: 5.0,
+            model: DistanceModel::Reference,
+        };
         assert!((reference.gain(4.0) - 0.5).abs() < 1e-6);
-        assert!((reference.gain(1000.0) - 0.2).abs() < 1e-6, "floored at 1/rolloff");
+        assert!(
+            (reference.gain(1000.0) - 0.2).abs() < 1e-6,
+            "floored at 1/rolloff"
+        );
         let d = EffectDesc::distance(1.0, 10.0, 2.0, DistanceModel::Linear);
         assert_eq!(DistanceParams::from_desc(&d).model, DistanceModel::Linear);
-        let none = DistanceParams { min: 1.0, max: 0.0, rolloff: 1.0, model: DistanceModel::None };
+        let none = DistanceParams {
+            min: 1.0,
+            max: 0.0,
+            rolloff: 1.0,
+            model: DistanceModel::None,
+        };
         assert_eq!(none.gain(0.5), 1.0);
         assert_eq!(none.gain(500.0), 1.0, "none: the mod owns distance gain");
-        let none_capped = DistanceParams { min: 1.0, max: 20.0, rolloff: 1.0, model: DistanceModel::None };
+        let none_capped = DistanceParams {
+            min: 1.0,
+            max: 20.0,
+            rolloff: 1.0,
+            model: DistanceModel::None,
+        };
         assert_eq!(none_capped.gain(19.0), 1.0);
         assert_eq!(none_capped.gain(25.0), 0.0, "max still culls");
-        assert_eq!(DistanceParams::from_desc(&EffectDesc::distance(1.0, 0.0, 0.0, DistanceModel::None)).model, DistanceModel::None);
+        assert_eq!(
+            DistanceParams::from_desc(&EffectDesc::distance(1.0, 0.0, 0.0, DistanceModel::None))
+                .model,
+            DistanceModel::None
+        );
     }
 
     #[test]
     fn config_nodes_are_reported_and_skipped() {
-        let chain = Chain::new(&[EffectDesc::distance(1.0, 0.0, 1.0, DistanceModel::Inverse), EffectDesc::gain(0.5)], 48000.0, 1, 64);
+        let chain = Chain::new(
+            &[
+                EffectDesc::distance(1.0, 0.0, 1.0, DistanceModel::Inverse),
+                EffectDesc::gain(0.5),
+            ],
+            48000.0,
+            1,
+            64,
+        );
         assert_eq!(chain.distance().unwrap().min, 1.0);
         assert!(chain.spatializer().is_none());
     }

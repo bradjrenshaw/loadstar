@@ -54,7 +54,11 @@ pub struct Selection {
 
 impl Selection {
     pub const fn none(category: u32) -> Selection {
-        Selection { entity_id: 0, category, index: 0 }
+        Selection {
+            entity_id: 0,
+            category,
+            index: 0,
+        }
     }
 }
 
@@ -70,7 +74,12 @@ pub struct Tracker {
 
 impl Tracker {
     pub fn new(filters: Vec<FilterEntry>, include_all: bool) -> Tracker {
-        Tracker { filters, include_all, category: None, selected: None }
+        Tracker {
+            filters,
+            include_all,
+            category: None,
+            selected: None,
+        }
     }
 
     pub fn set_filter_enabled(&mut self, index: usize, enabled: bool) -> bool {

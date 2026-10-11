@@ -11,7 +11,11 @@ pub fn lateral(right: f32, forward: f32, pan_width: f32, exponent: f32) -> f32 {
         return 0.0;
     }
     let lat = (right / dist.max(pan_width.max(1e-4))).clamp(-1.0, 1.0);
-    if lat == 0.0 { 0.0 } else { lat.signum() * lat.abs().powf(exponent.max(0.05)) }
+    if lat == 0.0 {
+        0.0
+    } else {
+        lat.signum() * lat.abs().powf(exponent.max(0.05))
+    }
 }
 
 /// Constant-power stereo gains with the interaural level difference capped at `ild_cap_db`
@@ -52,7 +56,10 @@ mod tests {
             assert!((l * l + r * r - 1.0).abs() < 1e-5, "power at {lat}");
         }
         let (l, r) = pan_gains(1.0, 12.0);
-        assert!((20.0 * (r / l).log10() - 12.0).abs() < 1e-3, "hard right = exactly the cap");
+        assert!(
+            (20.0 * (r / l).log10() - 12.0).abs() < 1e-3,
+            "hard right = exactly the cap"
+        );
         assert!(l > 0.2, "far ear keeps signal: {l}");
         let (l, r) = pan_gains(0.0, 12.0);
         assert!((l - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5 && (l - r).abs() < 1e-6);
@@ -63,18 +70,36 @@ mod tests {
     #[test]
     fn lateral_uses_absolute_offset_near_and_bearing_far() {
         assert_eq!(lateral(0.0, 0.0, 1.0, 1.0), 0.0);
-        assert!((lateral(0.5, 0.0, 2.0, 1.0) - 0.25).abs() < 1e-6, "inside pan width: offset / width");
-        assert!((lateral(10.0, 0.0, 2.0, 1.0) - 1.0).abs() < 1e-6, "far to the right: hard right");
-        assert!((lateral(5.0, 5.0, 1.0, 1.0) - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5, "45°: pure bearing");
-        assert!(lateral(0.25, 0.0, 1.0, 0.82) > 0.25, "exponent < 1 expands the centre");
-        assert!((lateral(1.0, 0.0, 1.0, 0.82) - 1.0).abs() < 1e-6, "extremes unchanged");
+        assert!(
+            (lateral(0.5, 0.0, 2.0, 1.0) - 0.25).abs() < 1e-6,
+            "inside pan width: offset / width"
+        );
+        assert!(
+            (lateral(10.0, 0.0, 2.0, 1.0) - 1.0).abs() < 1e-6,
+            "far to the right: hard right"
+        );
+        assert!(
+            (lateral(5.0, 5.0, 1.0, 1.0) - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5,
+            "45°: pure bearing"
+        );
+        assert!(
+            lateral(0.25, 0.0, 1.0, 0.82) > 0.25,
+            "exponent < 1 expands the centre"
+        );
+        assert!(
+            (lateral(1.0, 0.0, 1.0, 0.82) - 1.0).abs() < 1e-6,
+            "extremes unchanged"
+        );
     }
 
     #[test]
     fn itd_is_monotonic_signed_and_bounded() {
         let rate = 48000.0;
         let max = itd_samples(1.0, 0.66, rate);
-        assert!((max - 31.68).abs() < 0.1, "0.66 ms at 48 kHz ≈ 31.7 samples: {max}");
+        assert!(
+            (max - 31.68).abs() < 0.1,
+            "0.66 ms at 48 kHz ≈ 31.7 samples: {max}"
+        );
         let mut prev = 0.0;
         for i in 1..=10 {
             let v = itd_samples(i as f32 / 10.0, 0.66, rate);

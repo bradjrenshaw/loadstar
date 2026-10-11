@@ -25,14 +25,26 @@ struct Shelf {
 
 impl Shelf {
     fn new() -> Shelf {
-        Shelf { filter: Biquad::identity(), db: 0.0, corner: 0.0 }
+        Shelf {
+            filter: Biquad::identity(),
+            db: 0.0,
+            corner: 0.0,
+        }
     }
 
     /// Move halfway to the target once per block; retune only when it matters.
     fn approach(&mut self, rate: f32, corner: f32, target_db: f32, prime: bool) {
-        let next = if prime { target_db } else { self.db + (target_db - self.db) * 0.5 };
+        let next = if prime {
+            target_db
+        } else {
+            self.db + (target_db - self.db) * 0.5
+        };
         if prime || (next - self.db).abs() > 0.05 || (corner - self.corner).abs() > 1.0 {
-            self.db = if (next - target_db).abs() < 0.05 { target_db } else { next };
+            self.db = if (next - target_db).abs() < 0.05 {
+                target_db
+            } else {
+                next
+            };
             self.corner = corner;
             self.filter.set_highshelf(rate, corner, self.db);
         }
@@ -78,12 +90,24 @@ impl HeadVoice {
         }
         let lat = pan::lateral(p.right, p.forward, p.pan_width, params.pan_exponent);
         let (l, r) = pan::pan_gains(lat, params.ild_cap_db);
-        let itd = if params.has(flags::ITD) { pan::itd_samples(lat, params.itd_max_ms, self.rate) } else { 0.0 };
-        let shadow = if params.has(flags::SHADOW) { -params.shadow_max_db * lat.abs() } else { 0.0 };
+        let itd = if params.has(flags::ITD) {
+            pan::itd_samples(lat, params.itd_max_ms, self.rate)
+        } else {
+            0.0
+        };
+        let shadow = if params.has(flags::SHADOW) {
+            -params.shadow_max_db * lat.abs()
+        } else {
+            0.0
+        };
         let horizontal = (p.right * p.right + p.forward * p.forward).sqrt();
         let rear = if params.has(flags::REAR) && horizontal > 1e-4 {
             let forward_frac = (p.forward / horizontal).clamp(-1.0, 1.0);
-            if forward_frac < 0.0 { params.rear_max_db * forward_frac } else { 0.0 }
+            if forward_frac < 0.0 {
+                params.rear_max_db * forward_frac
+            } else {
+                0.0
+            }
         } else {
             0.0
         };
@@ -97,7 +121,13 @@ impl HeadVoice {
 }
 
 impl VoiceRenderer for HeadVoice {
-    fn process(&mut self, mono: &[f32], placement: &Placement, params: &SpatializerParams, out: &mut [f32]) {
+    fn process(
+        &mut self,
+        mono: &[f32],
+        placement: &Placement,
+        params: &SpatializerParams,
+        out: &mut [f32],
+    ) {
         let frames = mono.len().min(out.len() / 2);
         if frames == 0 {
             return;
@@ -114,8 +144,10 @@ impl VoiceRenderer for HeadVoice {
             self.gain_r.set_target(gr);
             self.itd.set_target(itd);
         }
-        self.rear.approach(self.rate, params.rear_corner_hz, rear_db, prime);
-        self.shadow.approach(self.rate, params.shadow_corner_hz, shadow_db, prime);
+        self.rear
+            .approach(self.rate, params.rear_corner_hz, rear_db, prime);
+        self.shadow
+            .approach(self.rate, params.shadow_corner_hz, shadow_db, prime);
         self.elevation.approach(self.rate, 4000.0, elev_db, prime);
 
         let (l0, ls) = self.gain_l.block(frames);
@@ -128,9 +160,15 @@ impl VoiceRenderer for HeadVoice {
             let itd = d0 + ds * i as f32;
 
             // Whole-source cues first (mono): rear darkening, elevation tilt.
-            let m = self.elevation.filter.process(self.rear.filter.process(mono[i]));
+            let m = self
+                .elevation
+                .filter
+                .process(self.rear.filter.process(mono[i]));
             // Far ear: delayed, then head-shadowed. The near ear is the undelayed signal.
-            let far = self.shadow.filter.process(self.delay.push_read(m, itd.abs()));
+            let far = self
+                .shadow
+                .filter
+                .process(self.delay.push_read(m, itd.abs()));
             let near = m;
             // Positive ITD = source on the right = the left ear is the far one. When the sign
             // flips mid-flight the roles swap at itd ≈ 0 with equal gains and ~0 dB shadow.
@@ -189,7 +227,14 @@ mod tests {
 
     fn channel_rms(stereo: &[f32], channel: usize) -> f32 {
         let n = stereo.len() / 2;
-        (stereo.iter().skip(channel).step_by(2).map(|s| s * s).sum::<f32>() / n as f32).sqrt()
+        (stereo
+            .iter()
+            .skip(channel)
+            .step_by(2)
+            .map(|s| s * s)
+            .sum::<f32>()
+            / n as f32)
+            .sqrt()
     }
 
     #[test]
@@ -220,12 +265,18 @@ mod tests {
         let mut v = HeadVoice::new(RATE);
         let behind = render(&mut v, &place(0.0, -5.0), 8000.0, 8);
         let (a, b) = (channel_rms(&ahead, 0), channel_rms(&behind, 0));
-        assert!(b < a * 0.5, "8 kHz behind is at least ~6 dB down: ahead={a} behind={b}");
+        assert!(
+            b < a * 0.5,
+            "8 kHz behind is at least ~6 dB down: ahead={a} behind={b}"
+        );
         let mut v = HeadVoice::new(RATE);
         let ahead_low = render(&mut v, &place(0.0, 5.0), 200.0, 8);
         let mut v = HeadVoice::new(RATE);
         let behind_low = render(&mut v, &place(0.0, -5.0), 200.0, 8);
-        assert!((channel_rms(&ahead_low, 0) - channel_rms(&behind_low, 0)).abs() < 0.05, "lows pass the rear shelf");
+        assert!(
+            (channel_rms(&ahead_low, 0) - channel_rms(&behind_low, 0)).abs() < 0.05,
+            "lows pass the rear shelf"
+        );
     }
 
     #[test]
@@ -236,10 +287,17 @@ mod tests {
         mono[10] = 1.0;
         let mut out = vec![0.0; BLOCK * 2];
         v.process(&mono, &place(5.0, 0.0), &params, &mut out);
-        let right_peak = (0..BLOCK).max_by(|&a, &b| out[2 * a + 1].partial_cmp(&out[2 * b + 1]).unwrap()).unwrap();
-        let left_peak = (0..BLOCK).max_by(|&a, &b| out[2 * a].partial_cmp(&out[2 * b]).unwrap()).unwrap();
+        let right_peak = (0..BLOCK)
+            .max_by(|&a, &b| out[2 * a + 1].partial_cmp(&out[2 * b + 1]).unwrap())
+            .unwrap();
+        let left_peak = (0..BLOCK)
+            .max_by(|&a, &b| out[2 * a].partial_cmp(&out[2 * b]).unwrap())
+            .unwrap();
         assert_eq!(right_peak, 10, "near ear undelayed");
-        assert!(left_peak >= 40 && left_peak <= 43, "far ear lags ~31.7 samples: {left_peak}");
+        assert!(
+            left_peak >= 40 && left_peak <= 43,
+            "far ear lags ~31.7 samples: {left_peak}"
+        );
     }
 
     #[test]
@@ -264,7 +322,11 @@ mod tests {
                 for c in 0..2 {
                     let s = out[2 * i + c];
                     if step > 0 || i > 0 {
-                        assert!((s - prev[c]).abs() < 0.08, "jump at block {step} sample {i} ch {c}: {} -> {s}", prev[c]);
+                        assert!(
+                            (s - prev[c]).abs() < 0.08,
+                            "jump at block {step} sample {i} ch {c}: {} -> {s}",
+                            prev[c]
+                        );
                     }
                     prev[c] = s;
                 }
@@ -275,11 +337,17 @@ mod tests {
     #[test]
     fn relative_and_inside_placements_are_centred_or_panned_plainly() {
         let mut v = HeadVoice::new(RATE);
-        let inside = Placement { inside: true, ..place(3.0, 0.0) };
+        let inside = Placement {
+            inside: true,
+            ..place(3.0, 0.0)
+        };
         let out = render(&mut v, &inside, 440.0, 4);
         assert!((channel_rms(&out, 0) - channel_rms(&out, 1)).abs() < 1e-3);
         let mut v = HeadVoice::new(RATE);
         let out = render(&mut v, &Placement::relative(1.0), 440.0, 4);
-        assert!(channel_rms(&out, 0) < 1e-3 && channel_rms(&out, 1) > 0.5, "hard right, no cap for relative sources");
+        assert!(
+            channel_rms(&out, 0) < 1e-3 && channel_rms(&out, 1) > 0.5,
+            "hard right, no cap for relative sources"
+        );
     }
 }

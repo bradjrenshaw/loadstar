@@ -21,7 +21,12 @@ pub struct EngineConfig {
 
 impl Default for EngineConfig {
     fn default() -> Self {
-        EngineConfig { sample_rate: 48000, block_frames: 128, master_gain: 1.0, voice_cap: 64 }
+        EngineConfig {
+            sample_rate: 48000,
+            block_frames: 128,
+            master_gain: 1.0,
+            voice_cap: 64,
+        }
     }
 }
 
@@ -38,7 +43,15 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(cfg: EngineConfig) -> Engine {
-        let cfg = EngineConfig { block_frames: cfg.block_frames.max(1), voice_cap: if cfg.voice_cap == 0 { 64 } else { cfg.voice_cap }, ..cfg };
+        let cfg = EngineConfig {
+            block_frames: cfg.block_frames.max(1),
+            voice_cap: if cfg.voice_cap == 0 {
+                64
+            } else {
+                cfg.voice_cap
+            },
+            ..cfg
+        };
         Engine {
             cfg,
             spaces: Vec::with_capacity(8),
@@ -55,7 +68,9 @@ impl Engine {
     }
 
     fn space_mut(&mut self, id: u32) -> Option<&mut Space> {
-        self.spaces.get_mut(id as usize).and_then(|s| s.as_deref_mut())
+        self.spaces
+            .get_mut(id as usize)
+            .and_then(|s| s.as_deref_mut())
     }
 
     fn chain_mut(&mut self, target: ChainTarget) -> Option<&mut Chain> {
@@ -63,7 +78,9 @@ impl Engine {
             ChainTarget::Master => Some(&mut self.master),
             ChainTarget::Space(s) => self.space_mut(s).map(Space::chain_mut),
             ChainTarget::Bus(s, b) => self.space_mut(s).and_then(|sp| sp.bus_chain_mut(b)),
-            ChainTarget::Source(s, id, stage) => self.space_mut(s).and_then(|sp| sp.source_chain_mut(id, stage)),
+            ChainTarget::Source(s, id, stage) => self
+                .space_mut(s)
+                .and_then(|sp| sp.source_chain_mut(id, stage)),
         }
     }
 
@@ -87,7 +104,11 @@ impl Engine {
                     }
                 }
             }
-            Command::SpaceDestroy(id) => self.spaces.get_mut(id as usize).and_then(Option::take).map(|s| Garbage::Any(s)),
+            Command::SpaceDestroy(id) => self
+                .spaces
+                .get_mut(id as usize)
+                .and_then(Option::take)
+                .map(|s| Garbage::Any(s)),
             Command::SpaceGain { space, gain } => {
                 if let Some(s) = self.space_mut(space) {
                     s.set_gain(gain);
@@ -156,13 +177,22 @@ impl Engine {
                 }
                 Some(Garbage::Any(chain))
             }
-            Command::SetEffectParam { target, index, param, value } => {
+            Command::SetEffectParam {
+                target,
+                index,
+                param,
+                value,
+            } => {
                 if let Some(c) = self.chain_mut(target) {
                     c.set_param(index, param, value);
                 }
                 None
             }
-            Command::SetEffectEnabled { target, index, enabled } => {
+            Command::SetEffectEnabled {
+                target,
+                index,
+                enabled,
+            } => {
                 if let Some(c) = self.chain_mut(target) {
                     c.set_enabled(index, enabled);
                 }
@@ -175,7 +205,11 @@ impl Engine {
                 }
                 self.buffers[idx].replace(buffer).map(Garbage::Buffer)
             }
-            Command::BufferFree(id) => self.buffers.get_mut(id as usize).and_then(Option::take).map(Garbage::Buffer),
+            Command::BufferFree(id) => self
+                .buffers
+                .get_mut(id as usize)
+                .and_then(Option::take)
+                .map(Garbage::Buffer),
             Command::MasterGain(g) => {
                 self.master_gain.set_target(g);
                 None
@@ -237,7 +271,10 @@ impl Engine {
             return;
         }
         // Keep the highest priority, then loudest; steal the rest.
-        self.audible.sort_by(|a, b| b.2.cmp(&a.2).then(b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal)));
+        self.audible.sort_by(|a, b| {
+            b.2.cmp(&a.2)
+                .then(b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
+        });
         for &(si, vi, _, _) in &self.audible[self.cfg.voice_cap..] {
             if let Some(Some(s)) = self.spaces.get_mut(si as usize) {
                 s.steal(vi);
@@ -276,11 +313,20 @@ mod tests {
     use loadstar_core::geometry::{Bounds, Vec3};
 
     fn engine() -> Engine {
-        Engine::new(EngineConfig { voice_cap: 2, block_frames: 128, ..Default::default() })
+        Engine::new(EngineConfig {
+            voice_cap: 2,
+            block_frames: 128,
+            ..Default::default()
+        })
     }
 
     fn space(e: &Engine) -> Box<Space> {
-        Box::new(Space::new(SpaceConfig::default(), e.cfg.sample_rate as f32, e.cfg.block_frames, Box::new(HeadModel)))
+        Box::new(Space::new(
+            SpaceConfig::default(),
+            e.cfg.sample_rate as f32,
+            e.cfg.block_frames,
+            Box::new(HeadModel),
+        ))
     }
 
     fn energy(buf: &[f32]) -> f32 {
@@ -290,10 +336,21 @@ mod tests {
     #[test]
     fn voice_cap_keeps_the_highest_priority_voices() {
         let mut e = engine();
-        e.apply(Command::SpaceCreate { id: 0, space: space(&e) });
-        e.apply(Command::BufferAdd { id: 0, buffer: Arc::new(Buffer { samples: vec![0.5; 48000], rate: 48000 }) });
+        e.apply(Command::SpaceCreate {
+            id: 0,
+            space: space(&e),
+        });
+        e.apply(Command::BufferAdd {
+            id: 0,
+            buffer: Arc::new(Buffer {
+                samples: vec![0.5; 48000],
+                rate: 48000,
+            }),
+        });
         let at = |x: f32| Bounds::Point(Vec3::new(x, 0.0, -1.0));
-        let mut descs: Vec<SourceDesc> = (1..=3).map(|i| SourceDesc::buffer(i, 0, at(i as f32 - 2.0)).looping()).collect();
+        let mut descs: Vec<SourceDesc> = (1..=3)
+            .map(|i| SourceDesc::buffer(i, 0, at(i as f32 - 2.0)).looping())
+            .collect();
         descs[2].priority = 9;
         e.apply(Command::Sync { space: 0, descs });
         let mut out = vec![0.0; 256];
@@ -309,26 +366,50 @@ mod tests {
     #[test]
     fn master_gain_and_chain_apply_last_and_finished_ids_are_collected() {
         let mut e = Engine::new(EngineConfig::default());
-        e.apply(Command::SpaceCreate { id: 0, space: space(&e) });
-        e.apply(Command::BufferAdd { id: 0, buffer: Arc::new(Buffer { samples: vec![0.5; 128], rate: 48000 }) });
-        e.apply(Command::Fire { space: 0, desc: SourceDesc::buffer(5, 0, Bounds::Point(Vec3::new(0.0, 0.0, -1.0))) });
+        e.apply(Command::SpaceCreate {
+            id: 0,
+            space: space(&e),
+        });
+        e.apply(Command::BufferAdd {
+            id: 0,
+            buffer: Arc::new(Buffer {
+                samples: vec![0.5; 128],
+                rate: 48000,
+            }),
+        });
+        e.apply(Command::Fire {
+            space: 0,
+            desc: SourceDesc::buffer(5, 0, Bounds::Point(Vec3::new(0.0, 0.0, -1.0))),
+        });
         e.apply(Command::MasterGain(0.0));
         let mut out = vec![0.0; 256];
         e.process(&mut out);
-        assert!(energy(&out) < energy(&vec![0.5; 256]) * 0.5, "master ramping to 0 within the block");
+        assert!(
+            energy(&out) < energy(&vec![0.5; 256]) * 0.5,
+            "master ramping to 0 within the block"
+        );
         e.process(&mut out);
         assert_eq!(e.take_finished(), vec![(0, 5)]);
         let garbage = e.apply(Command::SpaceDestroy(0));
-        assert!(garbage.is_some(), "displaced state comes back to be dropped on the game thread");
+        assert!(
+            garbage.is_some(),
+            "displaced state comes back to be dropped on the game thread"
+        );
     }
 
     #[test]
     fn displaced_chains_travel_back_in_their_own_box_and_voice_garbage_drains() {
         let mut e = Engine::new(EngineConfig::default());
-        e.run(Command::SpaceCreate { id: 0, space: space(&e) });
+        e.run(Command::SpaceCreate {
+            id: 0,
+            space: space(&e),
+        });
         let chain = Box::new(Chain::empty(48000.0, 2, 128));
         let addr = &*chain as *const Chain;
-        e.run(Command::SetChain { target: ChainTarget::Master, chain });
+        e.run(Command::SetChain {
+            target: ChainTarget::Master,
+            chain,
+        });
         let mut got = Vec::new();
         e.drain_garbage(|g| {
             got.push(g);
@@ -336,12 +417,25 @@ mod tests {
         });
         assert_eq!(got.len(), 1);
         match &got[0] {
-            Garbage::Any(b) => assert_eq!(b.downcast_ref::<Chain>().map(|c| c as *const Chain), Some(addr), "the incoming box carries the old chain out"),
+            Garbage::Any(b) => assert_eq!(
+                b.downcast_ref::<Chain>().map(|c| c as *const Chain),
+                Some(addr),
+                "the incoming box carries the old chain out"
+            ),
             _ => panic!("expected a boxed chain"),
         }
         // A fired voice's buffer reference surfaces through the same drain.
-        e.run(Command::BufferAdd { id: 0, buffer: Arc::new(Buffer { samples: vec![0.5; 128], rate: 48000 }) });
-        e.run(Command::Fire { space: 0, desc: SourceDesc::buffer(5, 0, Bounds::Point(Vec3::new(0.0, 0.0, -1.0))) });
+        e.run(Command::BufferAdd {
+            id: 0,
+            buffer: Arc::new(Buffer {
+                samples: vec![0.5; 128],
+                rate: 48000,
+            }),
+        });
+        e.run(Command::Fire {
+            space: 0,
+            desc: SourceDesc::buffer(5, 0, Bounds::Point(Vec3::new(0.0, 0.0, -1.0))),
+        });
         let mut out = vec![0.0; 256];
         e.process(&mut out);
         e.process(&mut out);

@@ -241,6 +241,9 @@ public sealed class AudioDevice : IDisposable
 
     private AudioDevice(AudioDeviceHandle h) => _h = h;
 
+    /// <summary>The native handle, for sibling surfaces (speech's positional calls).</summary>
+    internal AudioDeviceHandle Handle => _h;
+
     /// <summary>Open the default output (WASAPI shared mode). Throws <see cref="LoadstarException"/>
     /// with <see cref="Status.DeviceUnavailable"/> if there is none.</summary>
     public static AudioDevice Open(DeviceConfig? config = null)

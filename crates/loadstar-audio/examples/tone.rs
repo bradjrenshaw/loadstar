@@ -36,14 +36,26 @@ fn main() {
             })
             .collect();
         let tone = d.buffer_create(&ping, 1, rate).unwrap();
-        d.set_listener(space, Vec3::default(), Vec3::new(0.0, 0.0, -1.0), Vec3::new(0.0, 1.0, 0.0)).unwrap();
+        d.set_listener(
+            space,
+            Vec3::default(),
+            Vec3::new(0.0, 0.0, -1.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        )
+        .unwrap();
 
         // A looping beacon circling the listener at 3 m over 6 seconds, ahead → right → behind → left.
         let steps = 120;
         for i in 0..steps {
             let a = i as f32 / steps as f32 * std::f32::consts::TAU;
             let pos = Vec3::new(3.0 * a.sin(), 0.0, -3.0 * a.cos());
-            d.sync(space, &[SourceDesc::buffer(1, tone, Bounds::Point(pos)).repeats(0, 180.0).with_gain(0.5)]).unwrap();
+            d.sync(
+                space,
+                &[SourceDesc::buffer(1, tone, Bounds::Point(pos))
+                    .repeats(0, 180.0)
+                    .with_gain(0.5)],
+            )
+            .unwrap();
             if i % 30 == 0 {
                 println!("{}", ["ahead", "right", "behind", "left"][i / 30]);
             }

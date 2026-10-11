@@ -12,13 +12,18 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(feature = "audio")]
 pub mod audio;
 
-use loadstar_core::context::{GoalMode as CoreGoalMode, PathOptions as CorePathOptions, Profile, TileContext};
+#[cfg(feature = "speech")]
+pub mod speech;
+
+use loadstar_core::context::{
+    GoalMode as CoreGoalMode, PathOptions as CorePathOptions, Profile, TileContext,
+};
 use loadstar_core::entities::{Entity, SyncStats as CoreSyncStats};
-use loadstar_core::tracker::{Action as CoreAction, Filter, FilterEntry, Tracker};
 use loadstar_core::geometry::Bounds;
+pub use loadstar_core::geometry::Vec3;
 use loadstar_core::graph::LinkId;
 use loadstar_core::tile::{Dir, EdgeOverride, GridError, Link, Segment, TileGrid};
-pub use loadstar_core::geometry::Vec3;
+use loadstar_core::tracker::{Action as CoreAction, Filter, FilterEntry, Tracker};
 
 /// Bumped only on breaking ABI changes. Companions check this via [`ls_abi_version`] at load.
 const ABI_VERSION: u32 = 1;
@@ -38,6 +43,10 @@ pub enum Status {
     DeviceUnavailable = 5,
     /// The audio command queue is full — the mixer is not draining.
     Busy = 6,
+    /// Speech: the chosen voice is absent and `NoFallback` was set, or nothing at all can speak.
+    VoiceUnavailable = 7,
+    /// Speech: a feature the call needs is not in the resolved voice's set.
+    NotSupported = 8,
     /// Internal panic caught at the boundary. The context may be inconsistent; the host is intact.
     Panic = 100,
 }
@@ -114,8 +123,20 @@ pub struct PathSegment {
 impl From<Segment> for PathSegment {
     fn from(s: Segment) -> Self {
         match s {
-            Segment::Move { dir, count } => PathSegment { kind: 0, dir: dir as u32, count, _reserved: 0, link_id: 0 },
-            Segment::Link { link_id } => PathSegment { kind: 1, dir: 0, count: 0, _reserved: 0, link_id },
+            Segment::Move { dir, count } => PathSegment {
+                kind: 0,
+                dir: dir as u32,
+                count,
+                _reserved: 0,
+                link_id: 0,
+            },
+            Segment::Link { link_id } => PathSegment {
+                kind: 1,
+                dir: 0,
+                count: 0,
+                _reserved: 0,
+                link_id,
+            },
         }
     }
 }
@@ -151,7 +172,12 @@ impl PathOptions {
             1 => CoreGoalMode::Adjacent,
             _ => return None,
         };
-        Some(CorePathOptions { blocked_mask: self.blocked_mask, snap_radius: self.snap_radius, goal_mode, profile: self.profile })
+        Some(CorePathOptions {
+            blocked_mask: self.blocked_mask,
+            snap_radius: self.snap_radius,
+            goal_mode,
+            profile: self.profile,
+        })
     }
 }
 
@@ -203,10 +229,20 @@ impl BoundsDesc {
                 row: self.a.z as u32,
                 width: self.b.x as u32,
                 height: self.b.z as u32,
-                layer: if self.layer == u32::MAX { None } else { Some(self.layer) },
+                layer: if self.layer == u32::MAX {
+                    None
+                } else {
+                    Some(self.layer)
+                },
             },
-            2 => Bounds::Box { center: self.a, extents: self.b },
-            3 => Bounds::Sphere { center: self.a, radius: self.b.x },
+            2 => Bounds::Box {
+                center: self.a,
+                extents: self.b,
+            },
+            3 => Bounds::Sphere {
+                center: self.a,
+                radius: self.b.x,
+            },
             _ => return None,
         })
     }
@@ -311,13 +347,24 @@ pub struct FilterDesc {
 impl FilterDesc {
     fn to_core(self) -> Option<FilterEntry> {
         let filter = match self.kind {
-            0 => Filter::Reachable { profile: self.p0, blocked_mask: self.p1 },
-            1 => Filter::Range { max_distance: self.value },
+            0 => Filter::Reachable {
+                profile: self.p0,
+                blocked_mask: self.p1,
+            },
+            1 => Filter::Range {
+                max_distance: self.value,
+            },
             2 => Filter::Categories { mask: self.mask },
-            3 => Filter::Flags { require: self.p0, forbid: self.p1 },
+            3 => Filter::Flags {
+                require: self.p0,
+                forbid: self.p1,
+            },
             _ => return None,
         };
-        Some(FilterEntry { filter, enabled: self.enabled != 0 })
+        Some(FilterEntry {
+            filter,
+            enabled: self.enabled != 0,
+        })
     }
 }
 
@@ -352,12 +399,20 @@ fn parse_filters(filters: *const FilterDesc, len: usize) -> Option<Vec<FilterEnt
         return None;
     }
     // SAFETY: non-null checked; caller guarantees `filters` is readable for `len` entries.
-    unsafe { std::slice::from_raw_parts(filters, len) }.iter().map(|f| f.to_core()).collect()
+    unsafe { std::slice::from_raw_parts(filters, len) }
+        .iter()
+        .map(|f| f.to_core())
+        .collect()
 }
 
 impl From<CoreSyncStats> for SyncStats {
     fn from(s: CoreSyncStats) -> Self {
-        SyncStats { added: s.added, updated: s.updated, removed: s.removed, _reserved: 0 }
+        SyncStats {
+            added: s.added,
+            updated: s.updated,
+            removed: s.removed,
+            _reserved: 0,
+        }
     }
 }
 
@@ -445,15 +500,30 @@ pub extern "C" fn ls_tile_context_create_edges(
         // SAFETY: non-null checked; caller guarantees both arrays are readable for their
         // stated lengths for the duration of this call.
         let masks = unsafe { std::slice::from_raw_parts(masks, masks_len) };
-        let overrides: &[TileEdgeOverride] =
-            if overrides_len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(overrides, overrides_len) } };
+        let overrides: &[TileEdgeOverride] = if overrides_len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(overrides, overrides_len) }
+        };
 
         let mut converted = Vec::with_capacity(overrides.len());
         for ov in overrides {
-            let Some(dir) = Dir::from_u8(ov.dir) else { return Status::InvalidArgument };
-            converted.push((ov.node, dir, EdgeOverride { target_layer: ov.target_layer, cost: ov.cost }));
+            let Some(dir) = Dir::from_u8(ov.dir) else {
+                return Status::InvalidArgument;
+            };
+            converted.push((
+                ov.node,
+                dir,
+                EdgeOverride {
+                    target_layer: ov.target_layer,
+                    cost: ov.cost,
+                },
+            ));
         }
-        finish_create(TileGrid::from_edges(width, height, layers, masks, &converted), out)
+        finish_create(
+            TileGrid::from_edges(width, height, layers, masks, &converted),
+            out,
+        )
     })
 }
 
@@ -487,7 +557,13 @@ pub extern "C" fn ls_context_destroy(ctx: *mut Context) {
 
 /// Node id for `(col, row, layer)`. `InvalidArgument` if outside the grid.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_node_id(ctx: *const Context, col: u32, row: u32, layer: u32, out: *mut u32) -> Status {
+pub extern "C" fn ls_node_id(
+    ctx: *const Context,
+    col: u32,
+    row: u32,
+    layer: u32,
+    out: *mut u32,
+) -> Status {
     guard(|| {
         if ctx.is_null() || out.is_null() {
             return Status::NullPointer;
@@ -520,7 +596,9 @@ pub extern "C" fn ls_node_coords(
         }
         // SAFETY: non-null checked; a live context handle.
         let ctx = unsafe { &*ctx };
-        let Some((col, row, layer)) = ctx.0.grid().node_coords(node) else { return Status::InvalidArgument };
+        let Some((col, row, layer)) = ctx.0.grid().node_coords(node) else {
+            return Status::InvalidArgument;
+        };
         // SAFETY: each out-pointer is written only if non-null; caller guarantees writability.
         unsafe {
             if !out_col.is_null() {
@@ -603,12 +681,21 @@ fn with_grid(ctx: *mut Context, f: impl FnOnce(&mut TileGrid) -> Result<(), Grid
 /// Register an agent profile; `*out` receives its id for `PathOptions.profile`.
 /// `InvalidArgument` if the footprint is 0 or over 255.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_profile_register(ctx: *mut Context, profile: ProfileDesc, out: *mut u32) -> Status {
+pub extern "C" fn ls_profile_register(
+    ctx: *mut Context,
+    profile: ProfileDesc,
+    out: *mut u32,
+) -> Status {
     with_ctx_mut(ctx, |c| {
         if out.is_null() {
             return Status::NullPointer;
         }
-        let p = Profile { footprint: profile.footprint, radius: profile.radius, height: profile.height, step_height: profile.step_height };
+        let p = Profile {
+            footprint: profile.footprint,
+            radius: profile.radius,
+            height: profile.height,
+            step_height: profile.step_height,
+        };
         match c.register_profile(p) {
             // SAFETY: `out` non-null checked; caller guarantees it is writable.
             Some(id) => unsafe {
@@ -664,19 +751,37 @@ pub extern "C" fn ls_node_get_groups(ctx: *const Context, node: u32, out: *mut u
 /// Replace a node's groups.
 #[unsafe(no_mangle)]
 pub extern "C" fn ls_node_set_groups(ctx: *mut Context, node: u32, mask: u32) -> Status {
-    with_ctx_mut(ctx, |c| if c.set_groups(node, mask) { Status::Ok } else { Status::InvalidArgument })
+    with_ctx_mut(ctx, |c| {
+        if c.set_groups(node, mask) {
+            Status::Ok
+        } else {
+            Status::InvalidArgument
+        }
+    })
 }
 
 /// OR `mask` into a node's groups.
 #[unsafe(no_mangle)]
 pub extern "C" fn ls_node_add_groups(ctx: *mut Context, node: u32, mask: u32) -> Status {
-    with_ctx_mut(ctx, |c| if c.add_groups(node, mask) { Status::Ok } else { Status::InvalidArgument })
+    with_ctx_mut(ctx, |c| {
+        if c.add_groups(node, mask) {
+            Status::Ok
+        } else {
+            Status::InvalidArgument
+        }
+    })
 }
 
 /// Clear `mask` bits from a node's groups.
 #[unsafe(no_mangle)]
 pub extern "C" fn ls_node_remove_groups(ctx: *mut Context, node: u32, mask: u32) -> Status {
-    with_ctx_mut(ctx, |c| if c.remove_groups(node, mask) { Status::Ok } else { Status::InvalidArgument })
+    with_ctx_mut(ctx, |c| {
+        if c.remove_groups(node, mask) {
+            Status::Ok
+        } else {
+            Status::InvalidArgument
+        }
+    })
 }
 
 /// Clear `mask` bits from every node.
@@ -690,7 +795,12 @@ pub extern "C" fn ls_groups_clear(ctx: *mut Context, mask: u32) -> Status {
 
 /// Open or close one directed edge (`node` leaving in `dir`). The reverse edge is untouched.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_tile_set_edge(ctx: *mut Context, node: u32, dir: u8, passable: bool) -> Status {
+pub extern "C" fn ls_tile_set_edge(
+    ctx: *mut Context,
+    node: u32,
+    dir: u8,
+    passable: bool,
+) -> Status {
     with_grid(ctx, |g| {
         let dir = Dir::from_u8(dir).ok_or(GridError::InvalidNode(node))?;
         g.set_edge(node, dir, passable)
@@ -699,7 +809,13 @@ pub extern "C" fn ls_tile_set_edge(ctx: *mut Context, node: u32, dir: u8, passab
 
 /// Set the layer/cost override for one directed edge (ramps, terrain costs).
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_tile_set_edge_override(ctx: *mut Context, node: u32, dir: u8, target_layer: u32, cost: f32) -> Status {
+pub extern "C" fn ls_tile_set_edge_override(
+    ctx: *mut Context,
+    node: u32,
+    dir: u8,
+    target_layer: u32,
+    cost: f32,
+) -> Status {
     with_grid(ctx, |g| {
         let dir = Dir::from_u8(dir).ok_or(GridError::InvalidNode(node))?;
         g.set_edge_override(node, dir, EdgeOverride { target_layer, cost })
@@ -720,8 +836,12 @@ pub extern "C" fn ls_tile_clear_edge_override(ctx: *mut Context, node: u32, dir:
 #[unsafe(no_mangle)]
 pub extern "C" fn ls_link_add(ctx: *mut Context, link: LinkDesc) -> Status {
     with_grid(ctx, |g| {
-        let from = g.node_from_position(link.from).ok_or(GridError::InvalidNode(u32::MAX))?;
-        let to = g.node_from_position(link.to).ok_or(GridError::InvalidNode(u32::MAX))?;
+        let from = g
+            .node_from_position(link.from)
+            .ok_or(GridError::InvalidNode(u32::MAX))?;
+        let to = g
+            .node_from_position(link.to)
+            .ok_or(GridError::InvalidNode(u32::MAX))?;
         g.add_link(
             link.id,
             Link {
@@ -772,7 +892,13 @@ pub extern "C" fn ls_entity_upsert(ctx: *mut Context, entity: *const EntityDesc)
 /// Remove an entity. `InvalidArgument` if the id is unknown.
 #[unsafe(no_mangle)]
 pub extern "C" fn ls_entity_remove(ctx: *mut Context, id: u64) -> Status {
-    with_ctx_mut(ctx, |c| if c.remove_entity(id) { Status::Ok } else { Status::InvalidArgument })
+    with_ctx_mut(ctx, |c| {
+        if c.remove_entity(id) {
+            Status::Ok
+        } else {
+            Status::InvalidArgument
+        }
+    })
 }
 
 /// Declarative snapshot sync (spec §5): upsert every record, remove every entity absent
@@ -790,10 +916,16 @@ pub extern "C" fn ls_entities_sync(
             return Status::NullPointer;
         }
         // SAFETY: non-null checked; caller guarantees `entities` is readable for `entities_len`.
-        let descs: &[EntityDesc] = if entities_len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(entities, entities_len) } };
+        let descs: &[EntityDesc] = if entities_len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(entities, entities_len) }
+        };
         let mut converted = Vec::with_capacity(descs.len());
         for d in descs {
-            let Some(e) = d.to_core() else { return Status::InvalidArgument };
+            let Some(e) = d.to_core() else {
+                return Status::InvalidArgument;
+            };
             converted.push(e);
         }
         let result: SyncStats = c.sync_entities(&converted).into();
@@ -818,7 +950,13 @@ pub extern "C" fn ls_entity_count(ctx: *const Context) -> usize {
 /// Nodes an entity occupies (its bounds projected through the grid). Same buffer convention
 /// as [`ls_path_nodes`]. `InvalidArgument` for an unknown id; an off-grid entity writes zero.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_entity_nodes(ctx: *const Context, id: u64, out: *mut u32, capacity: usize, written: *mut usize) -> Status {
+pub extern "C" fn ls_entity_nodes(
+    ctx: *const Context,
+    id: u64,
+    out: *mut u32,
+    capacity: usize,
+    written: *mut usize,
+) -> Status {
     guard(|| {
         if ctx.is_null() {
             return Status::NullPointer;
@@ -833,7 +971,12 @@ pub extern "C" fn ls_entity_nodes(ctx: *const Context, id: u64, out: *mut u32, c
 
 /// Closest point of an entity's bounds to `from` — pure geometry, no map involved.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_entity_nearest_point(ctx: *const Context, id: u64, from: Vec3, out: *mut Vec3) -> Status {
+pub extern "C" fn ls_entity_nearest_point(
+    ctx: *const Context,
+    id: u64,
+    from: Vec3,
+    out: *mut Vec3,
+) -> Status {
     guard(|| {
         if ctx.is_null() || out.is_null() {
             return Status::NullPointer;
@@ -853,12 +996,20 @@ pub extern "C" fn ls_entity_nearest_point(ctx: *const Context, id: u64, from: Ve
 /// Path to an entity. Goal mode comes from the entity's `PathfindAdjacent` flag, not `opts`.
 /// `InvalidArgument` for an unknown id; otherwise the [`ls_find_path`] result convention.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_find_path_to_entity(ctx: *const Context, start: Vec3, id: u64, opts: PathOptions, out: *mut *mut Path) -> Status {
+pub extern "C" fn ls_find_path_to_entity(
+    ctx: *const Context,
+    start: Vec3,
+    id: u64,
+    opts: PathOptions,
+    out: *mut *mut Path,
+) -> Status {
     guard(|| {
         if ctx.is_null() || out.is_null() {
             return Status::NullPointer;
         }
-        let Some(opts) = opts.to_core() else { return Status::InvalidArgument };
+        let Some(opts) = opts.to_core() else {
+            return Status::InvalidArgument;
+        };
         // SAFETY: non-null checked; a live context handle.
         let ctx = unsafe { &*ctx };
         if ctx.0.entity(id).is_none() {
@@ -872,18 +1023,28 @@ pub extern "C" fn ls_find_path_to_entity(ctx: *const Context, start: Vec3, id: u
 /// from them, is reachable under `opts.blocked_mask`. Runs a fresh flood fill each call.
 /// `NoPath` if `start` is off-grid; `InvalidArgument` for an unknown id.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_entity_reachable(ctx: *const Context, start: Vec3, id: u64, opts: PathOptions, out: *mut bool) -> Status {
+pub extern "C" fn ls_entity_reachable(
+    ctx: *const Context,
+    start: Vec3,
+    id: u64,
+    opts: PathOptions,
+    out: *mut bool,
+) -> Status {
     guard(|| {
         if ctx.is_null() || out.is_null() {
             return Status::NullPointer;
         }
-        let Some(opts) = opts.to_core() else { return Status::InvalidArgument };
+        let Some(opts) = opts.to_core() else {
+            return Status::InvalidArgument;
+        };
         // SAFETY: non-null checked; a live context handle.
         let ctx = unsafe { &*ctx };
         if ctx.0.entity(id).is_none() {
             return Status::InvalidArgument;
         }
-        let Some(reached) = ctx.0.reachable(start, opts) else { return Status::NoPath };
+        let Some(reached) = ctx.0.reachable(start, opts) else {
+            return Status::NoPath;
+        };
         // SAFETY: `out` non-null checked; caller guarantees it is writable.
         unsafe { *out = ctx.0.entity_reachable(&reached, id).unwrap_or(false) };
         Status::Ok
@@ -931,7 +1092,13 @@ pub extern "C" fn ls_entity_vector(ctx: *const Context, id: u64, out: *mut Entit
 /// [`ls_entity_reachable`] from the player's position, using the reachability cache — cheap
 /// to call per announcement. `NoPath` if the player is off-grid.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_entity_reachable_from_player(ctx: *const Context, id: u64, profile: u32, blocked_mask: u32, out: *mut bool) -> Status {
+pub extern "C" fn ls_entity_reachable_from_player(
+    ctx: *const Context,
+    id: u64,
+    profile: u32,
+    blocked_mask: u32,
+    out: *mut bool,
+) -> Status {
     guard(|| {
         if ctx.is_null() || out.is_null() {
             return Status::NullPointer;
@@ -966,7 +1133,9 @@ pub extern "C" fn ls_tracker_create(
         if out.is_null() {
             return Status::NullPointer;
         }
-        let Some(filters) = parse_filters(filters, filters_len) else { return Status::InvalidArgument };
+        let Some(filters) = parse_filters(filters, filters_len) else {
+            return Status::InvalidArgument;
+        };
         let id = c.tracker_create(Tracker::new(filters, include_all));
         // SAFETY: `out` non-null checked; caller guarantees it is writable.
         unsafe { *out = id };
@@ -977,14 +1146,27 @@ pub extern "C" fn ls_tracker_create(
 /// Destroy a tracker. `InvalidArgument` if unknown.
 #[unsafe(no_mangle)]
 pub extern "C" fn ls_tracker_destroy(ctx: *mut Context, tracker: u32) -> Status {
-    with_ctx_mut(ctx, |c| if c.tracker_destroy(tracker) { Status::Ok } else { Status::InvalidArgument })
+    with_ctx_mut(ctx, |c| {
+        if c.tracker_destroy(tracker) {
+            Status::Ok
+        } else {
+            Status::InvalidArgument
+        }
+    })
 }
 
 /// Replace a tracker's filter list wholesale. The selection is re-validated on the next action.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_tracker_set_filters(ctx: *mut Context, tracker: u32, filters: *const FilterDesc, filters_len: usize) -> Status {
+pub extern "C" fn ls_tracker_set_filters(
+    ctx: *mut Context,
+    tracker: u32,
+    filters: *const FilterDesc,
+    filters_len: usize,
+) -> Status {
     with_ctx_mut(ctx, |c| {
-        let Some(filters) = parse_filters(filters, filters_len) else { return Status::InvalidArgument };
+        let Some(filters) = parse_filters(filters, filters_len) else {
+            return Status::InvalidArgument;
+        };
         match c.tracker_mut(tracker) {
             Some(t) => {
                 t.set_filters(filters);
@@ -997,10 +1179,19 @@ pub extern "C" fn ls_tracker_set_filters(ctx: *mut Context, tracker: u32, filter
 
 /// Enable or disable one filter by index (hotkey toggles).
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_tracker_set_filter_enabled(ctx: *mut Context, tracker: u32, index: usize, enabled: bool) -> Status {
+pub extern "C" fn ls_tracker_set_filter_enabled(
+    ctx: *mut Context,
+    tracker: u32,
+    index: usize,
+    enabled: bool,
+) -> Status {
     with_ctx_mut(ctx, |c| match c.tracker_mut(tracker) {
         Some(t) => {
-            if t.set_filter_enabled(index, enabled) { Status::Ok } else { Status::InvalidArgument }
+            if t.set_filter_enabled(index, enabled) {
+                Status::Ok
+            } else {
+                Status::InvalidArgument
+            }
         }
         None => Status::InvalidArgument,
     })
@@ -1008,7 +1199,12 @@ pub extern "C" fn ls_tracker_set_filter_enabled(ctx: *mut Context, tracker: u32,
 
 /// Drive a tracker. `action` is a `TrackerAction` discriminant.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_tracker_act(ctx: *mut Context, tracker: u32, action: u32, out: *mut Selection) -> Status {
+pub extern "C" fn ls_tracker_act(
+    ctx: *mut Context,
+    tracker: u32,
+    action: u32,
+    out: *mut Selection,
+) -> Status {
     with_ctx_mut(ctx, |c| {
         if out.is_null() {
             return Status::NullPointer;
@@ -1024,7 +1220,11 @@ pub extern "C" fn ls_tracker_act(ctx: *mut Context, tracker: u32, action: u32, o
         match c.tracker_act(tracker, action) {
             // SAFETY: `out` non-null checked; caller guarantees it is writable.
             Some(s) => unsafe {
-                *out = Selection { entity_id: s.entity_id, category: s.category, index: s.index };
+                *out = Selection {
+                    entity_id: s.entity_id,
+                    category: s.category,
+                    index: s.index,
+                };
                 Status::Ok
             },
             None => Status::InvalidArgument,
@@ -1034,7 +1234,12 @@ pub extern "C" fn ls_tracker_act(ctx: *mut Context, tracker: u32, action: u32, o
 
 /// Visible entity count under the tracker's filters, in `category` or (`UINT32_MAX`) all.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_tracker_count(ctx: *const Context, tracker: u32, category: u32, out: *mut u32) -> Status {
+pub extern "C" fn ls_tracker_count(
+    ctx: *const Context,
+    tracker: u32,
+    category: u32,
+    out: *mut u32,
+) -> Status {
     guard(|| {
         if ctx.is_null() || out.is_null() {
             return Status::NullPointer;
@@ -1081,12 +1286,20 @@ fn finish_path(result: Option<loadstar_core::graph::Path>, out: *mut *mut Path) 
 /// On `Ok`, `*out` receives a path handle (release with [`ls_path_free`]).
 /// On `NoPath`, `*out` is set to null and nothing needs freeing.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_find_path(ctx: *const Context, start: Vec3, goal: Vec3, opts: PathOptions, out: *mut *mut Path) -> Status {
+pub extern "C" fn ls_find_path(
+    ctx: *const Context,
+    start: Vec3,
+    goal: Vec3,
+    opts: PathOptions,
+    out: *mut *mut Path,
+) -> Status {
     guard(|| {
         if ctx.is_null() || out.is_null() {
             return Status::NullPointer;
         }
-        let Some(opts) = opts.to_core() else { return Status::InvalidArgument };
+        let Some(opts) = opts.to_core() else {
+            return Status::InvalidArgument;
+        };
         // SAFETY: non-null checked; a live context handle.
         finish_path(unsafe { &*ctx }.0.find_path(start, goal, opts), out)
     })
@@ -1107,12 +1320,20 @@ pub extern "C" fn ls_find_path_to_nodes(
         if ctx.is_null() || out.is_null() || (targets.is_null() && targets_len > 0) {
             return Status::NullPointer;
         }
-        let Some(opts) = opts.to_core() else { return Status::InvalidArgument };
+        let Some(opts) = opts.to_core() else {
+            return Status::InvalidArgument;
+        };
         // SAFETY: non-null checked; caller guarantees `targets` is readable for `targets_len`.
-        let targets: &[u32] = if targets_len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(targets, targets_len) } };
+        let targets: &[u32] = if targets_len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(targets, targets_len) }
+        };
         // SAFETY: non-null checked; a live context handle.
         let ctx = unsafe { &*ctx };
-        let n = ctx.0.grid().width() as usize * ctx.0.grid().height() as usize * ctx.0.grid().layers() as usize;
+        let n = ctx.0.grid().width() as usize
+            * ctx.0.grid().height() as usize
+            * ctx.0.grid().layers() as usize;
         if targets.iter().any(|&t| t as usize >= n) {
             return Status::InvalidArgument;
         }
@@ -1136,9 +1357,13 @@ pub extern "C" fn ls_reachable_nodes(
         if ctx.is_null() {
             return Status::NullPointer;
         }
-        let Some(opts) = opts.to_core() else { return Status::InvalidArgument };
+        let Some(opts) = opts.to_core() else {
+            return Status::InvalidArgument;
+        };
         // SAFETY: non-null checked; a live context handle.
-        let Some(reached) = unsafe { &*ctx }.0.reachable(start, opts) else { return Status::NoPath };
+        let Some(reached) = unsafe { &*ctx }.0.reachable(start, opts) else {
+            return Status::NoPath;
+        };
         let bytes: Vec<u8> = reached.iter().map(|&r| r as u8).collect();
         copy_out(&bytes, out, capacity, written)
     })
@@ -1167,7 +1392,12 @@ pub extern "C" fn ls_path_cost(path: *const Path) -> f32 {
 /// Copy the path's node ids into `out` (capacity `capacity`). `*written` receives the count
 /// needed; if it exceeds `capacity`, nothing is copied and `BufferTooSmall` is returned.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_path_nodes(path: *const Path, out: *mut u32, capacity: usize, written: *mut usize) -> Status {
+pub extern "C" fn ls_path_nodes(
+    path: *const Path,
+    out: *mut u32,
+    capacity: usize,
+    written: *mut usize,
+) -> Status {
     guard(|| {
         if path.is_null() {
             return Status::NullPointer;
@@ -1180,7 +1410,12 @@ pub extern "C" fn ls_path_nodes(path: *const Path, out: *mut u32, capacity: usiz
 /// Copy the path's link traversals into `out`. Same buffer convention as [`ls_path_nodes`].
 /// A path with no link traversals writes zero and returns `Ok`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_path_links(path: *const Path, out: *mut PathLink, capacity: usize, written: *mut usize) -> Status {
+pub extern "C" fn ls_path_links(
+    path: *const Path,
+    out: *mut PathLink,
+    capacity: usize,
+    written: *mut usize,
+) -> Status {
     guard(|| {
         if path.is_null() {
             return Status::NullPointer;
@@ -1190,7 +1425,11 @@ pub extern "C" fn ls_path_links(path: *const Path, out: *mut PathLink, capacity:
             .0
             .links
             .iter()
-            .map(|&(index, link_id)| PathLink { link_id, index: index as u32, _reserved: 0 })
+            .map(|&(index, link_id)| PathLink {
+                link_id,
+                index: index as u32,
+                _reserved: 0,
+            })
             .collect();
         copy_out(&links, out, capacity, written)
     })
@@ -1200,13 +1439,25 @@ pub extern "C" fn ls_path_links(path: *const Path, out: *mut PathLink, capacity:
 /// the teleporter" as data). Needs the context the path was found on. Same buffer
 /// convention as [`ls_path_nodes`].
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_path_segments(ctx: *const Context, path: *const Path, out: *mut PathSegment, capacity: usize, written: *mut usize) -> Status {
+pub extern "C" fn ls_path_segments(
+    ctx: *const Context,
+    path: *const Path,
+    out: *mut PathSegment,
+    capacity: usize,
+    written: *mut usize,
+) -> Status {
     guard(|| {
         if ctx.is_null() || path.is_null() {
             return Status::NullPointer;
         }
         // SAFETY: non-null checked; live context and path handles.
-        let segments: Vec<PathSegment> = unsafe { &*ctx }.0.grid().segments(&unsafe { &*path }.0).into_iter().map(Into::into).collect();
+        let segments: Vec<PathSegment> = unsafe { &*ctx }
+            .0
+            .grid()
+            .segments(&unsafe { &*path }.0)
+            .into_iter()
+            .map(Into::into)
+            .collect();
         copy_out(&segments, out, capacity, written)
     })
 }
@@ -1276,7 +1527,10 @@ mod tests {
 
     #[test]
     fn null_out_is_rejected_not_dereferenced() {
-        assert_eq!(ls_vec3_add(Vec3::default(), Vec3::default(), std::ptr::null_mut()), Status::NullPointer);
+        assert_eq!(
+            ls_vec3_add(Vec3::default(), Vec3::default(), std::ptr::null_mut()),
+            Status::NullPointer
+        );
     }
 
     #[test]
@@ -1284,7 +1538,12 @@ mod tests {
         assert_eq!(guard(|| panic!("boom")), Status::Panic);
     }
 
-    const DEFAULT_OPTS: PathOptions = PathOptions { blocked_mask: 0, snap_radius: 0, goal_mode: 0, profile: 0 };
+    const DEFAULT_OPTS: PathOptions = PathOptions {
+        blocked_mask: 0,
+        snap_radius: 0,
+        goal_mode: 0,
+        profile: 0,
+    };
 
     fn cell(col: f32, row: f32) -> Vec3 {
         Vec3::new(col + 0.5, 0.0, row + 0.5)
@@ -1295,25 +1554,44 @@ mod tests {
     fn context_and_path_lifecycle() {
         let cells = [1u8, 1, 1, 1, 0, 1, 1, 1, 1];
         let mut ctx = std::ptr::null_mut();
-        assert_eq!(ls_tile_context_create(3, 3, 1, cells.as_ptr(), cells.len(), &mut ctx), Status::Ok);
+        assert_eq!(
+            ls_tile_context_create(3, 3, 1, cells.as_ptr(), cells.len(), &mut ctx),
+            Status::Ok
+        );
         assert!(!ctx.is_null());
 
         let mut path = std::ptr::null_mut();
-        assert_eq!(ls_find_path(ctx, cell(0.0, 0.0), cell(2.0, 2.0), DEFAULT_OPTS, &mut path), Status::Ok);
+        assert_eq!(
+            ls_find_path(ctx, cell(0.0, 0.0), cell(2.0, 2.0), DEFAULT_OPTS, &mut path),
+            Status::Ok
+        );
         assert_eq!(ls_path_len(path), 5);
         assert_eq!(ls_path_cost(path), 4.0);
 
         let mut buf = [0u32; 2];
         let mut n = 0usize;
-        assert_eq!(ls_path_nodes(path, buf.as_mut_ptr(), buf.len(), &mut n), Status::BufferTooSmall);
+        assert_eq!(
+            ls_path_nodes(path, buf.as_mut_ptr(), buf.len(), &mut n),
+            Status::BufferTooSmall
+        );
         assert_eq!(n, 5);
 
         let mut buf = [0u32; 8];
-        assert_eq!(ls_path_nodes(path, buf.as_mut_ptr(), buf.len(), &mut n), Status::Ok);
+        assert_eq!(
+            ls_path_nodes(path, buf.as_mut_ptr(), buf.len(), &mut n),
+            Status::Ok
+        );
         assert_eq!(&buf[..n], &[0, 1, 2, 5, 8]);
 
-        let mut links = [PathLink { link_id: 0, index: 0, _reserved: 0 }; 1];
-        assert_eq!(ls_path_links(path, links.as_mut_ptr(), 1, &mut n), Status::Ok);
+        let mut links = [PathLink {
+            link_id: 0,
+            index: 0,
+            _reserved: 0,
+        }; 1];
+        assert_eq!(
+            ls_path_links(path, links.as_mut_ptr(), 1, &mut n),
+            Status::Ok
+        );
         assert_eq!(n, 0);
 
         let mut pos = Vec3::default();
@@ -1327,7 +1605,10 @@ mod tests {
         let mut id = 0;
         assert_eq!(ls_node_id(ctx, 1, 2, 0, &mut id), Status::Ok);
         assert_eq!(id, 7);
-        assert_eq!(ls_node_from_position(ctx, cell(1.0, 2.0), &mut id), Status::Ok);
+        assert_eq!(
+            ls_node_from_position(ctx, cell(1.0, 2.0), &mut id),
+            Status::Ok
+        );
         assert_eq!(id, 7);
 
         ls_path_free(path);
@@ -1340,7 +1621,12 @@ mod tests {
         let open = (1 << Dir::East as u8) | (1 << Dir::West as u8);
         let masks = [open; 8];
         // Ramp: leaving node 1 eastward lands on layer 1.
-        let ramp = TileEdgeOverride { node: 1, dir: Dir::East as u8, target_layer: 1, cost: 1.0 };
+        let ramp = TileEdgeOverride {
+            node: 1,
+            dir: Dir::East as u8,
+            target_layer: 1,
+            cost: 1.0,
+        };
         let mut ctx = std::ptr::null_mut();
         assert_eq!(
             ls_tile_context_create_edges(4, 1, 2, masks.as_ptr(), masks.len(), &ramp, 1, &mut ctx),
@@ -1349,13 +1635,19 @@ mod tests {
 
         let upper = |col: f32| Vec3::new(col + 0.5, 1.0, 0.5);
         let mut path = std::ptr::null_mut();
-        assert_eq!(ls_find_path(ctx, cell(0.0, 0.0), upper(3.0), DEFAULT_OPTS, &mut path), Status::Ok);
+        assert_eq!(
+            ls_find_path(ctx, cell(0.0, 0.0), upper(3.0), DEFAULT_OPTS, &mut path),
+            Status::Ok
+        );
         assert_eq!(ls_path_len(path), 4);
         ls_path_free(path);
 
         // Close the ramp edge; the layers disconnect.
         assert_eq!(ls_tile_set_edge(ctx, 1, Dir::East as u8, false), Status::Ok);
-        assert_eq!(ls_find_path(ctx, cell(0.0, 0.0), upper(3.0), DEFAULT_OPTS, &mut path), Status::NoPath);
+        assert_eq!(
+            ls_find_path(ctx, cell(0.0, 0.0), upper(3.0), DEFAULT_OPTS, &mut path),
+            Status::NoPath
+        );
 
         // A teleporter link bridges them instead, starting disabled.
         let link = LinkDesc {
@@ -1366,25 +1658,64 @@ mod tests {
             flags: LinkFlags::Bidirectional as u32 | LinkFlags::StartDisabled as u32,
         };
         assert_eq!(ls_link_add(ctx, link), Status::Ok);
-        assert_eq!(ls_find_path(ctx, cell(0.0, 0.0), upper(3.0), DEFAULT_OPTS, &mut path), Status::NoPath);
+        assert_eq!(
+            ls_find_path(ctx, cell(0.0, 0.0), upper(3.0), DEFAULT_OPTS, &mut path),
+            Status::NoPath
+        );
         assert_eq!(ls_link_set_enabled(ctx, 9001, true), Status::Ok);
-        assert_eq!(ls_find_path(ctx, upper(3.0), cell(0.0, 0.0), DEFAULT_OPTS, &mut path), Status::Ok);
+        assert_eq!(
+            ls_find_path(ctx, upper(3.0), cell(0.0, 0.0), DEFAULT_OPTS, &mut path),
+            Status::Ok
+        );
         assert_eq!(ls_path_len(path), 2);
-        let mut links = [PathLink { link_id: 0, index: 0, _reserved: 0 }; 2];
+        let mut links = [PathLink {
+            link_id: 0,
+            index: 0,
+            _reserved: 0,
+        }; 2];
         let mut n = 0;
-        assert_eq!(ls_path_links(path, links.as_mut_ptr(), 2, &mut n), Status::Ok);
+        assert_eq!(
+            ls_path_links(path, links.as_mut_ptr(), 2, &mut n),
+            Status::Ok
+        );
         assert_eq!(n, 1);
         assert_eq!((links[0].link_id, links[0].index), (9001, 1));
-        let mut segs = [PathSegment { kind: 0, dir: 0, count: 0, _reserved: 0, link_id: 0 }; 4];
-        assert_eq!(ls_path_segments(ctx, path, segs.as_mut_ptr(), 4, &mut n), Status::Ok);
+        let mut segs = [PathSegment {
+            kind: 0,
+            dir: 0,
+            count: 0,
+            _reserved: 0,
+            link_id: 0,
+        }; 4];
+        assert_eq!(
+            ls_path_segments(ctx, path, segs.as_mut_ptr(), 4, &mut n),
+            Status::Ok
+        );
         assert_eq!(n, 1);
-        assert_eq!(segs[0], PathSegment { kind: 1, dir: 0, count: 0, _reserved: 0, link_id: 9001 });
+        assert_eq!(
+            segs[0],
+            PathSegment {
+                kind: 1,
+                dir: 0,
+                count: 0,
+                _reserved: 0,
+                link_id: 9001
+            }
+        );
         ls_path_free(path);
 
         assert_eq!(ls_link_remove(ctx, 9001), Status::Ok);
         assert_eq!(ls_link_remove(ctx, 9001), Status::InvalidArgument);
-        assert_eq!(ls_tile_set_edge(ctx, 0, 7, true), Status::InvalidArgument, "bad dir");
-        assert_eq!(ls_tile_set_edge_override(ctx, 0, 2, 9, 1.0), Status::InvalidArgument, "bad layer");
+        assert_eq!(
+            ls_tile_set_edge(ctx, 0, 7, true),
+            Status::InvalidArgument,
+            "bad dir"
+        );
+        assert_eq!(
+            ls_tile_set_edge_override(ctx, 0, 2, 9, 1.0),
+            Status::InvalidArgument,
+            "bad layer"
+        );
         ls_context_destroy(ctx);
     }
 
@@ -1392,9 +1723,15 @@ mod tests {
     fn unreachable_reports_no_path_with_null_handle() {
         let cells = [1u8, 0, 1];
         let mut ctx = std::ptr::null_mut();
-        assert_eq!(ls_tile_context_create(3, 1, 1, cells.as_ptr(), cells.len(), &mut ctx), Status::Ok);
+        assert_eq!(
+            ls_tile_context_create(3, 1, 1, cells.as_ptr(), cells.len(), &mut ctx),
+            Status::Ok
+        );
         let mut path: *mut Path = std::ptr::dangling_mut();
-        assert_eq!(ls_find_path(ctx, cell(0.0, 0.0), cell(2.0, 0.0), DEFAULT_OPTS, &mut path), Status::NoPath);
+        assert_eq!(
+            ls_find_path(ctx, cell(0.0, 0.0), cell(2.0, 0.0), DEFAULT_OPTS, &mut path),
+            Status::NoPath
+        );
         assert!(path.is_null());
         ls_context_destroy(ctx);
     }
@@ -1404,31 +1741,71 @@ mod tests {
         const NPC: u32 = 1;
         // 5x3 open corridor; NPC at (2,1).
         let mut ctx = std::ptr::null_mut();
-        assert_eq!(ls_tile_context_create(5, 3, 1, [1u8; 15].as_ptr(), 15, &mut ctx), Status::Ok);
+        assert_eq!(
+            ls_tile_context_create(5, 3, 1, [1u8; 15].as_ptr(), 15, &mut ctx),
+            Status::Ok
+        );
         let npc = 7;
         assert_eq!(ls_node_add_groups(ctx, npc, NPC), Status::Ok);
         let mut mask = 0;
         assert_eq!(ls_node_get_groups(ctx, npc, &mut mask), Status::Ok);
         assert_eq!(mask, NPC);
-        assert_eq!(ls_node_get_groups(ctx, 99, &mut mask), Status::InvalidArgument);
+        assert_eq!(
+            ls_node_get_groups(ctx, 99, &mut mask),
+            Status::InvalidArgument
+        );
 
-        let blocked = PathOptions { blocked_mask: NPC, snap_radius: 0, goal_mode: 0, profile: 0 };
+        let blocked = PathOptions {
+            blocked_mask: NPC,
+            snap_radius: 0,
+            goal_mode: 0,
+            profile: 0,
+        };
         let mut path = std::ptr::null_mut();
-        assert_eq!(ls_find_path(ctx, cell(0.0, 1.0), cell(4.0, 1.0), blocked, &mut path), Status::Ok);
+        assert_eq!(
+            ls_find_path(ctx, cell(0.0, 1.0), cell(4.0, 1.0), blocked, &mut path),
+            Status::Ok
+        );
         assert_eq!(ls_path_len(path), 7, "detours around the NPC");
         ls_path_free(path);
 
-        let adjacent = PathOptions { blocked_mask: NPC, snap_radius: 0, goal_mode: 1, profile: 0 };
-        assert_eq!(ls_find_path_to_nodes(ctx, cell(0.0, 1.0), &npc, 1, adjacent, &mut path), Status::Ok);
-        assert_eq!(ls_path_len(path), 2, "stops next to the NPC: (0,1) -> (1,1)");
+        let adjacent = PathOptions {
+            blocked_mask: NPC,
+            snap_radius: 0,
+            goal_mode: 1,
+            profile: 0,
+        };
+        assert_eq!(
+            ls_find_path_to_nodes(ctx, cell(0.0, 1.0), &npc, 1, adjacent, &mut path),
+            Status::Ok
+        );
+        assert_eq!(
+            ls_path_len(path),
+            2,
+            "stops next to the NPC: (0,1) -> (1,1)"
+        );
         ls_path_free(path);
-        assert_eq!(ls_find_path_to_nodes(ctx, cell(0.0, 1.0), &99, 1, adjacent, &mut path), Status::InvalidArgument);
-        let bad_mode = PathOptions { blocked_mask: 0, snap_radius: 0, goal_mode: 7, profile: 0 };
-        assert_eq!(ls_find_path(ctx, cell(0.0, 1.0), cell(4.0, 1.0), bad_mode, &mut path), Status::InvalidArgument);
+        assert_eq!(
+            ls_find_path_to_nodes(ctx, cell(0.0, 1.0), &99, 1, adjacent, &mut path),
+            Status::InvalidArgument
+        );
+        let bad_mode = PathOptions {
+            blocked_mask: 0,
+            snap_radius: 0,
+            goal_mode: 7,
+            profile: 0,
+        };
+        assert_eq!(
+            ls_find_path(ctx, cell(0.0, 1.0), cell(4.0, 1.0), bad_mode, &mut path),
+            Status::InvalidArgument
+        );
 
         let mut reach = [0u8; 15];
         let mut n = 0;
-        assert_eq!(ls_reachable_nodes(ctx, cell(0.0, 0.0), blocked, reach.as_mut_ptr(), 15, &mut n), Status::Ok);
+        assert_eq!(
+            ls_reachable_nodes(ctx, cell(0.0, 0.0), blocked, reach.as_mut_ptr(), 15, &mut n),
+            Status::Ok
+        );
         assert_eq!(n, 15);
         assert_eq!(reach[npc as usize], 0);
         assert_eq!(reach[14], 1, "corridor around the NPC is open");
@@ -1450,21 +1827,48 @@ mod tests {
     }
 
     fn entity(id: u64, bounds: BoundsDesc, blocking: u32, flags: u32) -> EntityDesc {
-        EntityDesc { id, category: 1, _reserved: 0, blocking, flags, sort_key: 0, bounds }
+        EntityDesc {
+            id,
+            category: 1,
+            _reserved: 0,
+            blocking,
+            flags,
+            sort_key: 0,
+            bounds,
+        }
     }
 
     #[test]
     fn entities_through_the_abi() {
         const NPC: u32 = 1;
         let mut ctx = std::ptr::null_mut();
-        assert_eq!(ls_tile_context_create(5, 3, 1, [1u8; 15].as_ptr(), 15, &mut ctx), Status::Ok);
+        assert_eq!(
+            ls_tile_context_create(5, 3, 1, [1u8; 15].as_ptr(), 15, &mut ctx),
+            Status::Ok
+        );
 
-        let npc = entity(10, tile_rect(2, 1, 1, 1), NPC, EntityFlags::PathfindAdjacent as u32);
+        let npc = entity(
+            10,
+            tile_rect(2, 1, 1, 1),
+            NPC,
+            EntityFlags::PathfindAdjacent as u32,
+        );
         let chest = entity(20, tile_rect(4, 2, 1, 1), 0, 0);
         let snapshot = [npc, chest];
         let mut stats = SyncStats::default();
-        assert_eq!(ls_entities_sync(ctx, snapshot.as_ptr(), 2, &mut stats), Status::Ok);
-        assert_eq!(stats, SyncStats { added: 2, updated: 0, removed: 0, _reserved: 0 });
+        assert_eq!(
+            ls_entities_sync(ctx, snapshot.as_ptr(), 2, &mut stats),
+            Status::Ok
+        );
+        assert_eq!(
+            stats,
+            SyncStats {
+                added: 2,
+                updated: 0,
+                removed: 0,
+                _reserved: 0
+            }
+        );
         assert_eq!(ls_entity_count(ctx), 2);
 
         let mut mask = 0;
@@ -1473,27 +1877,55 @@ mod tests {
 
         let mut nodes = [0u32; 4];
         let mut n = 0;
-        assert_eq!(ls_entity_nodes(ctx, 10, nodes.as_mut_ptr(), 4, &mut n), Status::Ok);
+        assert_eq!(
+            ls_entity_nodes(ctx, 10, nodes.as_mut_ptr(), 4, &mut n),
+            Status::Ok
+        );
         assert_eq!(&nodes[..n], &[7]);
-        assert_eq!(ls_entity_nodes(ctx, 99, nodes.as_mut_ptr(), 4, &mut n), Status::InvalidArgument);
+        assert_eq!(
+            ls_entity_nodes(ctx, 99, nodes.as_mut_ptr(), 4, &mut n),
+            Status::InvalidArgument
+        );
 
-        let opts = PathOptions { blocked_mask: NPC, snap_radius: 0, goal_mode: 0, profile: 0 };
+        let opts = PathOptions {
+            blocked_mask: NPC,
+            snap_radius: 0,
+            goal_mode: 0,
+            profile: 0,
+        };
         let mut path = std::ptr::null_mut();
-        assert_eq!(ls_find_path_to_entity(ctx, cell(0.0, 1.0), 10, opts, &mut path), Status::Ok);
+        assert_eq!(
+            ls_find_path_to_entity(ctx, cell(0.0, 1.0), 10, opts, &mut path),
+            Status::Ok
+        );
         assert_eq!(ls_path_len(path), 2, "adjacent flag: stops next to the NPC");
         ls_path_free(path);
-        assert_eq!(ls_find_path_to_entity(ctx, cell(0.0, 1.0), 99, opts, &mut path), Status::InvalidArgument);
+        assert_eq!(
+            ls_find_path_to_entity(ctx, cell(0.0, 1.0), 99, opts, &mut path),
+            Status::InvalidArgument
+        );
 
         let mut reachable = false;
-        assert_eq!(ls_entity_reachable(ctx, cell(0.0, 1.0), 20, opts, &mut reachable), Status::Ok);
+        assert_eq!(
+            ls_entity_reachable(ctx, cell(0.0, 1.0), 20, opts, &mut reachable),
+            Status::Ok
+        );
         assert!(reachable);
 
         let mut p = Vec3::default();
-        assert_eq!(ls_entity_nearest_point(ctx, 20, cell(0.0, 0.0), &mut p), Status::Ok);
+        assert_eq!(
+            ls_entity_nearest_point(ctx, 20, cell(0.0, 0.0), &mut p),
+            Status::Ok
+        );
         assert_eq!(p, Vec3::new(4.0, 0.0, 2.0));
 
         // Moving the NPC by upsert frees the old cell; removing the chest shrinks the registry.
-        let moved = entity(10, tile_rect(2, 0, 1, 1), NPC, EntityFlags::PathfindAdjacent as u32);
+        let moved = entity(
+            10,
+            tile_rect(2, 0, 1, 1),
+            NPC,
+            EntityFlags::PathfindAdjacent as u32,
+        );
         assert_eq!(ls_entity_upsert(ctx, &moved), Status::Ok);
         assert_eq!(ls_node_get_groups(ctx, 7, &mut mask), Status::Ok);
         assert_eq!(mask, 0);
@@ -1501,9 +1933,21 @@ mod tests {
         assert_eq!(ls_entity_remove(ctx, 20), Status::InvalidArgument);
         assert_eq!(ls_entity_count(ctx), 1);
 
-        let bad = entity(30, BoundsDesc { kind: 9, ..tile_rect(0, 0, 1, 1) }, 0, 0);
+        let bad = entity(
+            30,
+            BoundsDesc {
+                kind: 9,
+                ..tile_rect(0, 0, 1, 1)
+            },
+            0,
+            0,
+        );
         assert_eq!(ls_entity_upsert(ctx, &bad), Status::InvalidArgument);
-        assert_eq!(ls_entities_sync(ctx, std::ptr::null(), 0, std::ptr::null_mut()), Status::Ok, "empty snapshot clears");
+        assert_eq!(
+            ls_entities_sync(ctx, std::ptr::null(), 0, std::ptr::null_mut()),
+            Status::Ok,
+            "empty snapshot clears"
+        );
         assert_eq!(ls_entity_count(ctx), 0);
         ls_context_destroy(ctx);
     }
@@ -1514,29 +1958,64 @@ mod tests {
         let mut w = [1u8; 12];
         w[5] = 0;
         let mut ctx = std::ptr::null_mut();
-        assert_eq!(ls_tile_context_create(4, 3, 1, w.as_ptr(), 12, &mut ctx), Status::Ok);
+        assert_eq!(
+            ls_tile_context_create(4, 3, 1, w.as_ptr(), 12, &mut ctx),
+            Status::Ok
+        );
 
         let mut clearance = 0;
         assert_eq!(ls_node_clearance(ctx, 2, &mut clearance), Status::Ok);
         assert_eq!(clearance, 2);
         assert_eq!(ls_node_clearance(ctx, 5, &mut clearance), Status::Ok);
         assert_eq!(clearance, 0);
-        assert_eq!(ls_node_clearance(ctx, 99, &mut clearance), Status::InvalidArgument);
+        assert_eq!(
+            ls_node_clearance(ctx, 99, &mut clearance),
+            Status::InvalidArgument
+        );
 
         let mut big = 0;
-        let desc = ProfileDesc { footprint: 2, radius: 1.0, height: 2.0, step_height: 0.5 };
+        let desc = ProfileDesc {
+            footprint: 2,
+            radius: 1.0,
+            height: 2.0,
+            step_height: 0.5,
+        };
         assert_eq!(ls_profile_register(ctx, desc, &mut big), Status::Ok);
         assert_eq!(big, 1);
-        assert_eq!(ls_profile_register(ctx, ProfileDesc { footprint: 0, ..desc }, &mut big), Status::InvalidArgument);
+        assert_eq!(
+            ls_profile_register(
+                ctx,
+                ProfileDesc {
+                    footprint: 0,
+                    ..desc
+                },
+                &mut big
+            ),
+            Status::InvalidArgument
+        );
 
-        let wide = PathOptions { blocked_mask: 0, snap_radius: 0, goal_mode: 0, profile: 1 };
+        let wide = PathOptions {
+            blocked_mask: 0,
+            snap_radius: 0,
+            goal_mode: 0,
+            profile: 1,
+        };
         let mut path = std::ptr::null_mut();
-        assert_eq!(ls_find_path(ctx, cell(0.0, 0.0), cell(2.0, 1.0), wide, &mut path), Status::NoPath);
-        assert_eq!(ls_find_path(ctx, cell(2.0, 0.0), cell(2.0, 1.0), wide, &mut path), Status::Ok);
+        assert_eq!(
+            ls_find_path(ctx, cell(0.0, 0.0), cell(2.0, 1.0), wide, &mut path),
+            Status::NoPath
+        );
+        assert_eq!(
+            ls_find_path(ctx, cell(2.0, 0.0), cell(2.0, 1.0), wide, &mut path),
+            Status::Ok
+        );
         assert_eq!(ls_path_len(path), 2);
         ls_path_free(path);
         let unknown = PathOptions { profile: 7, ..wide };
-        assert_eq!(ls_find_path(ctx, cell(2.0, 0.0), cell(2.0, 1.0), unknown, &mut path), Status::NoPath);
+        assert_eq!(
+            ls_find_path(ctx, cell(2.0, 0.0), cell(2.0, 1.0), unknown, &mut path),
+            Status::NoPath
+        );
         ls_context_destroy(ctx);
     }
 
@@ -1545,25 +2024,76 @@ mod tests {
         const NPC: u32 = 1;
         // 5x3 corridor: NPC at (2,1), chest at (4,2), hidden chest at (1,2).
         let mut ctx = std::ptr::null_mut();
-        assert_eq!(ls_tile_context_create(5, 3, 1, [1u8; 15].as_ptr(), 15, &mut ctx), Status::Ok);
+        assert_eq!(
+            ls_tile_context_create(5, 3, 1, [1u8; 15].as_ptr(), 15, &mut ctx),
+            Status::Ok
+        );
         let mut hidden = entity(31, tile_rect(1, 2, 1, 1), 0, EntityFlags::Hidden as u32);
         hidden.category = 3;
         let mut chest = entity(30, tile_rect(4, 2, 1, 1), 0, 0);
         chest.category = 3;
-        let snapshot = [entity(10, tile_rect(2, 1, 1, 1), NPC, EntityFlags::PathfindAdjacent as u32), chest, hidden];
-        assert_eq!(ls_entities_sync(ctx, snapshot.as_ptr(), 3, std::ptr::null_mut()), Status::Ok);
+        let snapshot = [
+            entity(
+                10,
+                tile_rect(2, 1, 1, 1),
+                NPC,
+                EntityFlags::PathfindAdjacent as u32,
+            ),
+            chest,
+            hidden,
+        ];
+        assert_eq!(
+            ls_entities_sync(ctx, snapshot.as_ptr(), 3, std::ptr::null_mut()),
+            Status::Ok
+        );
         assert_eq!(ls_player_set(ctx, cell(0.0, 1.0)), Status::Ok);
 
-        let no_hidden = FilterDesc { kind: 3, enabled: 1, p0: 0, p1: EntityFlags::Hidden as u32, mask: 0, value: 0.0, _reserved: 0 };
-        let reachable = FilterDesc { kind: 0, enabled: 0, p0: 0, p1: NPC, mask: 0, value: 0.0, _reserved: 0 };
+        let no_hidden = FilterDesc {
+            kind: 3,
+            enabled: 1,
+            p0: 0,
+            p1: EntityFlags::Hidden as u32,
+            mask: 0,
+            value: 0.0,
+            _reserved: 0,
+        };
+        let reachable = FilterDesc {
+            kind: 0,
+            enabled: 0,
+            p0: 0,
+            p1: NPC,
+            mask: 0,
+            value: 0.0,
+            _reserved: 0,
+        };
         let filters = [no_hidden, reachable];
         let mut t = 0;
-        assert_eq!(ls_tracker_create(ctx, filters.as_ptr(), 2, true, &mut t), Status::Ok);
+        assert_eq!(
+            ls_tracker_create(ctx, filters.as_ptr(), 2, true, &mut t),
+            Status::Ok
+        );
 
-        let mut sel = Selection { entity_id: 0, category: 0, index: 0 };
-        assert_eq!(ls_tracker_act(ctx, t, TrackerAction::Next as u32, &mut sel), Status::Ok);
-        assert_eq!(sel, Selection { entity_id: 10, category: 1, index: 0 });
-        assert_eq!(ls_tracker_act(ctx, t, TrackerAction::Next as u32, &mut sel), Status::Ok);
+        let mut sel = Selection {
+            entity_id: 0,
+            category: 0,
+            index: 0,
+        };
+        assert_eq!(
+            ls_tracker_act(ctx, t, TrackerAction::Next as u32, &mut sel),
+            Status::Ok
+        );
+        assert_eq!(
+            sel,
+            Selection {
+                entity_id: 10,
+                category: 1,
+                index: 0
+            }
+        );
+        assert_eq!(
+            ls_tracker_act(ctx, t, TrackerAction::Next as u32, &mut sel),
+            Status::Ok
+        );
         assert_eq!(sel.entity_id, 30, "hidden chest 31 is filtered out");
         let mut n = 0;
         assert_eq!(ls_tracker_count(ctx, t, u32::MAX, &mut n), Status::Ok);
@@ -1571,29 +2101,68 @@ mod tests {
         assert_eq!(ls_tracker_count(ctx, t, 3, &mut n), Status::Ok);
         assert_eq!(n, 1);
 
-        let mut v = EntityVector { nearest_point: Vec3::default(), bearing_deg: 0.0, elevation_deg: 0.0, distance: 0.0, steps: 0.0 };
+        let mut v = EntityVector {
+            nearest_point: Vec3::default(),
+            bearing_deg: 0.0,
+            elevation_deg: 0.0,
+            distance: 0.0,
+            steps: 0.0,
+        };
         assert_eq!(ls_entity_vector(ctx, 30, &mut v), Status::Ok);
         assert_eq!(v.nearest_point, Vec3::new(4.0, 0.0, 2.0));
-        assert!(v.bearing_deg > 90.0 && v.bearing_deg < 180.0, "south-east, got {}", v.bearing_deg);
+        assert!(
+            v.bearing_deg > 90.0 && v.bearing_deg < 180.0,
+            "south-east, got {}",
+            v.bearing_deg
+        );
         assert_eq!(v.steps, 4.0);
 
         let mut r = false;
-        assert_eq!(ls_entity_reachable_from_player(ctx, 30, 0, NPC, &mut r), Status::Ok);
+        assert_eq!(
+            ls_entity_reachable_from_player(ctx, 30, 0, NPC, &mut r),
+            Status::Ok
+        );
         assert!(r);
-        assert_eq!(ls_entity_reachable_from_player(ctx, 30, 9, NPC, &mut r), Status::InvalidArgument, "unknown profile");
+        assert_eq!(
+            ls_entity_reachable_from_player(ctx, 30, 9, NPC, &mut r),
+            Status::InvalidArgument,
+            "unknown profile"
+        );
 
-        assert_eq!(ls_tracker_act(ctx, t, TrackerAction::CategoryNext as u32, &mut sel), Status::Ok);
-        assert_eq!(sel, Selection { entity_id: 0, category: 1, index: 0 });
+        assert_eq!(
+            ls_tracker_act(ctx, t, TrackerAction::CategoryNext as u32, &mut sel),
+            Status::Ok
+        );
+        assert_eq!(
+            sel,
+            Selection {
+                entity_id: 0,
+                category: 1,
+                index: 0
+            }
+        );
         assert_eq!(ls_tracker_set_filter_enabled(ctx, t, 1, true), Status::Ok);
-        assert_eq!(ls_tracker_set_filter_enabled(ctx, t, 5, true), Status::InvalidArgument);
+        assert_eq!(
+            ls_tracker_set_filter_enabled(ctx, t, 5, true),
+            Status::InvalidArgument
+        );
         assert_eq!(ls_tracker_act(ctx, t, 9, &mut sel), Status::InvalidArgument);
-        assert_eq!(ls_tracker_set_filters(ctx, t, std::ptr::null(), 0), Status::Ok);
+        assert_eq!(
+            ls_tracker_set_filters(ctx, t, std::ptr::null(), 0),
+            Status::Ok
+        );
         assert_eq!(ls_tracker_count(ctx, t, u32::MAX, &mut n), Status::Ok);
         assert_eq!(n, 3, "no filters: hidden chest visible again");
         assert_eq!(ls_tracker_destroy(ctx, t), Status::Ok);
         assert_eq!(ls_tracker_act(ctx, t, 0, &mut sel), Status::InvalidArgument);
-        let bad = FilterDesc { kind: 9, ..no_hidden };
-        assert_eq!(ls_tracker_create(ctx, &bad, 1, true, &mut t), Status::InvalidArgument);
+        let bad = FilterDesc {
+            kind: 9,
+            ..no_hidden
+        };
+        assert_eq!(
+            ls_tracker_create(ctx, &bad, 1, true, &mut t),
+            Status::InvalidArgument
+        );
         ls_context_destroy(ctx);
     }
 
@@ -1601,7 +2170,10 @@ mod tests {
     fn bad_grid_is_invalid_argument() {
         let cells = [1u8; 3];
         let mut ctx = std::ptr::null_mut();
-        assert_eq!(ls_tile_context_create(2, 2, 1, cells.as_ptr(), cells.len(), &mut ctx), Status::InvalidArgument);
+        assert_eq!(
+            ls_tile_context_create(2, 2, 1, cells.as_ptr(), cells.len(), &mut ctx),
+            Status::InvalidArgument
+        );
         ls_context_destroy(std::ptr::null_mut()); // null must be harmless
         ls_path_free(std::ptr::null_mut());
     }

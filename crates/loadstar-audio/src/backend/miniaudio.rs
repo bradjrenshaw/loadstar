@@ -93,7 +93,9 @@ unsafe extern "C" fn data_callback(user: *mut c_void, out: *mut f32, frames: u32
         state.scheduled = true;
         schedule_realtime();
     }
-    let Some(engine) = state.engine.as_mut() else { return };
+    let Some(engine) = state.engine.as_mut() else {
+        return;
+    };
 
     while let Ok(cmd) = state.inbox.pop() {
         engine.run(cmd);
@@ -119,7 +121,10 @@ fn schedule_realtime() {
     #[cfg(windows)]
     unsafe {
         let mut index = 0u32;
-        let _ = windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW(windows::core::w!("Pro Audio"), &mut index);
+        let _ = windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW(
+            windows::core::w!("Pro Audio"),
+            &mut index,
+        );
     }
 }
 
@@ -132,16 +137,38 @@ pub fn open(
     finished: rtrb::Producer<(u32, u64)>,
 ) -> Result<MiniaudioStream, MiniaudioError> {
     let status = Arc::new(StreamStatus::default());
-    let mut state = Box::new(State { engine: None, inbox, garbage, finished, scheduled: false });
+    let mut state = Box::new(State {
+        engine: None,
+        inbox,
+        garbage,
+        finished,
+        scheduled: false,
+    });
 
     // miniaudio only takes the IAudioClient3 low-latency path when a specific period is
     // requested (0 means its 10 ms default), so ask for ~3 ms; the driver clamps it up if needed.
     // Likewise `sample_rate` should stay 0: an application-set rate disables that path.
-    let requested_period = if cfg.period_frames == 0 { 128 } else { cfg.period_frames as u32 };
-    let (mut rate, mut period, mut backend, mut result) = (0u32, 0u32, std::ptr::null::<c_char>(), 0i32);
+    let requested_period = if cfg.period_frames == 0 {
+        128
+    } else {
+        cfg.period_frames as u32
+    };
+    let (mut rate, mut period, mut backend, mut result) =
+        (0u32, 0u32, std::ptr::null::<c_char>(), 0i32);
     let user = &mut *state as *mut State as *mut c_void;
     // SAFETY: plain FFI call; out-pointers are valid locals.
-    let handle = unsafe { ls_ma_open(cfg.sample_rate, requested_period, data_callback, user, &mut rate, &mut period, &mut backend, &mut result) };
+    let handle = unsafe {
+        ls_ma_open(
+            cfg.sample_rate,
+            requested_period,
+            data_callback,
+            user,
+            &mut rate,
+            &mut period,
+            &mut backend,
+            &mut result,
+        )
+    };
     if handle.is_null() {
         return Err(MiniaudioError(describe(result)));
     }
@@ -149,9 +176,15 @@ pub fn open(
         "unknown".to_string()
     } else {
         // SAFETY: miniaudio returns a static NUL-terminated string.
-        unsafe { CStr::from_ptr(backend) }.to_string_lossy().into_owned()
+        unsafe { CStr::from_ptr(backend) }
+            .to_string_lossy()
+            .into_owned()
     };
-    let info = StreamInfo { sample_rate: rate, period_frames: period.max(1) as usize, channels: 2 };
+    let info = StreamInfo {
+        sample_rate: rate,
+        period_frames: period.max(1) as usize,
+        channels: 2,
+    };
 
     state.engine = Some(Engine::new(EngineConfig {
         sample_rate: info.sample_rate,
@@ -163,13 +196,25 @@ pub fn open(
     let started = unsafe { ls_ma_start(handle) };
     if started != 0 {
         unsafe { ls_ma_close(handle) };
-        return Err(MiniaudioError(format!("start failed: {}", describe(started))));
+        return Err(MiniaudioError(format!(
+            "start failed: {}",
+            describe(started)
+        )));
     }
     status.running.store(true, Ordering::Relaxed);
     // A period under 5 ms only happens on a low-latency path (IAudioClient3 or equivalent).
-    status.low_latency.store(info.period_frames as f32 * 1000.0 / info.sample_rate as f32 <= 5.0, Ordering::Relaxed);
+    status.low_latency.store(
+        info.period_frames as f32 * 1000.0 / info.sample_rate as f32 <= 5.0,
+        Ordering::Relaxed,
+    );
 
-    Ok(MiniaudioStream { handle, _state: state, info, backend_name, status })
+    Ok(MiniaudioStream {
+        handle,
+        _state: state,
+        info,
+        backend_name,
+        status,
+    })
 }
 
 fn describe(result: i32) -> String {

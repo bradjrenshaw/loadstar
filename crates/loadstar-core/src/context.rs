@@ -74,7 +74,12 @@ pub struct Profile {
 
 impl Default for Profile {
     fn default() -> Self {
-        Profile { footprint: 1, radius: 0.5, height: 1.0, step_height: 0.0 }
+        Profile {
+            footprint: 1,
+            radius: 0.5,
+            height: 1.0,
+            step_height: 0.0,
+        }
     }
 }
 
@@ -146,13 +151,25 @@ impl TileContext {
         if let Some(set) = cache.sets.get(&(profile, blocked_mask)) {
             return Some(Rc::clone(set));
         }
-        let set = Rc::new(self.reachable(self.player, PathOptions { blocked_mask, profile, ..Default::default() })?);
+        let set = Rc::new(self.reachable(
+            self.player,
+            PathOptions {
+                blocked_mask,
+                profile,
+                ..Default::default()
+            },
+        )?);
         cache.sets.insert((profile, blocked_mask), Rc::clone(&set));
         Some(set)
     }
 
     /// [`Self::entity_reachable`] against the cached reachability from the player.
-    pub fn entity_reachable_from_player(&self, id: EntityId, profile: u32, blocked_mask: u32) -> Option<bool> {
+    pub fn entity_reachable_from_player(
+        &self,
+        id: EntityId,
+        profile: u32,
+        blocked_mask: u32,
+    ) -> Option<bool> {
         let reached = self.reachable_from_player(profile, blocked_mask)?;
         self.entity_reachable(&reached, id)
     }
@@ -162,8 +179,16 @@ impl TileContext {
         let nearest_point = self.entity_nearest_point(id, self.player)?;
         let d = nearest_point - self.player;
         let horizontal = d.horizontal_length();
-        let bearing = if horizontal == 0.0 { 0.0 } else { d.x.atan2(-d.z).to_degrees().rem_euclid(360.0) };
-        let elevation = if horizontal == 0.0 && d.y == 0.0 { 0.0 } else { d.y.atan2(horizontal).to_degrees() };
+        let bearing = if horizontal == 0.0 {
+            0.0
+        } else {
+            d.x.atan2(-d.z).to_degrees().rem_euclid(360.0)
+        };
+        let elevation = if horizontal == 0.0 && d.y == 0.0 {
+            0.0
+        } else {
+            d.y.atan2(horizontal).to_degrees()
+        };
         Some(EntityVector {
             nearest_point,
             bearing_deg: bearing,
@@ -214,7 +239,12 @@ impl TileContext {
     /// Visible entity count under the tracker's filters, in one category or (`None`) all.
     pub fn tracker_count(&self, id: u32, category: Option<u16>) -> Option<u32> {
         let tracker = self.tracker(id)?;
-        Some(self.registry.iter().filter(|e| category.is_none_or(|c| e.category == c) && self.passes(tracker, e)).count() as u32)
+        Some(
+            self.registry
+                .iter()
+                .filter(|e| category.is_none_or(|c| e.category == c) && self.passes(tracker, e))
+                .count() as u32,
+        )
     }
 
     fn act(&self, t: &mut Tracker, action: Action) -> Selection {
@@ -252,7 +282,11 @@ impl TileContext {
                     Some(i) => {
                         let e = list[i];
                         t.selected = Some(e.id);
-                        Selection { entity_id: e.id, category: u32::from(e.category), index: i as u32 }
+                        Selection {
+                            entity_id: e.id,
+                            category: u32::from(e.category),
+                            index: i as u32,
+                        }
                     }
                     None => {
                         t.selected = None;
@@ -266,7 +300,12 @@ impl TileContext {
     /// Categories in cycle order: the ALL view first if configured, then every category
     /// that currently has a visible entity, ascending.
     fn tracker_categories(&self, t: &Tracker) -> Vec<Option<u16>> {
-        let mut cats: Vec<u16> = self.registry.iter().filter(|e| self.passes(t, e)).map(|e| e.category).collect();
+        let mut cats: Vec<u16> = self
+            .registry
+            .iter()
+            .filter(|e| self.passes(t, e))
+            .map(|e| e.category)
+            .collect();
         cats.sort_unstable();
         cats.dedup();
         let mut out = Vec::with_capacity(cats.len() + 1);
@@ -290,12 +329,22 @@ impl TileContext {
     }
 
     fn passes(&self, t: &Tracker, e: &Entity) -> bool {
-        t.filters.iter().filter(|f| f.enabled).all(|f| match f.filter {
-            Filter::Reachable { profile, blocked_mask } => self.entity_reachable_from_player(e.id, profile, blocked_mask) == Some(true),
-            Filter::Range { max_distance } => (e.bounds.nearest_point(self.player) - self.player).length() <= max_distance,
-            Filter::Categories { mask } => e.category < 64 && mask & (1u64 << e.category) != 0,
-            Filter::Flags { require, forbid } => e.flags & require == require && e.flags & forbid == 0,
-        })
+        t.filters
+            .iter()
+            .filter(|f| f.enabled)
+            .all(|f| match f.filter {
+                Filter::Reachable {
+                    profile,
+                    blocked_mask,
+                } => self.entity_reachable_from_player(e.id, profile, blocked_mask) == Some(true),
+                Filter::Range { max_distance } => {
+                    (e.bounds.nearest_point(self.player) - self.player).length() <= max_distance
+                }
+                Filter::Categories { mask } => e.category < 64 && mask & (1u64 << e.category) != 0,
+                Filter::Flags { require, forbid } => {
+                    e.flags & require == require && e.flags & forbid == 0
+                }
+            })
     }
 
     // --- Profiles ----------------------------------------------------------------------
@@ -336,17 +385,26 @@ impl TileContext {
 
     pub fn set_groups(&mut self, node: NodeId, mask: u32) -> bool {
         self.overlay_version += 1;
-        self.manual_groups.get_mut(node as usize).map(|g| *g = mask).is_some()
+        self.manual_groups
+            .get_mut(node as usize)
+            .map(|g| *g = mask)
+            .is_some()
     }
 
     pub fn add_groups(&mut self, node: NodeId, mask: u32) -> bool {
         self.overlay_version += 1;
-        self.manual_groups.get_mut(node as usize).map(|g| *g |= mask).is_some()
+        self.manual_groups
+            .get_mut(node as usize)
+            .map(|g| *g |= mask)
+            .is_some()
     }
 
     pub fn remove_groups(&mut self, node: NodeId, mask: u32) -> bool {
         self.overlay_version += 1;
-        self.manual_groups.get_mut(node as usize).map(|g| *g &= !mask).is_some()
+        self.manual_groups
+            .get_mut(node as usize)
+            .map(|g| *g &= !mask)
+            .is_some()
     }
 
     /// Remove `mask` from every node's manual groups. Entity-derived groups are unaffected.
@@ -393,7 +451,11 @@ impl TileContext {
         if self.registry.remove(id).is_none() {
             return false;
         }
-        if self.projections.remove(&id).is_some_and(|p| p.blocking != 0) {
+        if self
+            .projections
+            .remove(&id)
+            .is_some_and(|p| p.blocking != 0)
+        {
             self.rebuild_entity_groups();
         }
         true
@@ -408,7 +470,10 @@ impl TileContext {
             rebuild |= self.reproject(id);
         }
         for id in removed {
-            rebuild |= self.projections.remove(&id).is_some_and(|p| p.blocking != 0);
+            rebuild |= self
+                .projections
+                .remove(&id)
+                .is_some_and(|p| p.blocking != 0);
         }
         if rebuild {
             self.rebuild_entity_groups();
@@ -418,10 +483,18 @@ impl TileContext {
 
     /// Recompute one entity's projection. Returns whether the blocking overlay is affected.
     fn reproject(&mut self, id: EntityId) -> bool {
-        let Some(entity) = self.registry.get(id) else { return false };
+        let Some(entity) = self.registry.get(id) else {
+            return false;
+        };
         let nodes = self.grid.project(&entity.bounds);
         let old_blocking = self.projections.get(&id).map_or(0, |p| p.blocking);
-        self.projections.insert(id, Projection { blocking: entity.blocking, nodes });
+        self.projections.insert(
+            id,
+            Projection {
+                blocking: entity.blocking,
+                nodes,
+            },
+        );
         old_blocking != 0 || entity.blocking != 0
     }
 
@@ -442,13 +515,22 @@ impl TileContext {
 
     /// Path to an entity. The goal mode comes from the entity's `PATHFIND_ADJACENT` flag,
     /// not from `opts`. `None` if unknown, off-grid, or unreachable.
-    pub fn find_path_to_entity(&self, start: Vec3, id: EntityId, opts: PathOptions) -> Option<Path> {
+    pub fn find_path_to_entity(
+        &self,
+        start: Vec3,
+        id: EntityId,
+        opts: PathOptions,
+    ) -> Option<Path> {
         let entity = self.registry.get(id)?;
         let nodes = self.entity_nodes(id)?;
         if nodes.is_empty() {
             return None;
         }
-        let goal_mode = if entity.flags & flags::PATHFIND_ADJACENT != 0 { GoalMode::Adjacent } else { GoalMode::Onto };
+        let goal_mode = if entity.flags & flags::PATHFIND_ADJACENT != 0 {
+            GoalMode::Adjacent
+        } else {
+            GoalMode::Onto
+        };
         self.find_path_to_nodes(start, nodes, PathOptions { goal_mode, ..opts })
     }
 
@@ -472,8 +554,16 @@ impl TileContext {
 
     /// Path from the node containing `start` to the cheapest of `targets`, interpreted per
     /// `opts.goal_mode`. Target ids must be in range; `opts.profile` must be registered.
-    pub fn find_path_to_nodes(&self, start: Vec3, targets: &[NodeId], opts: PathOptions) -> Option<Path> {
-        if targets.iter().any(|&t| t as usize >= self.manual_groups.len()) {
+    pub fn find_path_to_nodes(
+        &self,
+        start: Vec3,
+        targets: &[NodeId],
+        opts: PathOptions,
+    ) -> Option<Path> {
+        if targets
+            .iter()
+            .any(|&t| t as usize >= self.manual_groups.len())
+        {
             return None;
         }
         let footprint = self.profile(opts.profile)?.footprint;
@@ -484,9 +574,17 @@ impl TileContext {
         };
         // Group blocking may be exempted for targets; fitting never is.
         let is_blocked = |n: NodeId| {
-            !self.fits(n, footprint) || (self.effective_groups(n) & opts.blocked_mask != 0 && !exempt.contains(&n))
+            !self.fits(n, footprint)
+                || (self.effective_groups(n) & opts.blocked_mask != 0 && !exempt.contains(&n))
         };
-        astar_query(&self.grid, &Query { start, goals: &goals, is_blocked: &is_blocked })
+        astar_query(
+            &self.grid,
+            &Query {
+                start,
+                goals: &goals,
+                is_blocked: &is_blocked,
+            },
+        )
     }
 
     /// Reachability from the node containing `start`, indexed by node id.
@@ -494,7 +592,9 @@ impl TileContext {
     pub fn reachable(&self, start: Vec3, opts: PathOptions) -> Option<Vec<bool>> {
         let footprint = self.profile(opts.profile)?.footprint;
         let start = self.snap_start(self.grid.node_from_position(start)?, opts, footprint)?;
-        let is_blocked = |n: NodeId| !self.fits(n, footprint) || self.effective_groups(n) & opts.blocked_mask != 0;
+        let is_blocked = |n: NodeId| {
+            !self.fits(n, footprint) || self.effective_groups(n) & opts.blocked_mask != 0
+        };
         Some(flood_fill(&self.grid, start, &is_blocked))
     }
 
@@ -506,7 +606,9 @@ impl TileContext {
             return Some(node);
         }
         self.grid.nearest_node(node, opts.snap_radius, |n| {
-            self.grid.has_edges(n) && self.fits(n, footprint) && self.effective_groups(n) & opts.blocked_mask == 0
+            self.grid.has_edges(n)
+                && self.fits(n, footprint)
+                && self.effective_groups(n) & opts.blocked_mask == 0
         })
     }
 }
@@ -525,15 +627,35 @@ mod tests {
     }
 
     fn rect(col: u32, row: u32, w: u32, h: u32) -> Bounds {
-        Bounds::TileRect { col, row, width: w, height: h, layer: Some(0) }
+        Bounds::TileRect {
+            col,
+            row,
+            width: w,
+            height: h,
+            layer: Some(0),
+        }
     }
 
     fn npc(id: u64, col: u32, row: u32) -> Entity {
-        Entity { id, category: 1, bounds: rect(col, row, 1, 1), blocking: NPC, flags: flags::PATHFIND_ADJACENT, sort_key: 0 }
+        Entity {
+            id,
+            category: 1,
+            bounds: rect(col, row, 1, 1),
+            blocking: NPC,
+            flags: flags::PATHFIND_ADJACENT,
+            sort_key: 0,
+        }
     }
 
     fn exit(id: u64, col: u32, row: u32, h: u32) -> Entity {
-        Entity { id, category: 2, bounds: rect(col, row, 1, h), blocking: EXIT, flags: 0, sort_key: 0 }
+        Entity {
+            id,
+            category: 2,
+            bounds: rect(col, row, 1, h),
+            blocking: EXIT,
+            flags: 0,
+            sort_key: 0,
+        }
     }
 
     /// 5x3 open corridor grid.
@@ -546,9 +668,24 @@ mod tests {
         let mut c = ctx();
         let npc = c.grid().node_id(2, 1, 0).unwrap();
         assert!(c.add_groups(npc, NPC));
-        let straight = c.find_path(cell(0, 1), cell(4, 1), PathOptions::default()).unwrap();
-        assert_eq!(straight.nodes.len(), 5, "ignoring groups walks straight through");
-        let around = c.find_path(cell(0, 1), cell(4, 1), PathOptions { blocked_mask: NPC, ..Default::default() }).unwrap();
+        let straight = c
+            .find_path(cell(0, 1), cell(4, 1), PathOptions::default())
+            .unwrap();
+        assert_eq!(
+            straight.nodes.len(),
+            5,
+            "ignoring groups walks straight through"
+        );
+        let around = c
+            .find_path(
+                cell(0, 1),
+                cell(4, 1),
+                PathOptions {
+                    blocked_mask: NPC,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!(around.nodes.len(), 7);
         assert!(!around.nodes.contains(&npc));
         assert!(!c.set_groups(999, NPC));
@@ -559,7 +696,10 @@ mod tests {
         let mut c = ctx();
         let exit = c.grid().node_id(4, 1, 0).unwrap();
         c.add_groups(exit, EXIT);
-        let opts = PathOptions { blocked_mask: EXIT | NPC, ..Default::default() };
+        let opts = PathOptions {
+            blocked_mask: EXIT | NPC,
+            ..Default::default()
+        };
         let p = c.find_path(cell(0, 1), cell(4, 1), opts).unwrap();
         assert_eq!(*p.nodes.last().unwrap(), exit);
     }
@@ -571,12 +711,25 @@ mod tests {
         c.add_groups(npc, NPC);
         let other = c.grid().node_id(3, 1, 0).unwrap();
         c.add_groups(other, NPC);
-        let opts = PathOptions { blocked_mask: NPC, goal_mode: GoalMode::Adjacent, ..Default::default() };
+        let opts = PathOptions {
+            blocked_mask: NPC,
+            goal_mode: GoalMode::Adjacent,
+            ..Default::default()
+        };
         let p = c.find_path_to_nodes(cell(0, 1), &[npc], opts).unwrap();
         let last = *p.nodes.last().unwrap();
-        assert!(last == c.grid().node_id(4, 0, 0).unwrap() || last == c.grid().node_id(4, 2, 0).unwrap());
+        assert!(
+            last == c.grid().node_id(4, 0, 0).unwrap()
+                || last == c.grid().node_id(4, 2, 0).unwrap()
+        );
         assert!(!p.nodes.contains(&npc) && !p.nodes.contains(&other));
-        assert_eq!(c.find_path_to_nodes(cell(4, 0), &[npc], opts).unwrap().nodes.len(), 1);
+        assert_eq!(
+            c.find_path_to_nodes(cell(4, 0), &[npc], opts)
+                .unwrap()
+                .nodes
+                .len(),
+            1
+        );
         assert_eq!(c.find_path_to_nodes(cell(0, 1), &[9999], opts), None);
     }
 
@@ -585,8 +738,21 @@ mod tests {
         let mut w = [1u8; 15];
         w[7] = 0;
         let c = TileContext::new(TileGrid::from_walkable(5, 3, 1, &w).unwrap());
-        assert_eq!(c.find_path(cell(2, 1), cell(4, 1), PathOptions::default()), None, "no snapping by default");
-        let p = c.find_path(cell(2, 1), cell(4, 1), PathOptions { snap_radius: 1, ..Default::default() }).unwrap();
+        assert_eq!(
+            c.find_path(cell(2, 1), cell(4, 1), PathOptions::default()),
+            None,
+            "no snapping by default"
+        );
+        let p = c
+            .find_path(
+                cell(2, 1),
+                cell(4, 1),
+                PathOptions {
+                    snap_radius: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_ne!(p.nodes[0], 7);
         assert_eq!(*p.nodes.last().unwrap(), c.grid().node_id(4, 1, 0).unwrap());
     }
@@ -599,27 +765,67 @@ mod tests {
         }
         let open = c.reachable(cell(0, 0), PathOptions::default()).unwrap();
         assert!(open.iter().all(|&r| r));
-        let blocked = c.reachable(cell(0, 0), PathOptions { blocked_mask: NPC, ..Default::default() }).unwrap();
+        let blocked = c
+            .reachable(
+                cell(0, 0),
+                PathOptions {
+                    blocked_mask: NPC,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert!(blocked[c.grid().node_id(1, 2, 0).unwrap() as usize]);
         assert!(!blocked[c.grid().node_id(3, 0, 0).unwrap() as usize]);
         c.clear_groups(NPC);
-        assert!(c.reachable(cell(0, 0), PathOptions { blocked_mask: NPC, ..Default::default() }).unwrap().iter().all(|&r| r));
+        assert!(
+            c.reachable(
+                cell(0, 0),
+                PathOptions {
+                    blocked_mask: NPC,
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .iter()
+            .all(|&r| r)
+        );
     }
 
     #[test]
     fn entities_project_into_blocking_groups_and_track_changes() {
         let mut c = ctx();
         let stats = c.sync_entities(&[npc(1, 2, 1), exit(2, 4, 0, 3)]);
-        assert_eq!(stats, SyncStats { added: 2, updated: 0, removed: 0 });
+        assert_eq!(
+            stats,
+            SyncStats {
+                added: 2,
+                updated: 0,
+                removed: 0
+            }
+        );
         let mid = c.grid().node_id(2, 1, 0).unwrap();
         assert_eq!(c.groups(mid), Some(NPC));
-        assert_eq!(c.entity_nodes(2).unwrap().len(), 3, "1x3 exit covers the whole last column");
+        assert_eq!(
+            c.entity_nodes(2).unwrap().len(),
+            3,
+            "1x3 exit covers the whole last column"
+        );
         assert_eq!(c.groups(c.grid().node_id(4, 2, 0).unwrap()), Some(EXIT));
 
         // Unchanged re-send: nothing happens. Moving the NPC frees its old cell.
-        assert_eq!(c.sync_entities(&[npc(1, 2, 1), exit(2, 4, 0, 3)]), SyncStats::default());
+        assert_eq!(
+            c.sync_entities(&[npc(1, 2, 1), exit(2, 4, 0, 3)]),
+            SyncStats::default()
+        );
         let stats = c.sync_entities(&[npc(1, 2, 0), exit(2, 4, 0, 3)]);
-        assert_eq!(stats, SyncStats { added: 0, updated: 1, removed: 0 });
+        assert_eq!(
+            stats,
+            SyncStats {
+                added: 0,
+                updated: 1,
+                removed: 0
+            }
+        );
         assert_eq!(c.groups(mid), Some(0));
         assert_eq!(c.groups(c.grid().node_id(2, 0, 0).unwrap()), Some(NPC));
 
@@ -627,7 +833,11 @@ mod tests {
         c.add_groups(mid, EXIT);
         assert_eq!(c.groups(mid), Some(EXIT));
         c.clear_groups(EXIT);
-        assert_eq!(c.groups(c.grid().node_id(4, 2, 0).unwrap()), Some(EXIT), "entity-derived survives clear");
+        assert_eq!(
+            c.groups(c.grid().node_id(4, 2, 0).unwrap()),
+            Some(EXIT),
+            "entity-derived survives clear"
+        );
 
         // Dropping the exit from the snapshot removes it and its groups.
         let stats = c.sync_entities(&[npc(1, 2, 0)]);
@@ -637,7 +847,11 @@ mod tests {
         assert_eq!(c.entity_nodes(2), None);
 
         assert_eq!(c.upsert_entity(npc(3, 9, 9)), Change::Added);
-        assert_eq!(c.entity_nodes(3), Some(&[][..]), "off-grid entity projects to nothing");
+        assert_eq!(
+            c.entity_nodes(3),
+            Some(&[][..]),
+            "off-grid entity projects to nothing"
+        );
         assert!(c.remove_entity(3));
         assert!(!c.remove_entity(3));
     }
@@ -646,15 +860,28 @@ mod tests {
     fn paths_to_entities_use_their_flag_and_nearest_points_are_geometric() {
         let mut c = ctx();
         c.sync_entities(&[npc(1, 4, 1), exit(2, 4, 0, 1)]);
-        let opts = PathOptions { blocked_mask: NPC | EXIT, ..Default::default() };
+        let opts = PathOptions {
+            blocked_mask: NPC | EXIT,
+            ..Default::default()
+        };
 
         let talk = c.find_path_to_entity(cell(0, 1), 1, opts).unwrap();
-        assert!(!talk.nodes.contains(&c.grid().node_id(4, 1, 0).unwrap()), "adjacent flag: never steps on the NPC");
+        assert!(
+            !talk.nodes.contains(&c.grid().node_id(4, 1, 0).unwrap()),
+            "adjacent flag: never steps on the NPC"
+        );
         let walk_onto = c.find_path_to_entity(cell(0, 1), 2, opts).unwrap();
-        assert_eq!(*walk_onto.nodes.last().unwrap(), c.grid().node_id(4, 0, 0).unwrap(), "no flag: ends on the exit");
+        assert_eq!(
+            *walk_onto.nodes.last().unwrap(),
+            c.grid().node_id(4, 0, 0).unwrap(),
+            "no flag: ends on the exit"
+        );
         assert_eq!(c.find_path_to_entity(cell(0, 1), 42, opts), None);
 
-        assert_eq!(c.entity_nearest_point(1, cell(0, 1)), Some(Vec3::new(4.0, 0.0, 1.5)));
+        assert_eq!(
+            c.entity_nearest_point(1, cell(0, 1)),
+            Some(Vec3::new(4.0, 0.0, 1.5))
+        );
     }
 
     #[test]
@@ -663,28 +890,93 @@ mod tests {
         let mut w = [1u8; 12];
         w[5] = 0;
         let mut c = TileContext::new(TileGrid::from_walkable(4, 3, 1, &w).unwrap());
-        let big = c.register_profile(Profile { footprint: 2, ..Default::default() }).unwrap();
+        let big = c
+            .register_profile(Profile {
+                footprint: 2,
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(big, 1);
-        assert_eq!(c.register_profile(Profile { footprint: 0, ..Default::default() }), None);
+        assert_eq!(
+            c.register_profile(Profile {
+                footprint: 0,
+                ..Default::default()
+            }),
+            None
+        );
 
         let small = PathOptions::default();
-        let wide = PathOptions { profile: big, ..Default::default() };
-        assert_eq!(c.find_path(cell(0, 0), cell(2, 1), small).unwrap().nodes.len(), 4);
-        assert_eq!(c.find_path(cell(0, 0), cell(2, 1), wide), None, "no 2x2-clear route out of the corner");
-        assert_eq!(c.find_path(cell(2, 0), cell(2, 1), wide).unwrap().nodes.len(), 2, "between the two anchors that fit");
-        assert_eq!(c.find_path(cell(0, 0), cell(2, 1), PathOptions { profile: 9, ..Default::default() }), None, "unknown profile");
+        let wide = PathOptions {
+            profile: big,
+            ..Default::default()
+        };
+        assert_eq!(
+            c.find_path(cell(0, 0), cell(2, 1), small)
+                .unwrap()
+                .nodes
+                .len(),
+            4
+        );
+        assert_eq!(
+            c.find_path(cell(0, 0), cell(2, 1), wide),
+            None,
+            "no 2x2-clear route out of the corner"
+        );
+        assert_eq!(
+            c.find_path(cell(2, 0), cell(2, 1), wide)
+                .unwrap()
+                .nodes
+                .len(),
+            2,
+            "between the two anchors that fit"
+        );
+        assert_eq!(
+            c.find_path(
+                cell(0, 0),
+                cell(2, 1),
+                PathOptions {
+                    profile: 9,
+                    ..Default::default()
+                }
+            ),
+            None,
+            "unknown profile"
+        );
 
         let reach = c.reachable(cell(2, 0), wide).unwrap();
-        assert_eq!(reach.iter().filter(|&&r| r).count(), 2, "only the two fitting anchors are reachable for the big agent");
-        assert_eq!(c.reachable(cell(2, 0), small).unwrap().iter().filter(|&&r| r).count(), 11);
+        assert_eq!(
+            reach.iter().filter(|&&r| r).count(),
+            2,
+            "only the two fitting anchors are reachable for the big agent"
+        );
+        assert_eq!(
+            c.reachable(cell(2, 0), small)
+                .unwrap()
+                .iter()
+                .filter(|&&r| r)
+                .count(),
+            11
+        );
     }
 
     fn chest(id: u64, col: u32, row: u32, sort_key: u32) -> Entity {
-        Entity { id, category: 3, bounds: rect(col, row, 1, 1), blocking: 0, flags: 0, sort_key }
+        Entity {
+            id,
+            category: 3,
+            bounds: rect(col, row, 1, 1),
+            blocking: 0,
+            flags: 0,
+            sort_key,
+        }
     }
 
     fn filters(list: &[Filter]) -> Vec<crate::tracker::FilterEntry> {
-        list.iter().map(|&filter| crate::tracker::FilterEntry { filter, enabled: true }).collect()
+        list.iter()
+            .map(|&filter| crate::tracker::FilterEntry {
+                filter,
+                enabled: true,
+            })
+            .collect()
     }
 
     #[test]
@@ -697,7 +989,11 @@ mod tests {
         assert_eq!((v.bearing_deg, v.elevation_deg), (90.0, 0.0), "due east");
         assert_eq!((v.distance, v.steps), (3.5, 3.5));
         let north = c.entity_vector(2).unwrap();
-        assert!((north.bearing_deg - 0.0).abs() < 1e-3, "due north, got {}", north.bearing_deg);
+        assert!(
+            (north.bearing_deg - 0.0).abs() < 1e-3,
+            "due north, got {}",
+            north.bearing_deg
+        );
         assert_eq!(c.entity_vector(9), None);
     }
 
@@ -706,7 +1002,10 @@ mod tests {
         let mut c = ctx();
         c.set_player_position(cell(0, 1));
         let a = c.reachable_from_player(0, NPC).unwrap();
-        assert!(Rc::ptr_eq(&a, &c.reachable_from_player(0, NPC).unwrap()), "same stamp: shared set");
+        assert!(
+            Rc::ptr_eq(&a, &c.reachable_from_player(0, NPC).unwrap()),
+            "same stamp: shared set"
+        );
         assert!(a.iter().all(|&r| r));
 
         c.sync_entities(&[npc(1, 2, 0), npc(2, 2, 1), npc(3, 2, 2)]);
@@ -714,49 +1013,128 @@ mod tests {
         assert!(!Rc::ptr_eq(&a, &b), "entity groups changed → recomputed");
         assert!(!b[c.grid().node_id(4, 1, 0).unwrap() as usize]);
 
-        c.grid_mut().add_link(1, crate::tile::Link { from: 5, to: 9, cost: 1.0, bidirectional: false, enabled: true }).unwrap();
-        assert!(c.reachable_from_player(0, NPC).unwrap()[9], "grid change → recomputed, teleporter crosses the wall");
+        c.grid_mut()
+            .add_link(
+                1,
+                crate::tile::Link {
+                    from: 5,
+                    to: 9,
+                    cost: 1.0,
+                    bidirectional: false,
+                    enabled: true,
+                },
+            )
+            .unwrap();
+        assert!(
+            c.reachable_from_player(0, NPC).unwrap()[9],
+            "grid change → recomputed, teleporter crosses the wall"
+        );
 
         c.set_player_position(cell(4, 1));
-        assert!(c.reachable_from_player(0, NPC).unwrap()[14], "player moved → recomputed from the new side");
-        assert_eq!(c.reachable_from_player(0, NPC).unwrap().iter().filter(|&&r| r).count(), 6, "the east side only");
+        assert!(
+            c.reachable_from_player(0, NPC).unwrap()[14],
+            "player moved → recomputed from the new side"
+        );
+        assert_eq!(
+            c.reachable_from_player(0, NPC)
+                .unwrap()
+                .iter()
+                .filter(|&&r| r)
+                .count(),
+            6,
+            "the east side only"
+        );
     }
 
     #[test]
     fn tracker_cycles_entities_in_sort_order_and_categories_ascending() {
         let mut c = ctx();
-        c.sync_entities(&[chest(30, 3, 0, 1), chest(31, 1, 0, 0), npc(10, 4, 2), exit(20, 4, 0, 1)]);
+        c.sync_entities(&[
+            chest(30, 3, 0, 1),
+            chest(31, 1, 0, 0),
+            npc(10, 4, 2),
+            exit(20, 4, 0, 1),
+        ]);
         let t = c.tracker_create(Tracker::new(Vec::new(), true));
         assert_eq!(t, 0);
 
         // ALL view first: entities ordered by (category, sort_key, id) → npc(1), exit(2), chests(3).
-        assert_eq!(c.tracker_act(t, Action::Next), Some(Selection { entity_id: 10, category: 1, index: 0 }));
-        assert_eq!(c.tracker_act(t, Action::Next), Some(Selection { entity_id: 20, category: 2, index: 1 }));
-        assert_eq!(c.tracker_act(t, Action::Next).unwrap().entity_id, 31, "sort_key 0 before sort_key 1");
+        assert_eq!(
+            c.tracker_act(t, Action::Next),
+            Some(Selection {
+                entity_id: 10,
+                category: 1,
+                index: 0
+            })
+        );
+        assert_eq!(
+            c.tracker_act(t, Action::Next),
+            Some(Selection {
+                entity_id: 20,
+                category: 2,
+                index: 1
+            })
+        );
+        assert_eq!(
+            c.tracker_act(t, Action::Next).unwrap().entity_id,
+            31,
+            "sort_key 0 before sort_key 1"
+        );
         assert_eq!(c.tracker_act(t, Action::Next).unwrap().entity_id, 30);
-        assert_eq!(c.tracker_act(t, Action::Next).unwrap().entity_id, 10, "wraps");
-        assert_eq!(c.tracker_act(t, Action::Prev).unwrap().entity_id, 30, "wraps backwards");
+        assert_eq!(
+            c.tracker_act(t, Action::Next).unwrap().entity_id,
+            10,
+            "wraps"
+        );
+        assert_eq!(
+            c.tracker_act(t, Action::Prev).unwrap().entity_id,
+            30,
+            "wraps backwards"
+        );
         assert_eq!(c.tracker_act(t, Action::Current).unwrap().index, 3);
         assert_eq!(c.tracker_count(t, None), Some(4));
 
         // Category cycling: ALL → 1 → 2 → 3 → ALL; selection resets.
-        assert_eq!(c.tracker_act(t, Action::CategoryNext), Some(Selection::none(1)));
-        assert_eq!(c.tracker_act(t, Action::CategoryNext), Some(Selection::none(2)));
-        assert_eq!(c.tracker_act(t, Action::CategoryNext), Some(Selection::none(3)));
+        assert_eq!(
+            c.tracker_act(t, Action::CategoryNext),
+            Some(Selection::none(1))
+        );
+        assert_eq!(
+            c.tracker_act(t, Action::CategoryNext),
+            Some(Selection::none(2))
+        );
+        assert_eq!(
+            c.tracker_act(t, Action::CategoryNext),
+            Some(Selection::none(3))
+        );
         assert_eq!(c.tracker_count(t, Some(3)), Some(2));
         assert_eq!(c.tracker_act(t, Action::Next).unwrap().entity_id, 31);
-        assert_eq!(c.tracker_act(t, Action::CategoryNext), Some(Selection::none(ALL)));
-        assert_eq!(c.tracker_act(t, Action::CategoryPrev), Some(Selection::none(3)));
+        assert_eq!(
+            c.tracker_act(t, Action::CategoryNext),
+            Some(Selection::none(ALL))
+        );
+        assert_eq!(
+            c.tracker_act(t, Action::CategoryPrev),
+            Some(Selection::none(3))
+        );
 
         // The selected entity vanishing: Current reports nothing, Next restarts.
         c.sync_entities(&[chest(30, 3, 0, 1), npc(10, 4, 2), exit(20, 4, 0, 1)]);
         assert_eq!(c.tracker_act(t, Action::Next).unwrap().entity_id, 30);
         c.sync_entities(&[npc(10, 4, 2), exit(20, 4, 0, 1)]);
         assert_eq!(c.tracker_act(t, Action::Current), Some(Selection::none(3)));
-        assert_eq!(c.tracker_act(t, Action::CategoryNext), Some(Selection::none(ALL)), "category 3 is gone");
+        assert_eq!(
+            c.tracker_act(t, Action::CategoryNext),
+            Some(Selection::none(ALL)),
+            "category 3 is gone"
+        );
         assert_eq!(c.tracker_act(9, Action::Next), None);
         assert!(c.tracker_destroy(t) && !c.tracker_destroy(t));
-        assert_eq!(c.tracker_create(Tracker::new(Vec::new(), false)), 0, "slot reused");
+        assert_eq!(
+            c.tracker_create(Tracker::new(Vec::new(), false)),
+            0,
+            "slot reused"
+        );
     }
 
     #[test]
@@ -766,29 +1144,85 @@ mod tests {
         // Two chests east of a wall of NPCs; one chest is hidden by convention.
         let mut hidden = chest(32, 4, 2, 0);
         hidden.flags = flags::HIDDEN;
-        c.sync_entities(&[npc(1, 2, 0), npc(2, 2, 1), npc(3, 2, 2), chest(30, 4, 0, 0), chest(31, 1, 2, 0), hidden]);
+        c.sync_entities(&[
+            npc(1, 2, 0),
+            npc(2, 2, 1),
+            npc(3, 2, 2),
+            chest(30, 4, 0, 0),
+            chest(31, 1, 2, 0),
+            hidden,
+        ]);
 
         let no_filters = c.tracker_create(Tracker::new(Vec::new(), true));
-        assert_eq!(c.tracker_count(no_filters, None), Some(6), "zero built-in rules: hidden is visible without a filter");
+        assert_eq!(
+            c.tracker_count(no_filters, None),
+            Some(6),
+            "zero built-in rules: hidden is visible without a filter"
+        );
 
-        let default = c.tracker_create(Tracker::new(filters(&[Filter::Flags { require: 0, forbid: flags::HIDDEN }]), true));
+        let default = c.tracker_create(Tracker::new(
+            filters(&[Filter::Flags {
+                require: 0,
+                forbid: flags::HIDDEN,
+            }]),
+            true,
+        ));
         assert_eq!(c.tracker_count(default, None), Some(5));
 
         let reachable = c.tracker_create(Tracker::new(
-            filters(&[Filter::Flags { require: 0, forbid: flags::HIDDEN }, Filter::Reachable { profile: 0, blocked_mask: NPC }]),
+            filters(&[
+                Filter::Flags {
+                    require: 0,
+                    forbid: flags::HIDDEN,
+                },
+                Filter::Reachable {
+                    profile: 0,
+                    blocked_mask: NPC,
+                },
+            ]),
             true,
         ));
-        assert_eq!(c.tracker_count(reachable, None), Some(4), "chest 30 is behind the NPC wall; the NPCs themselves are adjacent-reachable");
+        assert_eq!(
+            c.tracker_count(reachable, None),
+            Some(4),
+            "chest 30 is behind the NPC wall; the NPCs themselves are adjacent-reachable"
+        );
         assert_eq!(c.tracker_count(reachable, Some(3)), Some(1));
-        assert!(c.tracker_mut(reachable).unwrap().set_filter_enabled(1, false));
-        assert_eq!(c.tracker_count(reachable, None), Some(5), "toggled off → plain default view");
-        assert!(!c.tracker_mut(reachable).unwrap().set_filter_enabled(7, true));
+        assert!(
+            c.tracker_mut(reachable)
+                .unwrap()
+                .set_filter_enabled(1, false)
+        );
+        assert_eq!(
+            c.tracker_count(reachable, None),
+            Some(5),
+            "toggled off → plain default view"
+        );
+        assert!(
+            !c.tracker_mut(reachable)
+                .unwrap()
+                .set_filter_enabled(7, true)
+        );
 
-        let nearby = c.tracker_create(Tracker::new(filters(&[Filter::Range { max_distance: 1.5 }]), true));
-        assert_eq!(c.tracker_count(nearby, None), Some(2), "npc(2,1) at 1.5 and chest 31 at ~1.4");
+        let nearby = c.tracker_create(Tracker::new(
+            filters(&[Filter::Range { max_distance: 1.5 }]),
+            true,
+        ));
+        assert_eq!(
+            c.tracker_count(nearby, None),
+            Some(2),
+            "npc(2,1) at 1.5 and chest 31 at ~1.4"
+        );
 
-        let chests_only = c.tracker_create(Tracker::new(filters(&[Filter::Categories { mask: 1 << 3 }]), false));
-        assert_eq!(c.tracker_act(chests_only, Action::Next).unwrap().category, 3, "without ALL, starts in the first available category");
+        let chests_only = c.tracker_create(Tracker::new(
+            filters(&[Filter::Categories { mask: 1 << 3 }]),
+            false,
+        ));
+        assert_eq!(
+            c.tracker_act(chests_only, Action::Next).unwrap().category,
+            3,
+            "without ALL, starts in the first available category"
+        );
         assert_eq!(c.tracker_count(chests_only, None), Some(3));
     }
 
@@ -796,13 +1230,29 @@ mod tests {
     fn entity_reachability_counts_adjacent_standing_room() {
         let mut c = ctx();
         c.sync_entities(&[npc(1, 2, 1)]);
-        let opts = PathOptions { blocked_mask: NPC, ..Default::default() };
+        let opts = PathOptions {
+            blocked_mask: NPC,
+            ..Default::default()
+        };
         let reached = c.reachable(cell(0, 1), opts).unwrap();
-        assert!(!reached[c.grid().node_id(2, 1, 0).unwrap() as usize], "the NPC's own cell is blocked");
-        assert_eq!(c.entity_reachable(&reached, 1), Some(true), "...but you can stand next to it");
+        assert!(
+            !reached[c.grid().node_id(2, 1, 0).unwrap() as usize],
+            "the NPC's own cell is blocked"
+        );
+        assert_eq!(
+            c.entity_reachable(&reached, 1),
+            Some(true),
+            "...but you can stand next to it"
+        );
 
         // Wall it in with more NPCs: nothing adjacent is reachable any more.
-        c.sync_entities(&[npc(1, 2, 1), npc(2, 1, 1), npc(3, 3, 1), npc(4, 2, 0), npc(5, 2, 2)]);
+        c.sync_entities(&[
+            npc(1, 2, 1),
+            npc(2, 1, 1),
+            npc(3, 3, 1),
+            npc(4, 2, 0),
+            npc(5, 2, 2),
+        ]);
         let reached = c.reachable(cell(0, 1), opts).unwrap();
         assert_eq!(c.entity_reachable(&reached, 1), Some(false));
         assert_eq!(c.entity_reachable(&reached, 99), None);

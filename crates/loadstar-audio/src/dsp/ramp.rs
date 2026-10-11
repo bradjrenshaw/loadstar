@@ -8,7 +8,10 @@ pub struct Ramp {
 
 impl Ramp {
     pub const fn new(value: f32) -> Ramp {
-        Ramp { current: value, target: value }
+        Ramp {
+            current: value,
+            target: value,
+        }
     }
 
     pub fn set_target(&mut self, target: f32) {
@@ -37,7 +40,11 @@ impl Ramp {
     /// its target, so the next block starts there. Sample `i` of the block uses `start + step * i`.
     pub fn block(&mut self, frames: usize) -> (f32, f32) {
         let start = self.current;
-        let step = if frames == 0 { 0.0 } else { (self.target - self.current) / frames as f32 };
+        let step = if frames == 0 {
+            0.0
+        } else {
+            (self.target - self.current) / frames as f32
+        };
         self.current = self.target;
         (start, step)
     }

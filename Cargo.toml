@@ -11,6 +11,7 @@ repository = "https://github.com/bradjrenshaw/loadstar"
 [workspace.dependencies]
 loadstar-core = { path = "crates/loadstar-core", version = "0.1.0" }
 loadstar-audio = { path = "crates/loadstar-audio", version = "0.1.0" }
+loadstar-speech = { path = "crates/loadstar-speech", version = "0.1.0", default-features = false }
 
 [profile.release]
 lto = true

@@ -23,11 +23,23 @@ impl Default for Biquad {
 
 impl Biquad {
     pub const fn identity() -> Biquad {
-        Biquad { b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0, z1: 0.0, z2: 0.0 }
+        Biquad {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+            z1: 0.0,
+            z2: 0.0,
+        }
     }
 
     pub fn is_identity(&self) -> bool {
-        (self.b0 - 1.0).abs() < 1e-6 && self.b1.abs() < 1e-6 && self.b2.abs() < 1e-6 && self.a1.abs() < 1e-6 && self.a2.abs() < 1e-6
+        (self.b0 - 1.0).abs() < 1e-6
+            && self.b1.abs() < 1e-6
+            && self.b2.abs() < 1e-6
+            && self.a1.abs() < 1e-6
+            && self.a2.abs() < 1e-6
     }
 
     pub fn reset_state(&mut self) {
@@ -52,14 +64,28 @@ impl Biquad {
         let w0 = Self::w0(rate, hz);
         let (sin, cos) = (w0.sin(), w0.cos());
         let alpha = sin / (2.0 * q.max(0.05) as f64);
-        self.set((1.0 - cos) / 2.0, 1.0 - cos, (1.0 - cos) / 2.0, 1.0 + alpha, -2.0 * cos, 1.0 - alpha);
+        self.set(
+            (1.0 - cos) / 2.0,
+            1.0 - cos,
+            (1.0 - cos) / 2.0,
+            1.0 + alpha,
+            -2.0 * cos,
+            1.0 - alpha,
+        );
     }
 
     pub fn set_highpass(&mut self, rate: f32, hz: f32, q: f32) {
         let w0 = Self::w0(rate, hz);
         let (sin, cos) = (w0.sin(), w0.cos());
         let alpha = sin / (2.0 * q.max(0.05) as f64);
-        self.set((1.0 + cos) / 2.0, -(1.0 + cos), (1.0 + cos) / 2.0, 1.0 + alpha, -2.0 * cos, 1.0 - alpha);
+        self.set(
+            (1.0 + cos) / 2.0,
+            -(1.0 + cos),
+            (1.0 + cos) / 2.0,
+            1.0 + alpha,
+            -2.0 * cos,
+            1.0 - alpha,
+        );
     }
 
     /// Shelves and peaks at 0 dB become exact identity coefficients (state preserved), so a
@@ -80,7 +106,14 @@ impl Biquad {
         let w0 = Self::w0(rate, hz);
         let (sin, cos) = (w0.sin(), w0.cos());
         let alpha = sin / (2.0 * q.max(0.05) as f64);
-        self.set(1.0 + alpha * a, -2.0 * cos, 1.0 - alpha * a, 1.0 + alpha / a, -2.0 * cos, 1.0 - alpha / a);
+        self.set(
+            1.0 + alpha * a,
+            -2.0 * cos,
+            1.0 - alpha * a,
+            1.0 + alpha / a,
+            -2.0 * cos,
+            1.0 - alpha / a,
+        );
     }
 
     /// Shelf slope S = 1 (the gentlest maximally-flat shelf).

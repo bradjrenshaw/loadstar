@@ -92,15 +92,27 @@ impl SourceDesc {
     }
 
     pub fn buffer(id: u64, buffer: u32, bounds: Bounds) -> SourceDesc {
-        SourceDesc { buffer, ..Self::base(id, SourceKind::Buffer, bounds) }
+        SourceDesc {
+            buffer,
+            ..Self::base(id, SourceKind::Buffer, bounds)
+        }
     }
 
     pub fn oscillator(id: u64, hz: f32, waveform: Waveform, bounds: Bounds) -> SourceDesc {
-        SourceDesc { pitch: hz, waveform: waveform as u8, repeat_count: 0, ..Self::base(id, SourceKind::Oscillator, bounds) }
+        SourceDesc {
+            pitch: hz,
+            waveform: waveform as u8,
+            repeat_count: 0,
+            ..Self::base(id, SourceKind::Oscillator, bounds)
+        }
     }
 
     pub fn noise(id: u64, color: NoiseColor, bounds: Bounds) -> SourceDesc {
-        SourceDesc { waveform: color as u8, repeat_count: 0, ..Self::base(id, SourceKind::Noise, bounds) }
+        SourceDesc {
+            waveform: color as u8,
+            repeat_count: 0,
+            ..Self::base(id, SourceKind::Noise, bounds)
+        }
     }
 
     pub fn looping(mut self) -> SourceDesc {
@@ -135,8 +147,14 @@ impl SourceDesc {
 
     /// Equality for "did the record change" — the edge-triggered RESTART bit is not state.
     fn same_record(&self, other: &SourceDesc) -> bool {
-        let a = SourceDesc { flags: self.flags & !flags::RESTART, ..*self };
-        let b = SourceDesc { flags: other.flags & !flags::RESTART, ..*other };
+        let a = SourceDesc {
+            flags: self.flags & !flags::RESTART,
+            ..*self
+        };
+        let b = SourceDesc {
+            flags: other.flags & !flags::RESTART,
+            ..*other
+        };
         a == b
     }
 }
@@ -156,7 +174,11 @@ pub struct Listener {
 
 impl Default for Listener {
     fn default() -> Self {
-        Listener { position: Vec3::default(), forward: Vec3::new(0.0, 0.0, -1.0), up: Vec3::new(0.0, 1.0, 0.0) }
+        Listener {
+            position: Vec3::default(),
+            forward: Vec3::new(0.0, 0.0, -1.0),
+            up: Vec3::new(0.0, 1.0, 0.0),
+        }
     }
 }
 
@@ -170,7 +192,11 @@ pub struct SpaceConfig {
 
 impl Default for SpaceConfig {
     fn default() -> Self {
-        SpaceConfig { mode: SpaceMode::Planar, gain: 1.0, unit_scale: 1.0 }
+        SpaceConfig {
+            mode: SpaceMode::Planar,
+            gain: 1.0,
+            unit_scale: 1.0,
+        }
     }
 }
 
@@ -182,7 +208,11 @@ pub struct Bus {
 
 impl Bus {
     pub fn new(gain: f32, rate: f32, block: usize) -> Bus {
-        Bus { gain: Ramp::new(gain), chain: Chain::empty(rate, 2, block), buf: vec![0.0; block * 2] }
+        Bus {
+            gain: Ramp::new(gain),
+            chain: Chain::empty(rate, 2, block),
+            buf: vec![0.0; block * 2],
+        }
     }
 }
 
@@ -331,7 +361,13 @@ impl Space {
 
     /// A space with `prewarm` voices ready, so the audio thread allocates nothing until more
     /// than that many sources are alive at once. Game thread.
-    pub fn with_pool(cfg: SpaceConfig, rate: f32, block: usize, renderer: Box<dyn Renderer>, prewarm: usize) -> Space {
+    pub fn with_pool(
+        cfg: SpaceConfig,
+        rate: f32,
+        block: usize,
+        renderer: Box<dyn Renderer>,
+        prewarm: usize,
+    ) -> Space {
         let mut pool = Vec::with_capacity(prewarm);
         for _ in 0..prewarm {
             pool.push(Voice::blank(rate, block, renderer.as_ref()));
@@ -407,11 +443,22 @@ impl Space {
         if id == 0 {
             return None;
         }
-        self.voices.iter().position(|v| v.desc.id == id && v.declared == declared)
+        self.voices
+            .iter()
+            .position(|v| v.desc.id == id && v.declared == declared)
     }
 
-    fn create_voice(&mut self, desc: SourceDesc, declared: bool, buffers: &[Option<Arc<Buffer>>]) -> usize {
-        let buffer = if desc.kind == SourceKind::Buffer { buffers.get(desc.buffer as usize).cloned().flatten() } else { None };
+    fn create_voice(
+        &mut self,
+        desc: SourceDesc,
+        declared: bool,
+        buffers: &[Option<Arc<Buffer>>],
+    ) -> usize {
+        let buffer = if desc.kind == SourceKind::Buffer {
+            buffers.get(desc.buffer as usize).cloned().flatten()
+        } else {
+            None
+        };
         let mut voice = match self.pool.pop() {
             Some(v) => v,
             None => Voice::blank(self.rate, self.block, self.renderer.as_ref()),
@@ -447,11 +494,19 @@ impl Space {
         let restart = desc.flags & flags::RESTART != 0;
         let started = !old.playing() && desc.playing();
         let stopped = old.playing() && !desc.playing();
-        let buffer_changed = desc.kind != old.kind || (desc.kind == SourceKind::Buffer && desc.buffer != old.buffer);
-        voice.desc = SourceDesc { flags: desc.flags & !flags::RESTART, ..desc };
+        let buffer_changed =
+            desc.kind != old.kind || (desc.kind == SourceKind::Buffer && desc.buffer != old.buffer);
+        voice.desc = SourceDesc {
+            flags: desc.flags & !flags::RESTART,
+            ..desc
+        };
         voice.remove_when_done = !voice.declared || desc.flags & flags::AUTO_REMOVE != 0;
         if buffer_changed {
-            let next = if desc.kind == SourceKind::Buffer { buffers.get(desc.buffer as usize).cloned().flatten() } else { None };
+            let next = if desc.kind == SourceKind::Buffer {
+                buffers.get(desc.buffer as usize).cloned().flatten()
+            } else {
+                None
+            };
             if let Some(old) = std::mem::replace(&mut voice.buffer, next) {
                 self.released.push(Garbage::Buffer(old));
             }
@@ -517,7 +572,10 @@ impl Space {
     /// Play a sequence and remove the source when it drains. Id 0 is anonymous; a nonzero id
     /// retriggers an existing fired voice with that id instead of stacking a new one.
     pub fn fire(&mut self, desc: SourceDesc, buffers: &[Option<Arc<Buffer>>]) {
-        let desc = SourceDesc { flags: desc.flags | flags::PLAYING | flags::RESTART, ..desc };
+        let desc = SourceDesc {
+            flags: desc.flags | flags::PLAYING | flags::RESTART,
+            ..desc
+        };
         match self.find(desc.id, false) {
             Some(i) => self.apply_desc(i, desc, buffers),
             None => {
@@ -538,7 +596,10 @@ impl Space {
     }
 
     pub fn source_chain_mut(&mut self, id: u64, stage: Stage) -> Option<&mut Chain> {
-        let v = self.voices.iter_mut().find(|v| v.desc.id == id && id != 0)?;
+        let v = self
+            .voices
+            .iter_mut()
+            .find(|v| v.desc.id == id && id != 0)?;
         Some(match stage {
             Stage::Pre => &mut v.pre,
             Stage::Post => &mut v.post,
@@ -550,7 +611,11 @@ impl Space {
         Some(SourceState {
             playing: v.active(),
             position_frames: v.pos as u64,
-            plays_remaining: if v.desc.repeat_count == 0 { u16::MAX } else { v.desc.repeat_count.saturating_sub(v.plays_done) },
+            plays_remaining: if v.desc.repeat_count == 0 {
+                u16::MAX
+            } else {
+                v.desc.repeat_count.saturating_sub(v.plays_done)
+            },
         })
     }
 
@@ -588,7 +653,11 @@ impl Space {
 
     /// `(index, priority, level)` of every audible voice, for the engine's voice cap.
     pub fn audible(&self) -> impl Iterator<Item = (usize, u8, f32)> + '_ {
-        self.voices.iter().enumerate().filter(|(_, v)| v.active()).map(|(i, v)| (i, v.desc.priority, v.level.target()))
+        self.voices
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.active())
+            .map(|(i, v)| (i, v.desc.priority, v.level.target()))
     }
 
     pub fn steal(&mut self, index: usize) {
@@ -681,10 +750,15 @@ impl Space {
                                 any = true;
                             } else {
                                 v.plays_done = v.plays_done.saturating_add(1);
-                                let more = v.desc.repeat_count == 0 || v.plays_done < v.desc.repeat_count;
+                                let more =
+                                    v.desc.repeat_count == 0 || v.plays_done < v.desc.repeat_count;
                                 if more {
                                     v.pos = 0.0;
-                                    v.phase = if gap_frames > 0 { Phase::Gap(gap_frames) } else { Phase::Playing };
+                                    v.phase = if gap_frames > 0 {
+                                        Phase::Gap(gap_frames)
+                                    } else {
+                                        Phase::Playing
+                                    };
                                 } else {
                                     // The record keeps the mod's declared PLAYING bit; "finished"
                                     // is the phase, so an unchanged re-send does not retrigger.
@@ -697,7 +771,11 @@ impl Space {
                             }
                         }
                         Phase::Gap(n) => {
-                            v.phase = if n <= 1 { Phase::Playing } else { Phase::Gap(n - 1) };
+                            v.phase = if n <= 1 {
+                                Phase::Playing
+                            } else {
+                                Phase::Gap(n - 1)
+                            };
                             any = true;
                         }
                         Phase::Idle => break,
@@ -733,12 +811,20 @@ impl Space {
             let distance_gain = if placement.relative || placement.inside {
                 1.0
             } else {
-                v.pre.distance().or(space_distance).unwrap_or_else(|| DistanceParams::default_for(unit_scale)).gain(placement.distance)
+                v.pre
+                    .distance()
+                    .or(space_distance)
+                    .unwrap_or_else(|| DistanceParams::default_for(unit_scale))
+                    .gain(placement.distance)
             };
             if !v.stopping && !v.stolen {
                 let target = v.desc.gain.max(0.0) * distance_gain;
                 // A voice starting from silence lands on its level at once; only changes ramp.
-                if v.fresh { v.level.set_now(target) } else { v.level.set_target(target) }
+                if v.fresh {
+                    v.level.set_now(target)
+                } else {
+                    v.level.set_target(target)
+                }
             }
             v.fresh = false;
 
@@ -752,7 +838,11 @@ impl Space {
                 }
                 v.pre.process(mono);
                 let stereo = &mut self.stereo[..frames * 2];
-                let params = v.pre.spatializer().map(SpatializerParams::from_desc).unwrap_or(default_spat);
+                let params = v
+                    .pre
+                    .spatializer()
+                    .map(SpatializerParams::from_desc)
+                    .unwrap_or(default_spat);
                 v.render.process(mono, &placement, &params, stereo);
                 v.post.process(stereo);
                 let bus_index = (v.desc.bus as usize).min(self.buses.len() - 1);
@@ -764,8 +854,11 @@ impl Space {
 
             // Retire voices that are done and either stopping (ramp complete) or stolen while idle.
             let done_sequence = v.phase == Phase::Idle && v.remove_when_done;
-            let ramped_out = (v.stopping || v.stolen) && v.level.is_settled() && v.level.target() == 0.0;
-            if (done_sequence && (v.level.is_settled() || !produced)) || (ramped_out && (v.remove_when_done || v.stolen && v.phase == Phase::Idle)) {
+            let ramped_out =
+                (v.stopping || v.stolen) && v.level.is_settled() && v.level.target() == 0.0;
+            if (done_sequence && (v.level.is_settled() || !produced))
+                || (ramped_out && (v.remove_when_done || v.stolen && v.phase == Phase::Idle))
+            {
                 if v.stopping && v.declared && !v.remove_when_done {
                     v.phase = Phase::Idle;
                     v.stopping = false;
@@ -818,12 +911,20 @@ fn dot(a: Vec3, b: Vec3) -> f32 {
 }
 
 fn cross(a: Vec3, b: Vec3) -> Vec3 {
-    Vec3::new(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x)
+    Vec3::new(
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x,
+    )
 }
 
 fn normalize(v: Vec3, fallback: Vec3) -> Vec3 {
     let len = v.length();
-    if len < 1e-6 { fallback } else { Vec3::new(v.x / len, v.y / len, v.z / len) }
+    if len < 1e-6 {
+        fallback
+    } else {
+        Vec3::new(v.x / len, v.y / len, v.z / len)
+    }
 }
 
 #[cfg(test)]
@@ -839,7 +940,10 @@ mod tests {
     }
 
     fn buffers(frames: usize) -> Vec<Option<Arc<Buffer>>> {
-        vec![Some(Arc::new(Buffer { samples: vec![0.5; frames], rate: 48000 }))]
+        vec![Some(Arc::new(Buffer {
+            samples: vec![0.5; frames],
+            rate: 48000,
+        }))]
     }
 
     fn point(x: f32, z: f32) -> Bounds {
@@ -869,10 +973,16 @@ mod tests {
         let out = render(&mut s, 8);
         assert!(energy(&out, 1) > energy(&out, 0) * 3.0, "east is right");
         // Turn to face east: the source is now straight ahead → centred.
-        s.set_listener(Listener { forward: Vec3::new(1.0, 0.0, 0.0), ..Listener::default() });
+        s.set_listener(Listener {
+            forward: Vec3::new(1.0, 0.0, 0.0),
+            ..Listener::default()
+        });
         let out = render(&mut s, 12);
         let tail = &out[out.len() / 2..];
-        assert!((energy(tail, 0) - energy(tail, 1)).abs() < energy(tail, 0) * 0.05, "ahead is centred");
+        assert!(
+            (energy(tail, 0) - energy(tail, 1)).abs() < energy(tail, 0) * 0.05,
+            "ahead is centred"
+        );
     }
 
     #[test]
@@ -884,12 +994,22 @@ mod tests {
         s.sync(&[SourceDesc::buffer(1, 0, point(0.0, -8.0)).looping()], &b);
         let _ = render(&mut s, 2);
         let far = energy(&render(&mut s, 6), 0);
-        assert!(far < near * 0.1, "8 units away is much quieter: near {near}, far {far}");
-        let room = Bounds::Box { center: Vec3::new(0.0, 0.0, 0.0), extents: Vec3::new(3.0, 3.0, 3.0) };
+        assert!(
+            far < near * 0.1,
+            "8 units away is much quieter: near {near}, far {far}"
+        );
+        let room = Bounds::Box {
+            center: Vec3::new(0.0, 0.0, 0.0),
+            extents: Vec3::new(3.0, 3.0, 3.0),
+        };
         s.sync(&[SourceDesc::buffer(1, 0, room).looping()], &b);
         let _ = render(&mut s, 2);
         let inside = render(&mut s, 6);
-        assert!(energy(&inside, 0) > far * 20.0 && (energy(&inside, 0) - energy(&inside, 1)).abs() < 1e-3, "inside: loud and centred");
+        assert!(
+            energy(&inside, 0) > far * 20.0
+                && (energy(&inside, 0) - energy(&inside, 1)).abs() < 1e-3,
+            "inside: loud and centred"
+        );
     }
 
     #[test]
@@ -903,7 +1023,11 @@ mod tests {
         assert_eq!(s.take_finished(), vec![7]);
         for _ in 0..3 {
             s.sync(&[desc], &b);
-            assert_eq!(energy(&render(&mut s, 2), 0), 0.0, "re-sending the same record does not retrigger");
+            assert_eq!(
+                energy(&render(&mut s, 2), 0),
+                0.0,
+                "re-sending the same record does not retrigger"
+            );
         }
         assert!(s.take_finished().is_empty());
         assert!(!s.state(7).unwrap().playing);
@@ -916,13 +1040,20 @@ mod tests {
     fn fired_sources_repeat_with_gaps_and_remove_themselves() {
         let mut s = space();
         let b = buffers(BLOCK); // exactly one block long
-        s.fire(SourceDesc::buffer(9, 0, point(0.0, -2.0)).repeats(3, BLOCK as f32 / 48.0), &b); // gap = 1 block
+        s.fire(
+            SourceDesc::buffer(9, 0, point(0.0, -2.0)).repeats(3, BLOCK as f32 / 48.0),
+            &b,
+        ); // gap = 1 block
         let mut per_block = Vec::new();
         for _ in 0..8 {
             per_block.push(energy(&render(&mut s, 1), 0) > 1e-6);
         }
         // play, gap, play, gap, play, then silence
-        assert_eq!(&per_block[..6], &[true, false, true, false, true, false], "{per_block:?}");
+        assert_eq!(
+            &per_block[..6],
+            &[true, false, true, false, true, false],
+            "{per_block:?}"
+        );
         assert_eq!(s.take_finished(), vec![9]);
         assert_eq!(s.source_count(), 0, "fired: gone when done");
         // Anonymous fire is never reported and never stacks with anything.
@@ -939,8 +1070,16 @@ mod tests {
         let b = buffers(BLOCK);
         s.fire(SourceDesc::buffer(1, 0, point(0.0, -2.0)), &b);
         s.fire(SourceDesc::buffer(2, 0, point(1.0, -2.0)), &b);
-        assert_eq!((s.source_count(), s.pool_len()), (2, 0), "both came from the pool");
-        assert_eq!(Arc::strong_count(b[0].as_ref().unwrap()), 3, "two voices hold the buffer");
+        assert_eq!(
+            (s.source_count(), s.pool_len()),
+            (2, 0),
+            "both came from the pool"
+        );
+        assert_eq!(
+            Arc::strong_count(b[0].as_ref().unwrap()),
+            3,
+            "two voices hold the buffer"
+        );
         let _ = render(&mut s, 3);
         assert_eq!((s.source_count(), s.pool_len()), (0, 2), "both went back");
         let mut released = Vec::new();
@@ -948,10 +1087,18 @@ mod tests {
             released.push(g);
             Ok(())
         });
-        assert_eq!(released.len(), 2, "each retiring voice released its buffer reference");
+        assert_eq!(
+            released.len(),
+            2,
+            "each retiring voice released its buffer reference"
+        );
         assert!(released.iter().all(|g| matches!(g, Garbage::Buffer(_))));
         drop(released);
-        assert_eq!(Arc::strong_count(b[0].as_ref().unwrap()), 1, "no reference left on the audio side");
+        assert_eq!(
+            Arc::strong_count(b[0].as_ref().unwrap()),
+            1,
+            "no reference left on the audio side"
+        );
         // A refused sink keeps the item for next time.
         s.fire(SourceDesc::buffer(3, 0, point(0.0, -2.0)), &b);
         let _ = render(&mut s, 3);
@@ -974,33 +1121,71 @@ mod tests {
         // Constant 0.5 input, centred: the very first sample is already at level (no fade-in).
         let first = out[0].abs() + out[1].abs();
         let last = out[BLOCK * 2 - 2].abs() + out[BLOCK * 2 - 1].abs();
-        assert!((first - last).abs() < last * 0.05, "no ramp across the first block: {first} vs {last}");
+        assert!(
+            (first - last).abs() < last * 0.05,
+            "no ramp across the first block: {first} vs {last}"
+        );
         s.stop(4);
         let mut out = vec![0.0; BLOCK * 2];
         s.process(&mut out);
-        assert!(out[0].abs() > out[BLOCK * 2 - 2].abs() * 10.0, "stopping ramps down over the block");
+        assert!(
+            out[0].abs() > out[BLOCK * 2 - 2].abs() * 10.0,
+            "stopping ramps down over the block"
+        );
     }
 
     #[test]
     fn sync_omission_removes_and_gain_zero_keeps_alive() {
         let mut s = space();
         let b = buffers(48000);
-        s.sync(&[SourceDesc::buffer(1, 0, point(1.0, 0.0)).looping(), SourceDesc::buffer(2, 0, point(-1.0, 0.0)).looping()], &b);
+        s.sync(
+            &[
+                SourceDesc::buffer(1, 0, point(1.0, 0.0)).looping(),
+                SourceDesc::buffer(2, 0, point(-1.0, 0.0)).looping(),
+            ],
+            &b,
+        );
         let _ = render(&mut s, 2);
         assert_eq!(s.source_count(), 2);
-        s.sync(&[SourceDesc::buffer(1, 0, point(1.0, 0.0)).looping().with_gain(0.0)], &b);
+        s.sync(
+            &[SourceDesc::buffer(1, 0, point(1.0, 0.0))
+                .looping()
+                .with_gain(0.0)],
+            &b,
+        );
         let _ = render(&mut s, 4);
-        assert_eq!(s.source_count(), 1, "2 was omitted → removed after its ramp-out");
-        assert!(s.state(1).unwrap().playing, "gain 0 keeps the voice alive (mute-not-dispose)");
+        assert_eq!(
+            s.source_count(),
+            1,
+            "2 was omitted → removed after its ramp-out"
+        );
+        assert!(
+            s.state(1).unwrap().playing,
+            "gain 0 keeps the voice alive (mute-not-dispose)"
+        );
         assert!(energy(&render(&mut s, 2), 0) < 1e-6);
-        s.sync(&[SourceDesc::buffer(1, 0, point(1.0, 0.0)).looping().with_gain(1.0)], &b);
-        assert!(energy(&render(&mut s, 2), 1) > 0.0, "and resumes seamlessly");
+        s.sync(
+            &[SourceDesc::buffer(1, 0, point(1.0, 0.0))
+                .looping()
+                .with_gain(1.0)],
+            &b,
+        );
+        assert!(
+            energy(&render(&mut s, 2), 1) > 0.0,
+            "and resumes seamlessly"
+        );
     }
 
     #[test]
     fn oscillator_and_noise_sources_play_until_stopped() {
         let mut s = space();
-        s.sync(&[SourceDesc::oscillator(1, 440.0, Waveform::Sine, point(0.0, -1.0)), SourceDesc::noise(2, NoiseColor::Pink, point(0.0, 1.0))], &[]);
+        s.sync(
+            &[
+                SourceDesc::oscillator(1, 440.0, Waveform::Sine, point(0.0, -1.0)),
+                SourceDesc::noise(2, NoiseColor::Pink, point(0.0, 1.0)),
+            ],
+            &[],
+        );
         let out = render(&mut s, 4);
         assert!(energy(&out, 0) > 1.0 && energy(&out, 1) > 1.0);
         s.stop(1);
@@ -1015,13 +1200,22 @@ mod tests {
         let mut s = space();
         let b = buffers(48000);
         let quiet = s.add_bus(Bus::new(0.25, RATE, BLOCK));
-        s.sync(&[SourceDesc::buffer(1, 0, point(0.0, -1.0)).looping().on_bus(quiet)], &b);
+        s.sync(
+            &[SourceDesc::buffer(1, 0, point(0.0, -1.0))
+                .looping()
+                .on_bus(quiet)],
+            &b,
+        );
         let _ = render(&mut s, 2);
         let on_quiet_bus = energy(&render(&mut s, 4), 0);
         s.sync(&[SourceDesc::buffer(1, 0, point(0.0, -1.0)).looping()], &b);
         let _ = render(&mut s, 2);
         let on_bus_0 = energy(&render(&mut s, 4), 0);
-        assert!((on_quiet_bus / on_bus_0 - 0.0625).abs() < 0.01, "gain 0.25 → energy 1/16: {}", on_quiet_bus / on_bus_0);
+        assert!(
+            (on_quiet_bus / on_bus_0 - 0.0625).abs() < 0.01,
+            "gain 0.25 → energy 1/16: {}",
+            on_quiet_bus / on_bus_0
+        );
         s.set_gain(0.5);
         let _ = render(&mut s, 2);
         let half = energy(&render(&mut s, 4), 0);

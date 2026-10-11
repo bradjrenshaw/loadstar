@@ -1,0 +1,37 @@
+[package]
+name = "loadstar-speech"
+description = "Speech for game accessibility mods: one categorised voice tree (screen readers via Prism, native synthesizers), queues with explicit interrupt semantics, render-to-PCM and positioned speech through loadstar-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["prism", "sapi", "clipboard", "audio"]
+# Load prism.dll at runtime (libloading) for every screen reader it knows. No build-time link.
+prism = ["dep:libloading"]
+# Native SAPI 5 through COM (Windows).
+sapi = []
+# The clipboard leaf (Windows).
+clipboard = []
+# Positioned speech: render on the worker, fire through loadstar-audio's in-process intake.
+audio = ["dep:loadstar-audio"]
+
+[dependencies]
+loadstar-core.workspace = true
+loadstar-audio = { workspace = true, optional = true }
+libloading = { version = "0.9", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_Media_Speech",
+    "Win32_Media_Audio",
+    "Win32_UI_Shell",
+] }

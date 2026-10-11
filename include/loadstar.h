@@ -10,8 +10,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-/* The audio surface (la_*) is compiled in by default. */
+/* The audio (la_*) and speech (lv_*) surfaces are compiled in by default. */
 #define LOADSTAR_AUDIO 1
+#define LOADSTAR_SPEECH 1
 
 /**
  * Result of every ABI call. Exported to C as `LsStatus`.
@@ -36,6 +37,14 @@ typedef enum LsStatus {
    * The audio command queue is full — the mixer is not draining.
    */
   LsStatus_Busy = 6,
+  /**
+   * Speech: the chosen voice is absent and `NoFallback` was set, or nothing at all can speak.
+   */
+  LsStatus_VoiceUnavailable = 7,
+  /**
+   * Speech: a feature the call needs is not in the resolved voice's set.
+   */
+  LsStatus_NotSupported = 8,
   /**
    * Internal panic caught at the boundary. The context may be inconsistent; the host is intact.
    */
@@ -79,6 +88,13 @@ typedef struct LsContext LsContext;
  * Opaque: a path result (spec §8). Exported to C as `LsPath`.
  */
 typedef struct LsPath LsPath;
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * Opaque: a speech context. Exported to C as `LsSpeech`.
+ */
+typedef struct LsSpeech_ LsSpeech_;
+#endif
 
 /**
  * A position or displacement. `#[repr(C)]` so the FFI layer can pass it by value unchanged.
@@ -389,6 +405,52 @@ typedef struct LsAudioEffectDesc {
   uint32_t flags;
   float p[8];
 } LsAudioEffectDesc;
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * `lv_create` configuration.
+ */
+typedef struct LsSpeechConfig {
+  /**
+   * Explicit Prism library path (NUL-terminated UTF-8), or null for the default search.
+   */
+  const char *prism_path;
+  /**
+   * Nonzero = load Prism (default). Zero = never, for deterministic tests.
+   */
+  uint32_t load_prism;
+  /**
+   * Utterances that keep a queryable state; 0 = 1024.
+   */
+  uint32_t utterance_history;
+} LsSpeechConfig;
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * A profile (speech-spec §2): flat, caller-owned, 24 bytes. `voice` 0 = root auto.
+ */
+typedef struct LsSpeechProfile {
+  uint64_t voice;
+  float rate;
+  float pitch;
+  float volume;
+  /**
+   * `SpeechProfileFlags`.
+   */
+  uint32_t flags;
+} LsSpeechProfile;
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+typedef struct LsSpeechQueueOptions {
+  /**
+   * 1 = sequential; 0 = unlimited overlap.
+   */
+  uint32_t max_concurrent;
+  uint32_t gap_ms;
+} LsSpeechQueueOptions;
 #endif
 
 #define LsDir_ALL { LsDir_South, LsDir_North, LsDir_East, LsDir_West, }
@@ -950,6 +1012,305 @@ enum LsStatus la_effect_set_enabled(struct LsAudioDevice *dev,
                                     struct LsAudioChainTarget target,
                                     uint32_t index,
                                     bool enabled);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * Open a speech context. Cheap: backends probe on the worker; nothing speaks.
+ */
+enum LsStatus lv_create(const struct LsSpeechConfig *cfg, struct LsSpeech_ **out_ctx);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * Close a context: stops every queue, joins the worker. Null is a no-op.
+ */
+void lv_destroy(struct LsSpeech_ *ctx);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * The Prism tag this build was validated against, and where the library was loaded from
+ * (`"v0.18.3 @ C:\...\prism.dll"`); empty when Prism is not loaded.
+ */
+enum LsStatus lv_prism_version(struct LsSpeech_ *ctx, char *buf, uintptr_t cap, uintptr_t *written);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * Ask for a re-probe; `changed` reports whether the tree's shape changed since the last call
+ * (the re-probe lands asynchronously — call again next frame to see its result).
+ */
+enum LsStatus lv_tree_refresh(struct LsSpeech_ *ctx, bool *changed);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * Snapshot generation; 0 until the first probe has published.
+ */
+enum LsStatus lv_tree_generation(struct LsSpeech_ *ctx, uint64_t *generation);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+enum LsStatus lv_category_count(struct LsSpeech_ *ctx, uintptr_t *count);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+enum LsStatus lv_category_at(struct LsSpeech_ *ctx, uintptr_t index, uint64_t *id);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * The category's fixed key (`screen_readers`, `sapi5`, …) — what a mod localizes.
+ */
+enum LsStatus lv_category_key(struct LsSpeech_ *ctx,
+                              uint64_t id,
+                              char *buf,
+                              uintptr_t cap,
+                              uintptr_t *written);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * The category's default (English) display name — the fallback for unknown keys.
+ */
+enum LsStatus lv_category_name(struct LsSpeech_ *ctx,
+                               uint64_t id,
+                               char *buf,
+                               uintptr_t cap,
+                               uintptr_t *written);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+enum LsStatus lv_category_rank(struct LsSpeech_ *ctx, uint64_t id, int32_t *rank);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * The voice id that means "this category's best".
+ */
+enum LsStatus lv_category_auto(struct LsSpeech_ *ctx, uint64_t id, uint64_t *voice);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+enum LsStatus lv_voice_count(struct LsSpeech_ *ctx, uint64_t category, uintptr_t *count);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+enum LsStatus lv_voice_at(struct LsSpeech_ *ctx, uint64_t category, uintptr_t index, uint64_t *id);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+enum LsStatus lv_voice_name(struct LsSpeech_ *ctx,
+                            uint64_t id,
+                            char *buf,
+                            uintptr_t cap,
+                            uintptr_t *written);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * BCP-47 where the backend knows it; empty otherwise.
+ */
+enum LsStatus lv_voice_language(struct LsSpeech_ *ctx,
+                                uint64_t id,
+                                char *buf,
+                                uintptr_t cap,
+                                uintptr_t *written);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+enum LsStatus lv_voice_category(struct LsSpeech_ *ctx, uint64_t id, uint64_t *category);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * Bitwise OR of `SpeechFeature`.
+ */
+enum LsStatus lv_voice_features(struct LsSpeech_ *ctx, uint64_t id, uint64_t *bits);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * Whether the leaf can speak right now (reader running, voice installed).
+ */
+enum LsStatus lv_voice_available(struct LsSpeech_ *ctx, uint64_t id, bool *available);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * What `profile` would use right now for a call needing `required` features. `voice` is the
+ * leaf that would speak (0 = nothing, with `VoiceUnavailable`), `missing` the required bits it lacks.
+ */
+enum LsStatus lv_resolve(struct LsSpeech_ *ctx,
+                         const struct LsSpeechProfile *profile_,
+                         uint64_t required,
+                         uint64_t *voice,
+                         bool *fell_back,
+                         uint64_t *missing);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * Create a queue (`options` may be null for sequential, no gap). Queue 0 always exists.
+ */
+enum LsStatus lv_queue_create(struct LsSpeech_ *ctx,
+                              const struct LsSpeechQueueOptions *options,
+                              uint32_t *queue);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+enum LsStatus lv_queue_set(struct LsSpeech_ *ctx,
+                           uint32_t queue,
+                           const struct LsSpeechQueueOptions *options);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+enum LsStatus lv_queue_destroy(struct LsSpeech_ *ctx, uint32_t queue);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * Speak `text` (NUL-terminated UTF-8) on `queue` through `profile`. Returns the utterance id.
+ */
+enum LsStatus lv_speak(struct LsSpeech_ *ctx,
+                       uint32_t queue,
+                       const struct LsSpeechProfile *profile_,
+                       const char *text,
+                       uint32_t flags,
+                       uint64_t *utterance);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * Speech plus braille where the leaf supports both (`lv_speak` with `BrailleToo`).
+ */
+enum LsStatus lv_output(struct LsSpeech_ *ctx,
+                        uint32_t queue,
+                        const struct LsSpeechProfile *profile_,
+                        const char *text,
+                        uint32_t flags,
+                        uint64_t *utterance);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * Braille only.
+ */
+enum LsStatus lv_braille(struct LsSpeech_ *ctx,
+                         uint32_t queue,
+                         const struct LsSpeechProfile *profile_,
+                         const char *text,
+                         uint64_t *utterance);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * Silence as a queue item.
+ */
+enum LsStatus lv_gap(struct LsSpeech_ *ctx, uint32_t queue, uint32_t ms, uint64_t *utterance);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * Cut what this queue is speaking; keep what is pending.
+ */
+enum LsStatus lv_stop(struct LsSpeech_ *ctx, uint32_t queue);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * Drop everything pending on this queue; keep what is speaking.
+ */
+enum LsStatus lv_flush(struct LsSpeech_ *ctx, uint32_t queue);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+enum LsStatus lv_pause(struct LsSpeech_ *ctx, uint32_t queue);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+enum LsStatus lv_resume(struct LsSpeech_ *ctx, uint32_t queue);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * One utterance: cut if speaking, drop if pending.
+ */
+enum LsStatus lv_cancel(struct LsSpeech_ *ctx, uint64_t utterance);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * Every queue, every backend.
+ */
+enum LsStatus lv_stop_all(struct LsSpeech_ *ctx);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * `UtteranceState`, possibly with `Flat` OR-ed in.
+ */
+enum LsStatus lv_utterance_state(struct LsSpeech_ *ctx, uint64_t utterance, uint32_t *state);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * The leaf that spoke (or will speak) the utterance after any fallback; 0 if not yet known.
+ */
+enum LsStatus lv_utterance_voice(struct LsSpeech_ *ctx, uint64_t utterance, uint64_t *voice);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * Start a render job (worker thread, polled). `NotSupported` synchronously if the voice cannot render.
+ */
+enum LsStatus lv_render(struct LsSpeech_ *ctx,
+                        const struct LsSpeechProfile *profile_,
+                        const char *text,
+                        uint32_t flags,
+                        uint64_t *job);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+enum LsStatus lv_render_poll(struct LsSpeech_ *ctx, uint64_t job, uint32_t *state);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * The finished PCM (interleaved f32), library-owned and valid until `lv_render_free`.
+ * `InvalidArgument` while the job is not done.
+ */
+enum LsStatus lv_render_take(struct LsSpeech_ *ctx,
+                             uint64_t job,
+                             const float **samples,
+                             uintptr_t *frames,
+                             uint32_t *channels,
+                             uint32_t *rate);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+enum LsStatus lv_render_free(struct LsSpeech_ *ctx, uint64_t job);
+#endif
+
+#if (defined(LOADSTAR_SPEECH) && defined(LOADSTAR_AUDIO))
+/**
+ * Positional speech (audio feature): rendered on the worker, fired into `space` as a one-shot
+ * source built from `desc` (the mod's bus, bounds, gain, pan width, priority; `id`, `buffer` and
+ * the PLAYING/AUTO_REMOVE flags are the library's), honouring the queue like any utterance.
+ * `source` is the mod's handle for `la_source_stop` / `la_source_upsert` from the moment this
+ * returns.
+ */
+enum LsStatus lv_speak_at(struct LsSpeech_ *ctx,
+                          uint32_t queue,
+                          const struct LsSpeechProfile *profile_,
+                          const char *text,
+                          uint32_t flags,
+                          struct LsAudioDevice *device,
+                          uint32_t space,
+                          const struct LsAudioSourceDesc *desc,
+                          uint64_t *utterance,
+                          uint64_t *source);
 #endif
 
 #ifdef __cplusplus

@@ -9,6 +9,12 @@ pub struct NullBackend {
 
 impl NullBackend {
     pub fn new(sample_rate: u32, period_frames: usize) -> NullBackend {
-        NullBackend { info: StreamInfo { sample_rate, period_frames: period_frames.max(1), channels: 2 } }
+        NullBackend {
+            info: StreamInfo {
+                sample_rate,
+                period_frames: period_frames.max(1),
+                channels: 2,
+            },
+        }
     }
 }
