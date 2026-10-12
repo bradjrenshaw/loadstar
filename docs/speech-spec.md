@@ -155,7 +155,7 @@ Flags on a speak call:
 - **`FRONT`** — go to the head of this queue without cutting anything. The soft cut: a warning that should come next but not clip the word in progress.
 - Neither — append. **This is the default, and it is the SayTheSpire rule**: nothing interrupts unless the caller says so. Dialogue in wotr never interrupts; a cursor readout does. Interrupt is a property of the *call*, never of the profile or the queue.
 - **`SSML`** — text is SSML; `NotSupported` on leaves without the feature.
-- **`BRAILLE_TOO`** (on `lv_speak`) — same as `lv_output`; kept so bindings with a single speak method can express both.
+- **`BRAILLE_TOO`** (on `lv_speak`) — same as `lv_output`; kept so bindings with a single speak method can express both. It is a *preference*, never a requirement: on a leaf without braille (a synthesizer, the clipboard) the text is simply spoken. (Decided 2026-10-11 after the wotr migration shipped mute SAPI: every UI line goes through output.)
 
 Rules, all learned by ear in the mods:
 
@@ -321,7 +321,6 @@ Two lines in `spec.md` move:
 
 ## 12. Open questions
 
-- Prism's `output` on readers that lack braille: speak only, or `NotSupported`? (Proposed: speak only — `OUTPUT` means "the user's preferred modality set", not "both or fail".)
 - `lv_stop` on a queue sharing a reader with another queue cuts the other queue's live utterance (§3). Should the cut utterance report `Cancelled` or `Done`? (Proposed: `Cancelled`, truthfully.)
 - Whether `gap_ms` should also apply after an `INTERRUPT`, or only between naturally sequential items. (Proposed: only between sequential items; an interrupt is already a discontinuity.)
 - Category display names for third-party categories: English only from the backend, or per-language (the backend supplies a table, the mod asks with the game's language tag)? (Proposed: per-language optional, English required; built-ins need neither since mods localise their keys.)

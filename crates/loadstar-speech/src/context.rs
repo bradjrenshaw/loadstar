@@ -393,9 +393,8 @@ impl Speech {
         if flags & speak_flags::SSML != 0 {
             required |= features::SSML;
         }
-        if flags & speak_flags::BRAILLE_TOO != 0 {
-            required |= features::OUTPUT;
-        }
+        // BRAILLE_TOO never adds a requirement: "output" means the user's modality set, so a leaf
+        // without braille (a synthesizer, the clipboard) just speaks (speech-spec §3).
         self.precheck(profile, required)?;
         self.submit(
             queue,
@@ -795,6 +794,16 @@ mod tests {
             "gap honoured: {:?}",
             t.elapsed()
         );
+    }
+
+    #[test]
+    fn output_on_a_voice_without_braille_still_speaks() {
+        let (s, _, ss) = open(false); // no reader: root auto is SAPI, which has no OUTPUT feature
+        let id = s
+            .speak(0, &Profile::default(), "hello", speak_flags::BRAILLE_TOO)
+            .expect("output on a synthesizer speaks instead of being refused");
+        wait_until(|| s.utterance(id).0 == UtteranceState::Speaking, "spoken");
+        assert_eq!(speaks(&ss), vec!["hello"]);
     }
 
     #[test]
