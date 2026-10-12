@@ -191,7 +191,17 @@ impl Tree {
         self.by_id.get(&id).copied()
     }
 
+    /// The voices a UI should list under a category: the AVAILABLE ones (a reader that is not
+    /// running is not offered). An absent leaf is still addressable by id (`leaf`), so a saved pick
+    /// keeps its name and the library's fallback decides what speaks.
     pub fn leaves_in(&self, category: u64) -> impl Iterator<Item = &Leaf> + '_ {
+        self.leaves
+            .iter()
+            .filter(move |l| l.category == category && l.available)
+    }
+
+    /// Every leaf in a category, available or not.
+    pub fn all_leaves_in(&self, category: u64) -> impl Iterator<Item = &Leaf> + '_ {
         self.leaves.iter().filter(move |l| l.category == category)
     }
 
@@ -386,9 +396,18 @@ mod tests {
             .collect();
         assert_eq!(
             readers,
-            vec![("NVDA", 0), ("JAWS", 1)],
-            "native NVDA wins over Prism's; JAWS only from Prism"
+            vec![("NVDA", 0)],
+            "native NVDA wins over Prism's; JAWS is absent so it is not listed"
         );
+        let all: Vec<&str> = t
+            .all_leaves_in(ids::category_id(SCREEN_READERS))
+            .map(|l| l.name.as_str())
+            .collect();
+        assert_eq!(all, vec!["NVDA", "JAWS"]);
+        let jaws = t
+            .leaf(ids::voice_id("prism", "jaws"))
+            .expect("an absent leaf stays addressable by id");
+        assert!(!jaws.available);
     }
 
     #[test]
