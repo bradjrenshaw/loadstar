@@ -155,9 +155,22 @@ const READERS: &[u64] = &[
     0xED4760890B55C2F2, // SenseReader
     0x8380F2A37B2C3EB6, // System Access
     0x9120D89908785C13, // Window-Eyes
-    0xCB4897961A754BCB, // VoiceOver
     0xD199C175AEEC494B, // Android screen reader
 ];
+
+/// Prism backend ids that never become leaves. VoiceOver (v0.18.3, macOS) proved too unreliable
+/// in Blindfold to offer; AVSpeech is the macOS default instead.
+const EXCLUDED: &[u64] = &[
+    0xCB4897961A754BCB, // VoiceOver
+];
+
+/// Prism synthesizers that belong in a built-in category rather than the catch-all "prism" one.
+fn builtin_category(id: u64) -> Option<&'static str> {
+    match id {
+        0x28E3429577805C24 => Some(tree::AVSPEECH), // AVSpeech
+        _ => None,
+    }
+}
 
 /// Where to look for the library (speech-spec §4.3).
 pub fn candidates(explicit: Option<&Path>) -> Vec<PathBuf> {
@@ -385,7 +398,7 @@ impl Backend for PrismBackend {
             for i in 0..n {
                 let id = (api.registry_id_at)(self.ctx, i);
                 let synth_allowed = !cfg!(windows);
-                if !READERS.contains(&id) && !synth_allowed {
+                if EXCLUDED.contains(&id) || (!READERS.contains(&id) && !synth_allowed) {
                     continue;
                 }
                 let name_ptr = (api.registry_name)(self.ctx, id);
@@ -407,18 +420,19 @@ impl Backend for PrismBackend {
                     f |= features::SCREEN_READER;
                     f &= !features::RENDER; // a reader never renders, whatever its bits say
                 }
+                let builtin = if is_reader {
+                    Some(tree::SCREEN_READERS)
+                } else {
+                    builtin_category(id)
+                };
                 out.push(LeafSpec {
-                    category: if is_reader {
-                        tree::SCREEN_READERS.into()
-                    } else {
-                        "prism".into()
-                    },
-                    category_name: if is_reader {
+                    category: builtin.unwrap_or("prism").into(),
+                    category_name: if builtin.is_some() {
                         None
                     } else {
                         Some("Prism".into())
                     },
-                    category_rank: if is_reader { None } else { Some(600) },
+                    category_rank: if builtin.is_some() { None } else { Some(600) },
                     name: name.clone(),
                     language: String::new(),
                     native_id: format!("{id:016x}"),

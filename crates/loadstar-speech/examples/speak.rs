@@ -63,7 +63,7 @@ fn main() {
     while matches!(state.0, UtteranceState::Pending | UtteranceState::Speaking)
         && start.elapsed() < Duration::from_secs(15)
     {
-        std::thread::sleep(Duration::from_millis(5));
+        idle(Duration::from_millis(5));
         state = s.utterance(id);
     }
     println!(
@@ -87,7 +87,7 @@ fn main() {
                 while s.render_poll(job) == RenderState::Pending
                     && t.elapsed() < Duration::from_secs(15)
                 {
-                    std::thread::sleep(Duration::from_millis(5));
+                    idle(Duration::from_millis(5));
                 }
                 match s.render_take_owned(job) {
                     Some(pcm) => println!(
@@ -117,7 +117,7 @@ fn main() {
                 while s.render_poll(job) == RenderState::Pending
                     && t.elapsed() < Duration::from_secs(5)
                 {
-                    std::thread::sleep(Duration::from_micros(200));
+                    idle(Duration::from_micros(200));
                 }
                 let took = t.elapsed();
                 if let Some(pcm) = s.render_take_owned(job) {
@@ -149,4 +149,26 @@ fn main() {
     let t = Instant::now();
     let _ = s.speak(0, &probe, "", speak_flags::FRONT); // empty: the shortest full call path
     println!("speak (empty) call: {:?}", t.elapsed());
+}
+
+/// Wait like a game's main loop does. On macOS, Prism runs every AVSpeech call on the main
+/// thread (dispatch_sync from the worker), so the waiting thread must service the main queue the
+/// way a host's event loop would; a bare sleep deadlocks the worker.
+#[cfg(target_os = "macos")]
+fn idle(d: Duration) {
+    use std::ffi::c_void;
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        static kCFRunLoopDefaultMode: *const c_void;
+        fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source: u8) -> i32;
+    }
+    // SAFETY: called on the main thread with CoreFoundation's own mode constant.
+    unsafe {
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, d.as_secs_f64(), 0);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn idle(d: Duration) {
+    std::thread::sleep(d);
 }
