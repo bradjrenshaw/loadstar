@@ -7,13 +7,15 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["prism", "sapi", "clipboard", "audio"]
+default = ["prism", "sapi", "clipboard", "avspeech", "audio"]
 # Load prism.dll at runtime (libloading) for every screen reader it knows. No build-time link.
 prism = ["dep:libloading"]
 # Native SAPI 5 through COM (Windows).
 sapi = []
 # The clipboard leaf (Windows).
 clipboard = []
+# Native AVSpeechSynthesizer (macOS).
+avspeech = []
 # Positioned speech: render on the worker, fire through loadstar-audio's in-process intake.
 audio = ["dep:loadstar-audio"]
 
@@ -37,3 +39,9 @@ windows = { version = "0.61", features = [
     "Win32_Media_Audio",
     "Win32_UI_Shell",
 ] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-avf-audio = "0.3"
+block2 = "0.6"

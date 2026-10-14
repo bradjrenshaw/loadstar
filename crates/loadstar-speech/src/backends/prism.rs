@@ -164,10 +164,14 @@ const EXCLUDED: &[u64] = &[
     0xCB4897961A754BCB, // VoiceOver
 ];
 
+const AV_SPEECH: u64 = 0x28E3429577805C24;
+
 /// Prism synthesizers that belong in a built-in category rather than the catch-all "prism" one.
+/// Prism's AVSpeech is only a leaf when the native backend (backends/avspeech.rs) is compiled out:
+/// it runs every call on the main thread, which stalls the worker behind the host's main loop.
 fn builtin_category(id: u64) -> Option<&'static str> {
     match id {
-        0x28E3429577805C24 => Some(tree::AVSPEECH), // AVSpeech
+        AV_SPEECH => Some(tree::AVSPEECH),
         _ => None,
     }
 }
@@ -398,7 +402,10 @@ impl Backend for PrismBackend {
             for i in 0..n {
                 let id = (api.registry_id_at)(self.ctx, i);
                 let synth_allowed = !cfg!(windows);
-                if EXCLUDED.contains(&id) || (!READERS.contains(&id) && !synth_allowed) {
+                if EXCLUDED.contains(&id)
+                    || (!READERS.contains(&id) && !synth_allowed)
+                    || (id == AV_SPEECH && cfg!(all(feature = "avspeech", target_os = "macos")))
+                {
                     continue;
                 }
                 let name_ptr = (api.registry_name)(self.ctx, id);

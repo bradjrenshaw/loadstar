@@ -20,4 +20,4 @@ speech-prism = ["speech", "loadstar-speech/prism"]
 [dependencies]
 loadstar-core.workspace = true
 loadstar-audio = { workspace = true, optional = true }
-loadstar-speech = { workspace = true, optional = true, default-features = false, features = ["sapi", "clipboard", "audio"] }
+loadstar-speech = { workspace = true, optional = true, default-features = false, features = ["sapi", "clipboard", "avspeech", "audio"] }

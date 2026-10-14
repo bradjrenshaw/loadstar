@@ -151,12 +151,16 @@ fn main() {
     println!("speak (empty) call: {:?}", t.elapsed());
 }
 
-/// Wait like a game's main loop does. On macOS, Prism runs every AVSpeech call on the main
-/// thread (dispatch_sync from the worker), so the waiting thread must service the main queue the
-/// way a host's event loop would; a bare sleep deadlocks the worker.
+/// Wait like a game's main loop does: on macOS, service the main queue, which AVSpeech's render
+/// callbacks (and Prism's Apple backends, for every call) are delivered on. SPEAK_MAIN_SLEEPS=1
+/// sleeps instead, to check that live speech does not depend on the main thread.
 #[cfg(target_os = "macos")]
 fn idle(d: Duration) {
     use std::ffi::c_void;
+    if std::env::var_os("SPEAK_MAIN_SLEEPS").is_some() {
+        std::thread::sleep(d);
+        return;
+    }
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
         static kCFRunLoopDefaultMode: *const c_void;

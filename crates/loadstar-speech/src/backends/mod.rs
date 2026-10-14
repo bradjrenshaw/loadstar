@@ -9,5 +9,8 @@ pub mod prism;
 #[cfg(all(feature = "sapi", windows))]
 pub mod sapi;
 
+#[cfg(all(feature = "avspeech", target_os = "macos"))]
+pub mod avspeech;
+
 #[cfg(all(feature = "clipboard", windows))]
 pub mod clipboard;

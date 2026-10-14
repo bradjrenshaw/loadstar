@@ -165,7 +165,8 @@ impl Speech {
             let p = crate::backends::prism::PrismBackend::load(cfg.prism_path.as_deref());
             prism_loaded_from = p.loaded_from().map(Path::to_path_buf);
             if p.is_loaded() {
-                if !cfg!(windows) {
+                // Prism renders only where no native synthesizer does (Linux today).
+                if !cfg!(windows) && !cfg!(all(feature = "avspeech", target_os = "macos")) {
                     renderers.insert(
                         backends.len(),
                         Box::new(crate::backends::prism::PrismRender::load(
@@ -183,6 +184,14 @@ impl Speech {
                 Box::new(crate::backends::sapi::SapiRender::new()),
             );
             backends.push(Box::new(crate::backends::sapi::SapiBackend::new()));
+        }
+        #[cfg(all(feature = "avspeech", target_os = "macos"))]
+        {
+            renderers.insert(
+                backends.len(),
+                Box::new(crate::backends::avspeech::AvSpeechRender::new()),
+            );
+            backends.push(Box::new(crate::backends::avspeech::AvSpeechBackend::new()));
         }
         #[cfg(all(feature = "clipboard", windows))]
         backends.push(Box::new(crate::backends::clipboard::ClipboardBackend));

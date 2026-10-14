@@ -45,7 +45,7 @@ Where a simpler design and a faster one exist, this spec takes the faster one an
 - **Changing the user's voice behind their back.** The library never substitutes a different synthesizer because the chosen voice cannot do something (position itself, render, speak SSML). It reports `NotSupported` and the mod decides, per call and visibly, what to do instead (§6).
 - **Compiling Prism in.** Prism is CMake/C++ with fetched dependencies; Loadstar builds with cargo alone. Prism is dynamically loaded (§4).
 - **A runtime plugin ABI for third-party backends.** The tree is designed so one can be added without breaking anything (§2, "Open set"); the plugin contract itself is a later spec section.
-- **Linux and macOS backends** beyond what Prism provides at runtime. The backend trait exists so speech-dispatcher and AVSpeech can be added natively when a consumer needs them.
+- **Linux backends** beyond what Prism provides at runtime. The backend trait exists so speech-dispatcher can be added natively when a consumer needs it. (macOS has native AVSpeech, §5.5.)
 
 ---
 
@@ -222,6 +222,17 @@ COM via the `windows` crate (already a dependency of the audio crate): one `ISpV
 
 Copies the text. Exists so "something happens" when nothing else can; the fallback walk's last step.
 
+### 5.5 AVSpeech (macOS) — category `avspeech`
+
+`AVSpeechSynthesizer` via `objc2-avf-audio`, one leaf per installed voice (`speechVoices`, the identifier as native id, the system default for `currentLanguageCode` marked default), so the root auto on a Mac is the user's system voice. One synthesizer per concurrent utterance, reused per voice. Rate maps piecewise around `AVSpeechUtteranceDefaultSpeechRate`; pitch maps 0..1 onto the 0.5–2.0 multiplier, an octave each way.
+
+It replaces Prism's AVSpeech backend, which `dispatch_sync`s every call onto the main thread: from the worker that stalls speech behind the host's main loop and deadlocks it outright in a host that never runs one. Measured (`examples/avspeech_probe.rs`):
+
+- **Live speech runs on the worker alone.** `speakUtterance` speaks with the main thread asleep. `isSpeaking` reads false for ~8 ms after the call, so an utterance is finished only once it has been seen speaking (or after a 2 s grace if it never is).
+- **Render does not.** `writeUtterance:toBufferCallback:` delivers its buffers on the main queue, so a render completes only while the host services it — a game's event loop does. The render thread waits with a timeout scaled to the text and returns `Failed` instead of hanging.
+
+Prism's VoiceOver backend is excluded (unreliable in practice), and Prism's AVSpeech is a leaf only when this backend is compiled out, so on macOS Prism contributes no leaves today.
+
 ---
 
 ## 6. Rendering and the audio crate
@@ -317,7 +328,7 @@ Two lines in `spec.md` move:
 4. **NVDA direct + the 32-bit validation**; Say the Spire 2 moves over.
 5. **OneCore**, SSML passthrough.
 6. ~~Streaming positional speech~~ **Shipped 2026-10-11**: `Stream`-kind sources in the audio crate (`la_stream_create/write/progress/finish/free`, the speech worker uses the in-process intake), SAPI renders into a forwarding COM stream, 2.7 ms to first sound warm. Finding on the way: SAPI synthesizes a two-second line in ~3 ms; the latency people hear from "SAPI" is its leading silence, hence `TRIM_SILENCE` live.
-7. Later: `lv_submit` batches if a mod hits the ordering race; the plugin ABI for third-party backends (the tree already has room); speech-dispatcher and AVSpeech natively; priorities only if two mods converge on the same scheme.
+7. Later: `lv_submit` batches if a mod hits the ordering race; the plugin ABI for third-party backends (the tree already has room); speech-dispatcher natively (AVSpeech shipped, §5.5); priorities only if two mods converge on the same scheme.
 
 ## 12. Open questions
 

@@ -5,7 +5,7 @@ Engine-agnostic navigation and spatial-awareness core for game accessibility mod
 Sibling of [Loadstone](https://github.com/bradjrenshaw) (mod manager): Loadstone loads the mods, Loadstar guides them.
 
 Design: [`docs/spec.md`](docs/spec.md). Distilled from the Wayfinder/CSTW experiment; read the non-goals first.
-Audio: [`docs/audio-spec.md`](docs/audio-spec.md). Speech: [`docs/speech-spec.md`](docs/speech-spec.md) — `loadstar-speech` (the `lv_*` surface): one categorised voice tree (screen readers through a runtime-loaded Prism, native SAPI 5, clipboard), queues with explicit interrupt semantics, polled utterance ids, render-to-PCM and positioned speech through the audio crate. Prism is pinned as the `external/prism` submodule; `tools/fetch-prism.ps1` downloads the matching `prism.dll`.
+Audio: [`docs/audio-spec.md`](docs/audio-spec.md). Speech: [`docs/speech-spec.md`](docs/speech-spec.md) — `loadstar-speech` (the `lv_*` surface): one categorised voice tree (screen readers through a runtime-loaded Prism, native SAPI 5 and AVSpeech, clipboard), queues with explicit interrupt semantics, polled utterance ids, render-to-PCM and positioned speech through the audio crate. Prism is pinned as the `external/prism` submodule; `tools/fetch-prism.ps1` downloads the matching `prism.dll`.
 
 ## Layout
 
