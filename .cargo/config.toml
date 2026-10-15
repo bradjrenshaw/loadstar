@@ -1,0 +1,8 @@
+# Link the C runtime statically on Windows so loadstar.dll has no dependency on the
+# Visual C++ Redistributable (vcruntime140.dll + api-ms-win-crt-*). The game itself and
+# prism.dll carry none either; a fresh Windows without the redist must still load us.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
