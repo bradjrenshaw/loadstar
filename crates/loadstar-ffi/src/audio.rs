@@ -121,7 +121,7 @@ pub struct AudioSourceDesc {
 }
 
 impl AudioSourceDesc {
-    pub(crate) fn to_core(&self) -> Option<SourceDesc> {
+    pub(crate) fn to_core(self) -> Option<SourceDesc> {
         Some(SourceDesc {
             id: self.id,
             kind: SourceKind::from_u8(self.kind),
@@ -151,7 +151,7 @@ pub struct AudioEffectDesc {
 }
 
 impl AudioEffectDesc {
-    fn to_core(&self) -> Option<EffectDesc> {
+    fn to_core(self) -> Option<EffectDesc> {
         Some(EffectDesc {
             kind: EffectKind::from_u32(self.kind)?,
             flags: self.flags,
@@ -173,7 +173,7 @@ pub struct AudioChainTarget {
 }
 
 impl AudioChainTarget {
-    fn to_core(&self) -> Option<ChainTarget> {
+    fn to_core(self) -> Option<ChainTarget> {
         Some(match self.kind {
             0 => ChainTarget::Master,
             1 => ChainTarget::Space(self.space),
@@ -203,18 +203,20 @@ fn status(r: Result<(), DeviceError>) -> Status {
     }
 }
 
-fn with_device(dev: *mut AudioDevice, f: impl FnOnce(&mut Device) -> Status) -> Status {
-    guard(|| {
-        if dev.is_null() {
-            return Status::NullPointer;
-        }
-        // SAFETY: non-null checked; a live device handle from `la_device_open*`, used from one thread.
-        f(&mut unsafe { &mut *dev }.0)
+/// Run `f` on a device the export has already turned into a reference (`dev.as_mut()`, under
+/// its `# Safety` contract): `None` (a null handle) is `NullPointer`.
+fn with_device(dev: Option<&mut AudioDevice>, f: impl FnOnce(&mut Device) -> Status) -> Status {
+    guard(|| match dev {
+        Some(d) => f(&mut d.0),
+        None => Status::NullPointer,
     })
 }
 
 /// Write a `u32` result through an out-pointer.
-fn out_u32(out: *mut u32, r: Result<u32, DeviceError>) -> Status {
+///
+/// # Safety
+/// `out` must be null or valid for writing one `u32`.
+unsafe fn out_u32(out: *mut u32, r: Result<u32, DeviceError>) -> Status {
     match r {
         // SAFETY: callers check `out` for null; caller guarantees it is writable.
         Ok(v) => unsafe {
@@ -243,8 +245,14 @@ fn config(c: AudioDeviceConfig) -> DeviceConfig {
 // ---------------------------------------------------------------------------
 
 /// Open the default audio output (WASAPI shared mode on Windows). `DeviceUnavailable` if none.
+///
+/// # Safety
+/// `out` must be null or valid for writing one pointer.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_device_open(cfg: AudioDeviceConfig, out: *mut *mut AudioDevice) -> Status {
+pub unsafe extern "C" fn la_device_open(
+    cfg: AudioDeviceConfig,
+    out: *mut *mut AudioDevice,
+) -> Status {
     guard(|| {
         if out.is_null() {
             return Status::NullPointer;
@@ -263,8 +271,11 @@ pub extern "C" fn la_device_open(cfg: AudioDeviceConfig, out: *mut *mut AudioDev
 
 /// Open a device with no hardware: periods are rendered on demand with [`la_device_render`].
 /// For tests and harnesses.
+///
+/// # Safety
+/// `out` must be null or valid for writing one pointer.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_device_open_null(
+pub unsafe extern "C" fn la_device_open_null(
     cfg: AudioDeviceConfig,
     sample_rate: u32,
     period_frames: u32,
@@ -288,8 +299,11 @@ pub extern "C" fn la_device_open_null(
 }
 
 /// Close a device, stopping its audio thread and releasing every space and buffer. Null is a no-op.
+///
+/// # Safety
+/// `dev` must be null or a audio device handle from `la_device_open` or `la_device_open_null` that has not been released, and no other call may be using it. It is dangling after this call.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_device_close(dev: *mut AudioDevice) {
+pub unsafe extern "C" fn la_device_close(dev: *mut AudioDevice) {
     let _ = guard(|| {
         if !dev.is_null() {
             // SAFETY: `dev` came from `Box::into_raw` in an open function; the caller won't reuse it.
@@ -300,9 +314,17 @@ pub extern "C" fn la_device_close(dev: *mut AudioDevice) {
 }
 
 /// The format the backend actually opened.
+///
+/// # Safety
+/// - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing one `AudioStreamInfo`.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_device_info(dev: *mut AudioDevice, out: *mut AudioStreamInfo) -> Status {
-    with_device(dev, |d| {
+pub unsafe extern "C" fn la_device_info(
+    dev: *mut AudioDevice,
+    out: *mut AudioStreamInfo,
+) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| {
         if out.is_null() {
             return Status::NullPointer;
         }
@@ -320,16 +342,28 @@ pub extern "C" fn la_device_info(dev: *mut AudioDevice, out: *mut AudioStreamInf
     })
 }
 
+/// # Safety
+/// `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_device_master_gain(dev: *mut AudioDevice, gain: f32) -> Status {
-    with_device(dev, |d| status(d.master_gain(gain)))
+pub unsafe extern "C" fn la_device_master_gain(dev: *mut AudioDevice, gain: f32) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| status(d.master_gain(gain)))
 }
 
 /// Null devices only: apply pending commands and render `frames` frames of interleaved
 /// stereo into `out` (`2 * frames` floats). A no-op on hardware devices.
+///
+/// # Safety
+/// - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing `2 * frames` floats.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_device_render(dev: *mut AudioDevice, out: *mut f32, frames: usize) -> Status {
-    with_device(dev, |d| {
+pub unsafe extern "C" fn la_device_render(
+    dev: *mut AudioDevice,
+    out: *mut f32,
+    frames: usize,
+) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| {
         if out.is_null() {
             return Status::NullPointer;
         }
@@ -343,14 +377,20 @@ pub extern "C" fn la_device_render(dev: *mut AudioDevice, out: *mut f32, frames:
 /// Drain the `(space, id)` pairs whose sequences ended since the last call. Buffer convention
 /// as `ls_path_nodes`: `*written` receives the count; `BufferTooSmall` if it exceeds `capacity`
 /// (nothing is consumed in that case).
+///
+/// # Safety
+/// - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing `capacity` elements.
+/// - `written` must be null or valid for writing one `usize`.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_device_finished(
+pub unsafe extern "C" fn la_device_finished(
     dev: *mut AudioDevice,
     out: *mut AudioFinished,
     capacity: usize,
     written: *mut usize,
 ) -> Status {
-    with_device(dev, |d| {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| {
         if written.is_null() {
             return Status::NullPointer;
         }
@@ -386,15 +426,20 @@ pub extern "C" fn la_device_finished(
 // ---------------------------------------------------------------------------
 
 /// Create a space. `mode` is an `AudioSpaceMode`; `unit_scale` = units per metre (0 = 1).
+///
+/// # Safety
+/// - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing one `u32`.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_space_create(
+pub unsafe extern "C" fn la_space_create(
     dev: *mut AudioDevice,
     mode: u32,
     gain: f32,
     unit_scale: f32,
     out: *mut u32,
 ) -> Status {
-    with_device(dev, |d| {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| {
         if out.is_null() {
             return Status::NullPointer;
         }
@@ -403,58 +448,92 @@ pub extern "C" fn la_space_create(
             1 => SpaceMode::Spatial,
             _ => return Status::InvalidArgument,
         };
-        out_u32(out, d.space_create(mode, gain, unit_scale))
+        // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+        unsafe { out_u32(out, d.space_create(mode, gain, unit_scale)) }
     })
 }
 
+/// # Safety
+/// `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_space_destroy(dev: *mut AudioDevice, space: u32) -> Status {
-    with_device(dev, |d| status(d.space_destroy(space)))
+pub unsafe extern "C" fn la_space_destroy(dev: *mut AudioDevice, space: u32) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| status(d.space_destroy(space)))
 }
 
+/// # Safety
+/// `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_space_gain(dev: *mut AudioDevice, space: u32, gain: f32) -> Status {
-    with_device(dev, |d| status(d.space_gain(space, gain)))
+pub unsafe extern "C" fn la_space_gain(dev: *mut AudioDevice, space: u32, gain: f32) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| {
+        status(d.space_gain(space, gain))
+    })
 }
 
 /// Listener pose for a space, each frame.
+///
+/// # Safety
+/// `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_listener_set(
+pub unsafe extern "C" fn la_listener_set(
     dev: *mut AudioDevice,
     space: u32,
     position: Vec3,
     forward: Vec3,
     up: Vec3,
 ) -> Status {
-    with_device(dev, |d| {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| {
         status(d.set_listener(space, position, forward, up))
     })
 }
 
 /// Per-frame hook for simulating renderers (audio spec §3). A no-op for the head model.
+///
+/// # Safety
+/// `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_space_update(dev: *mut AudioDevice, space: u32, dt: f32) -> Status {
-    with_device(dev, |d| status(d.space_update(space, dt)))
+pub unsafe extern "C" fn la_space_update(dev: *mut AudioDevice, space: u32, dt: f32) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| {
+        status(d.space_update(space, dt))
+    })
 }
 
+/// # Safety
+/// - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing one `u32`.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_bus_create(
+pub unsafe extern "C" fn la_bus_create(
     dev: *mut AudioDevice,
     space: u32,
     gain: f32,
     out: *mut u32,
 ) -> Status {
-    with_device(dev, |d| {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| {
         if out.is_null() {
             return Status::NullPointer;
         }
-        out_u32(out, d.bus_create(space, gain))
+        // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+        unsafe { out_u32(out, d.bus_create(space, gain)) }
     })
 }
 
+/// # Safety
+/// `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_bus_gain(dev: *mut AudioDevice, space: u32, bus: u32, gain: f32) -> Status {
-    with_device(dev, |d| status(d.bus_gain(space, bus, gain)))
+pub unsafe extern "C" fn la_bus_gain(
+    dev: *mut AudioDevice,
+    space: u32,
+    bus: u32,
+    gain: f32,
+) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| {
+        status(d.bus_gain(space, bus, gain))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -462,8 +541,13 @@ pub extern "C" fn la_bus_gain(dev: *mut AudioDevice, space: u32, bus: u32, gain:
 // ---------------------------------------------------------------------------
 
 /// Upload interleaved PCM; converted to mono at the mixer rate (copied — the caller keeps ownership).
+///
+/// # Safety
+/// - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+/// - `samples` must be null or valid for reading `samples_len` elements.
+/// - `out` must be null or valid for writing one `u32`.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_buffer_create(
+pub unsafe extern "C" fn la_buffer_create(
     dev: *mut AudioDevice,
     samples: *const f32,
     samples_len: usize,
@@ -471,28 +555,38 @@ pub extern "C" fn la_buffer_create(
     sample_rate: u32,
     out: *mut u32,
 ) -> Status {
-    with_device(dev, |d| {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| {
         if out.is_null() || samples.is_null() {
             return Status::NullPointer;
         }
         // SAFETY: non-null checked; caller guarantees `samples` is readable for `samples_len` floats.
         let pcm = unsafe { std::slice::from_raw_parts(samples, samples_len) };
-        out_u32(out, d.buffer_create(pcm, channels as usize, sample_rate))
+        // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+        unsafe { out_u32(out, d.buffer_create(pcm, channels as usize, sample_rate)) }
     })
 }
 
+/// # Safety
+/// - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing one `u32`.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_buffer_click(dev: *mut AudioDevice, ms: f32, out: *mut u32) -> Status {
-    with_device(dev, |d| {
+pub unsafe extern "C" fn la_buffer_click(dev: *mut AudioDevice, ms: f32, out: *mut u32) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| {
         if out.is_null() {
             return Status::NullPointer;
         }
-        out_u32(out, d.buffer_click(ms))
+        // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+        unsafe { out_u32(out, d.buffer_click(ms)) }
     })
 }
 
+/// # Safety
+/// - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing one `u32`.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_buffer_tone(
+pub unsafe extern "C" fn la_buffer_tone(
     dev: *mut AudioDevice,
     hz: f32,
     ms: f32,
@@ -500,17 +594,22 @@ pub extern "C" fn la_buffer_tone(
     release_ms: f32,
     out: *mut u32,
 ) -> Status {
-    with_device(dev, |d| {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| {
         if out.is_null() {
             return Status::NullPointer;
         }
-        out_u32(out, d.buffer_tone(hz, ms, attack_ms, release_ms))
+        // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+        unsafe { out_u32(out, d.buffer_tone(hz, ms, attack_ms, release_ms)) }
     })
 }
 
+/// # Safety
+/// `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_buffer_free(dev: *mut AudioDevice, buffer: u32) -> Status {
-    with_device(dev, |d| status(d.buffer_free(buffer)))
+pub unsafe extern "C" fn la_buffer_free(dev: *mut AudioDevice, buffer: u32) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| status(d.buffer_free(buffer)))
 }
 
 // ---------------------------------------------------------------------------
@@ -520,32 +619,44 @@ pub extern "C" fn la_buffer_free(dev: *mut AudioDevice, buffer: u32) -> Status {
 /// Create a streaming source (audio spec §3): a ring of `capacity` mono frames at the mixer rate
 /// that starts playing once `prefill` frames are in. Reference it from a source record with
 /// `kind = Stream` and `buffer = id`; feed it with `la_stream_write`.
+///
+/// # Safety
+/// - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing `capacity` elements.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_stream_create(
+pub unsafe extern "C" fn la_stream_create(
     dev: *mut AudioDevice,
     capacity: usize,
     prefill: usize,
     out: *mut u32,
 ) -> Status {
-    with_device(dev, |d| {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| {
         if out.is_null() {
             return Status::NullPointer;
         }
-        out_u32(out, d.stream_create(capacity, prefill))
+        // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+        unsafe { out_u32(out, d.stream_create(capacity, prefill)) }
     })
 }
 
 /// Write mono samples at the mixer rate; `written` receives how many were taken (the rest did not
 /// fit — come back next frame).
+///
+/// # Safety
+/// - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+/// - `samples` must be null or valid for reading `samples_len` elements.
+/// - `written` must be null or valid for writing one `usize`.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_stream_write(
+pub unsafe extern "C" fn la_stream_write(
     dev: *mut AudioDevice,
     stream: u32,
     samples: *const f32,
     samples_len: usize,
     written: *mut usize,
 ) -> Status {
-    with_device(dev, |d| {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| {
         if samples.is_null() || written.is_null() {
             return Status::NullPointer;
         }
@@ -563,48 +674,69 @@ pub extern "C" fn la_stream_write(
 }
 
 /// Frames written and played so far, and whether the producer has finished.
+///
+/// # Safety
+/// - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+/// - `written` must be null or valid for writing one `u64`.
+/// - `played` must be null or valid for writing one `u64`.
+/// - `finished` must be null or valid for writing one `bool`.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_stream_progress(
+pub unsafe extern "C" fn la_stream_progress(
     dev: *mut AudioDevice,
     stream: u32,
     written: *mut u64,
     played: *mut u64,
     finished: *mut bool,
 ) -> Status {
-    with_device(dev, |d| match d.stream_progress(stream) {
-        Ok((w, p, done)) => {
-            if written.is_null() || played.is_null() || finished.is_null() {
-                return Status::NullPointer;
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| {
+        match d.stream_progress(stream) {
+            Ok((w, p, done)) => {
+                if written.is_null() || played.is_null() || finished.is_null() {
+                    return Status::NullPointer;
+                }
+                // SAFETY: all three out-pointers checked.
+                unsafe {
+                    *written = w;
+                    *played = p;
+                    *finished = done;
+                }
+                Status::Ok
             }
-            // SAFETY: all three out-pointers checked.
-            unsafe {
-                *written = w;
-                *played = p;
-                *finished = done;
-            }
-            Status::Ok
+            Err(e) => status(Err(e)),
         }
-        Err(e) => status(Err(e)),
     })
 }
 
 /// No more samples will come: the voice ends once the ring drains.
+///
+/// # Safety
+/// `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_stream_finish(dev: *mut AudioDevice, stream: u32) -> Status {
-    with_device(dev, |d| status(d.stream_finish(stream)))
+pub unsafe extern "C" fn la_stream_finish(dev: *mut AudioDevice, stream: u32) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| status(d.stream_finish(stream)))
 }
 
 /// Release the stream id (after its voice finished).
+///
+/// # Safety
+/// `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_stream_free(dev: *mut AudioDevice, stream: u32) -> Status {
-    with_device(dev, |d| status(d.stream_free(stream)))
+pub unsafe extern "C" fn la_stream_free(dev: *mut AudioDevice, stream: u32) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| status(d.stream_free(stream)))
 }
 
 // ---------------------------------------------------------------------------
 // Sources
 // ---------------------------------------------------------------------------
 
-fn read_descs(descs: *const AudioSourceDesc, len: usize) -> Option<Vec<SourceDesc>> {
+/// Source records into core descriptors; `None` on a bad record or a null `descs` with `len > 0`.
+///
+/// # Safety
+/// `descs` must be null or valid for reading `len` records.
+unsafe fn read_descs(descs: *const AudioSourceDesc, len: usize) -> Option<Vec<SourceDesc>> {
     if len == 0 {
         return Some(Vec::new());
     }
@@ -614,32 +746,44 @@ fn read_descs(descs: *const AudioSourceDesc, len: usize) -> Option<Vec<SourceDes
     // SAFETY: non-null checked; caller guarantees `descs` is readable for `len` records.
     unsafe { std::slice::from_raw_parts(descs, len) }
         .iter()
+        .copied()
         .map(AudioSourceDesc::to_core)
         .collect()
 }
 
 /// Declarative snapshot of a space's declared sources (audio spec §3). `InvalidArgument`
 /// rejects the whole snapshot on any bad bounds kind.
+///
+/// # Safety
+/// - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+/// - `descs` must be null or valid for reading `descs_len` elements.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_space_sync(
+pub unsafe extern "C" fn la_space_sync(
     dev: *mut AudioDevice,
     space: u32,
     descs: *const AudioSourceDesc,
     descs_len: usize,
 ) -> Status {
-    with_device(dev, |d| match read_descs(descs, descs_len) {
-        Some(list) => status(d.sync(space, &list)),
-        None => Status::InvalidArgument,
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| {
+        match unsafe { read_descs(descs, descs_len) } {
+            Some(list) => status(d.sync(space, &list)),
+            None => Status::InvalidArgument,
+        }
     })
 }
 
+/// # Safety
+/// - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+/// - `desc` must be null or valid for reading one `AudioSourceDesc`.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_source_upsert(
+pub unsafe extern "C" fn la_source_upsert(
     dev: *mut AudioDevice,
     space: u32,
     desc: *const AudioSourceDesc,
 ) -> Status {
-    with_device(dev, |d| {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| {
         if desc.is_null() {
             return Status::NullPointer;
         }
@@ -651,19 +795,27 @@ pub extern "C" fn la_source_upsert(
     })
 }
 
+/// # Safety
+/// `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_source_remove(dev: *mut AudioDevice, space: u32, id: u64) -> Status {
-    with_device(dev, |d| status(d.remove(space, id)))
+pub unsafe extern "C" fn la_source_remove(dev: *mut AudioDevice, space: u32, id: u64) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| status(d.remove(space, id)))
 }
 
 /// Play a sequence and remove the source when it drains (audio spec §3, fired sources).
+///
+/// # Safety
+/// - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+/// - `desc` must be null or valid for reading one `AudioSourceDesc`.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_space_fire(
+pub unsafe extern "C" fn la_space_fire(
     dev: *mut AudioDevice,
     space: u32,
     desc: *const AudioSourceDesc,
 ) -> Status {
-    with_device(dev, |d| {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| {
         if desc.is_null() {
             return Status::NullPointer;
         }
@@ -675,9 +827,12 @@ pub extern "C" fn la_space_fire(
     })
 }
 
+/// # Safety
+/// `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_source_stop(dev: *mut AudioDevice, space: u32, id: u64) -> Status {
-    with_device(dev, |d| status(d.stop(space, id)))
+pub unsafe extern "C" fn la_source_stop(dev: *mut AudioDevice, space: u32, id: u64) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| status(d.stop(space, id)))
 }
 
 // ---------------------------------------------------------------------------
@@ -685,14 +840,19 @@ pub extern "C" fn la_source_stop(dev: *mut AudioDevice, space: u32, id: u64) -> 
 // ---------------------------------------------------------------------------
 
 /// Replace a chain wholesale (`nodes` may be null when `nodes_len` is 0).
+///
+/// # Safety
+/// - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+/// - `nodes` must be null or valid for reading `nodes_len` elements.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_chain_set(
+pub unsafe extern "C" fn la_chain_set(
     dev: *mut AudioDevice,
     target: AudioChainTarget,
     nodes: *const AudioEffectDesc,
     nodes_len: usize,
 ) -> Status {
-    with_device(dev, |d| {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| {
         let Some(target) = target.to_core() else {
             return Status::InvalidArgument;
         };
@@ -704,6 +864,7 @@ pub extern "C" fn la_chain_set(
             // SAFETY: non-null checked; caller guarantees `nodes` is readable for `nodes_len` records.
             unsafe { std::slice::from_raw_parts(nodes, nodes_len) }
                 .iter()
+                .copied()
                 .map(AudioEffectDesc::to_core)
                 .collect()
         };
@@ -715,29 +876,37 @@ pub extern "C" fn la_chain_set(
 }
 
 /// Retune one parameter of one node in place.
+///
+/// # Safety
+/// `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_effect_set_param(
+pub unsafe extern "C" fn la_effect_set_param(
     dev: *mut AudioDevice,
     target: AudioChainTarget,
     index: u32,
     param: u32,
     value: f32,
 ) -> Status {
-    with_device(dev, |d| match target.to_core() {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| match target.to_core() {
         Some(t) => status(d.set_effect_param(t, index as usize, param as usize, value)),
         None => Status::InvalidArgument,
     })
 }
 
 /// Enable or disable one node, crossfaded.
+///
+/// # Safety
+/// `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn la_effect_set_enabled(
+pub unsafe extern "C" fn la_effect_set_enabled(
     dev: *mut AudioDevice,
     target: AudioChainTarget,
     index: u32,
     enabled: bool,
 ) -> Status {
-    with_device(dev, |d| match target.to_core() {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_device(unsafe { dev.as_mut() }, |d| match target.to_core() {
         Some(t) => status(d.set_effect_enabled(t, index as usize, enabled)),
         None => Status::InvalidArgument,
     })
@@ -792,111 +961,114 @@ mod tests {
 
     #[test]
     fn null_device_through_the_abi() {
-        let mut dev = std::ptr::null_mut();
-        assert_eq!(
-            la_device_open_null(AudioDeviceConfig::default(), 48000, 256, &mut dev),
-            Status::Ok
-        );
-        let mut info = AudioStreamInfo::default();
-        assert_eq!(la_device_info(dev, &mut info), Status::Ok);
-        assert_eq!(
-            (info.sample_rate, info.period_frames, info.low_latency),
-            (48000, 256, 0)
-        );
+        // SAFETY: every pointer passed below is a live local or a handle created in this test.
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(
+                la_device_open_null(AudioDeviceConfig::default(), 48000, 256, &mut dev),
+                Status::Ok
+            );
+            let mut info = AudioStreamInfo::default();
+            assert_eq!(la_device_info(dev, &mut info), Status::Ok);
+            assert_eq!(
+                (info.sample_rate, info.period_frames, info.low_latency),
+                (48000, 256, 0)
+            );
 
-        let mut space = 0;
-        assert_eq!(la_space_create(dev, 0, 1.0, 1.0, &mut space), Status::Ok);
-        assert_eq!(
-            la_space_create(dev, 7, 1.0, 1.0, &mut space),
-            Status::InvalidArgument
-        );
-        let mut tone = 0;
-        assert_eq!(
-            la_buffer_tone(dev, 440.0, 500.0, 5.0, 5.0, &mut tone),
-            Status::Ok
-        );
-        assert_eq!(
-            la_listener_set(
-                dev,
-                space,
-                Vec3::default(),
-                Vec3::new(0.0, 0.0, -1.0),
-                Vec3::new(0.0, 1.0, 0.0)
-            ),
-            Status::Ok
-        );
-        let descs = [source(1, tone, point(4.0, 0.0))];
-        assert_eq!(la_space_sync(dev, space, descs.as_ptr(), 1), Status::Ok);
-        assert_eq!(
-            la_space_sync(dev, 9, descs.as_ptr(), 1),
-            Status::InvalidArgument
-        );
+            let mut space = 0;
+            assert_eq!(la_space_create(dev, 0, 1.0, 1.0, &mut space), Status::Ok);
+            assert_eq!(
+                la_space_create(dev, 7, 1.0, 1.0, &mut space),
+                Status::InvalidArgument
+            );
+            let mut tone = 0;
+            assert_eq!(
+                la_buffer_tone(dev, 440.0, 500.0, 5.0, 5.0, &mut tone),
+                Status::Ok
+            );
+            assert_eq!(
+                la_listener_set(
+                    dev,
+                    space,
+                    Vec3::default(),
+                    Vec3::new(0.0, 0.0, -1.0),
+                    Vec3::new(0.0, 1.0, 0.0)
+                ),
+                Status::Ok
+            );
+            let descs = [source(1, tone, point(4.0, 0.0))];
+            assert_eq!(la_space_sync(dev, space, descs.as_ptr(), 1), Status::Ok);
+            assert_eq!(
+                la_space_sync(dev, 9, descs.as_ptr(), 1),
+                Status::InvalidArgument
+            );
 
-        let mut out = vec![0.0f32; 512];
-        let (mut l, mut r) = (0.0, 0.0);
-        for _ in 0..6 {
-            assert_eq!(la_device_render(dev, out.as_mut_ptr(), 256), Status::Ok);
-            l += out.iter().step_by(2).map(|s| s * s).sum::<f32>();
-            r += out.iter().skip(1).step_by(2).map(|s| s * s).sum::<f32>();
-        }
-        assert!(r > l * 2.0, "east → right: l={l} r={r}");
-
-        let lowpass = AudioEffectDesc {
-            kind: AudioEffectKind::LowPass as u32,
-            flags: 1,
-            p: [200.0, 0.707, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        };
-        let target = AudioChainTarget {
-            kind: AudioChainKind::Space as u32,
-            space,
-            bus: 0,
-            _reserved: 0,
-            source_id: 0,
-        };
-        assert_eq!(la_chain_set(dev, target, &lowpass, 1), Status::Ok);
-        assert_eq!(la_effect_set_enabled(dev, target, 0, false), Status::Ok);
-        let bad = AudioChainTarget { kind: 9, ..target };
-        assert_eq!(la_chain_set(dev, bad, &lowpass, 1), Status::InvalidArgument);
-
-        let fired = AudioSourceDesc {
-            repeat_count: 1,
-            id: 77,
-            ..source(0, tone, point(0.0, -1.0))
-        };
-        assert_eq!(la_space_fire(dev, space, &fired), Status::Ok);
-        for _ in 0..120 {
-            la_device_render(dev, out.as_mut_ptr(), 256);
-        }
-        let mut done = [AudioFinished {
-            space: 0,
-            _reserved: 0,
-            id: 0,
-        }; 4];
-        let mut n = 0;
-        assert_eq!(
-            la_device_finished(dev, std::ptr::null_mut(), 0, &mut n),
-            Status::BufferTooSmall,
-            "two-call pattern: size query"
-        );
-        assert_eq!(n, 1);
-        assert_eq!(
-            la_device_finished(dev, done.as_mut_ptr(), 4, &mut n),
-            Status::Ok,
-            "...consumes nothing, so the real call still gets it"
-        );
-        assert_eq!(n, 1);
-        assert_eq!(
-            done[0],
-            AudioFinished {
-                space,
-                _reserved: 0,
-                id: 77
+            let mut out = vec![0.0f32; 512];
+            let (mut l, mut r) = (0.0, 0.0);
+            for _ in 0..6 {
+                assert_eq!(la_device_render(dev, out.as_mut_ptr(), 256), Status::Ok);
+                l += out.iter().step_by(2).map(|s| s * s).sum::<f32>();
+                r += out.iter().skip(1).step_by(2).map(|s| s * s).sum::<f32>();
             }
-        );
+            assert!(r > l * 2.0, "east → right: l={l} r={r}");
 
-        assert_eq!(la_buffer_free(dev, 9), Status::InvalidArgument);
-        assert_eq!(la_space_destroy(dev, space), Status::Ok);
-        la_device_close(dev);
-        la_device_close(std::ptr::null_mut());
+            let lowpass = AudioEffectDesc {
+                kind: AudioEffectKind::LowPass as u32,
+                flags: 1,
+                p: [200.0, 0.707, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            };
+            let target = AudioChainTarget {
+                kind: AudioChainKind::Space as u32,
+                space,
+                bus: 0,
+                _reserved: 0,
+                source_id: 0,
+            };
+            assert_eq!(la_chain_set(dev, target, &lowpass, 1), Status::Ok);
+            assert_eq!(la_effect_set_enabled(dev, target, 0, false), Status::Ok);
+            let bad = AudioChainTarget { kind: 9, ..target };
+            assert_eq!(la_chain_set(dev, bad, &lowpass, 1), Status::InvalidArgument);
+
+            let fired = AudioSourceDesc {
+                repeat_count: 1,
+                id: 77,
+                ..source(0, tone, point(0.0, -1.0))
+            };
+            assert_eq!(la_space_fire(dev, space, &fired), Status::Ok);
+            for _ in 0..120 {
+                la_device_render(dev, out.as_mut_ptr(), 256);
+            }
+            let mut done = [AudioFinished {
+                space: 0,
+                _reserved: 0,
+                id: 0,
+            }; 4];
+            let mut n = 0;
+            assert_eq!(
+                la_device_finished(dev, std::ptr::null_mut(), 0, &mut n),
+                Status::BufferTooSmall,
+                "two-call pattern: size query"
+            );
+            assert_eq!(n, 1);
+            assert_eq!(
+                la_device_finished(dev, done.as_mut_ptr(), 4, &mut n),
+                Status::Ok,
+                "...consumes nothing, so the real call still gets it"
+            );
+            assert_eq!(n, 1);
+            assert_eq!(
+                done[0],
+                AudioFinished {
+                    space,
+                    _reserved: 0,
+                    id: 77
+                }
+            );
+
+            assert_eq!(la_buffer_free(dev, 9), Status::InvalidArgument);
+            assert_eq!(la_space_destroy(dev, space), Status::Ok);
+            la_device_close(dev);
+            la_device_close(std::ptr::null_mut());
+        }
     }
 }

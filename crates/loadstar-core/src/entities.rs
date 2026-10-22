@@ -28,6 +28,9 @@ pub struct Entity {
     pub flags: u32,
     /// Explicit browse order within a category.
     pub sort_key: u32,
+    /// Mod-defined group for group browsing (spec §8): entities sharing a nonzero value are
+    /// one group ("all the mushrooms"). 0 = ungrouped, a group of its own.
+    pub group: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,6 +137,7 @@ mod tests {
             blocking: 1,
             flags: flags::PATHFIND_ADJACENT,
             sort_key: 0,
+            group: 0,
         }
     }
 

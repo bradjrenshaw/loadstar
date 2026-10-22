@@ -295,7 +295,7 @@ mod tests {
             .unwrap();
         assert_eq!(right_peak, 10, "near ear undelayed");
         assert!(
-            left_peak >= 40 && left_peak <= 43,
+            (40..=43).contains(&left_peak),
             "far ear lags ~31.7 samples: {left_peak}"
         );
     }

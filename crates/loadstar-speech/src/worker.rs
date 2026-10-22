@@ -516,16 +516,16 @@ impl Worker {
                 }
             }
             Msg::Cancel(id) => {
-                if let Some(queue) = self.owner.get(&id).copied() {
-                    if let Some(q) = self.queues.get_mut(&queue) {
-                        if let Some(pos) = q.pending.iter().position(|i| i.id == id) {
-                            q.pending.remove(pos);
-                            self.shared.table.set(id, UtteranceState::Cancelled, false);
-                        } else if let Some(pos) = q.active.iter().position(|a| a.id == id) {
-                            let a = q.active.remove(pos);
-                            Self::cut_one(&a, &mut self.backends);
-                            self.shared.table.set(id, UtteranceState::Cancelled, false);
-                        }
+                if let Some(queue) = self.owner.get(&id).copied()
+                    && let Some(q) = self.queues.get_mut(&queue)
+                {
+                    if let Some(pos) = q.pending.iter().position(|i| i.id == id) {
+                        q.pending.remove(pos);
+                        self.shared.table.set(id, UtteranceState::Cancelled, false);
+                    } else if let Some(pos) = q.active.iter().position(|a| a.id == id) {
+                        let a = q.active.remove(pos);
+                        Self::cut_one(&a, &mut self.backends);
+                        self.shared.table.set(id, UtteranceState::Cancelled, false);
                     }
                 }
             }
@@ -551,11 +551,11 @@ impl Worker {
                 }
             }
             Msg::QueueDestroy(id) => {
-                if id != 0 {
-                    if let Some(mut q) = self.queues.remove(&id) {
-                        Self::cut_actives(&mut q, &mut self.backends, &self.shared.table);
-                        Self::drop_pending(&mut q, &self.shared.table);
-                    }
+                if id != 0
+                    && let Some(mut q) = self.queues.remove(&id)
+                {
+                    Self::cut_actives(&mut q, &mut self.backends, &self.shared.table);
+                    Self::drop_pending(&mut q, &self.shared.table);
                 }
             }
             Msg::Render {
@@ -711,20 +711,19 @@ impl Worker {
                     a.next_poll = Some(now + Duration::from_millis(10));
                 }
             }
-            if !done {
-                if let (Some(b), Some(poll)) = (a.backend, a.next_poll) {
-                    if poll <= now {
-                        match self.backends[b].speaking(a.slot) {
-                            Some(true) => {
-                                a.next_poll = Some(
-                                    now + self.backends[b]
-                                        .poll_interval()
-                                        .unwrap_or(Duration::from_millis(20)),
-                                )
-                            }
-                            Some(false) | None => done = true,
-                        }
+            if !done
+                && let (Some(b), Some(poll)) = (a.backend, a.next_poll)
+                && poll <= now
+            {
+                match self.backends[b].speaking(a.slot) {
+                    Some(true) => {
+                        a.next_poll = Some(
+                            now + self.backends[b]
+                                .poll_interval()
+                                .unwrap_or(Duration::from_millis(20)),
+                        )
                     }
+                    Some(false) | None => done = true,
                 }
             }
             if done {

@@ -492,9 +492,10 @@ impl IStream_Impl for ForwardingStream_Impl {
         if !pstatstg.is_null() {
             // SAFETY: valid out struct.
             unsafe {
-                let mut st = STATSTG::default();
-                st.cbSize = self.state.lock().unwrap_or_else(|e| e.into_inner()).0;
-                *pstatstg = st;
+                *pstatstg = STATSTG {
+                    cbSize: self.state.lock().unwrap_or_else(|e| e.into_inner()).0,
+                    ..Default::default()
+                };
             }
         }
         Ok(())

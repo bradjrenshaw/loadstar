@@ -55,12 +55,139 @@ public sealed class Path
     }
 }
 
-/// <summary>A tile-grid context (spec §4). Dispose releases the native handle.</summary>
-public sealed class TileContext : IDisposable
+/// <summary>
+/// A context (spec §4): entities, the player, entity vectors and trackers, plus a map in the
+/// <see cref="TileContext"/> subclass. <see cref="Create"/> makes one without a map, for spaces the
+/// library doesn't model: everything here works, entities project to no nodes, and nothing is
+/// reachable. Dispose releases the native handle.
+/// </summary>
+public class Context : IDisposable
 {
-    private readonly ContextHandle _handle;
+    private protected readonly ContextHandle _handle;
 
-    private TileContext(ContextHandle handle) => _handle = handle;
+    private protected Context(ContextHandle handle) => _handle = handle;
+
+    /// <summary>A context without a map.</summary>
+    public static Context Create()
+    {
+        Native.ls_context_create(out var h).ThrowIfError(nameof(Native.ls_context_create));
+        return new Context(h);
+    }
+
+    // --- Entities ---
+
+    /// <summary>Insert or replace one entity by id.</summary>
+    public void UpsertEntity(in EntityDesc entity) =>
+        Native.ls_entity_upsert(_handle, entity).ThrowIfError(nameof(Native.ls_entity_upsert));
+
+    public void RemoveEntity(ulong id) =>
+        Native.ls_entity_remove(_handle, id).ThrowIfError(nameof(Native.ls_entity_remove));
+
+    /// <summary>
+    /// Declarative snapshot sync: send everything you see each frame; the library diffs,
+    /// re-projects only what changed, and removes entities absent from the snapshot.
+    /// </summary>
+    public SyncStats SyncEntities(EntityDesc[] entities)
+    {
+        Native.ls_entities_sync(_handle, entities.Length == 0 ? null : entities, (UIntPtr)entities.Length, out var stats)
+            .ThrowIfError(nameof(Native.ls_entities_sync));
+        return stats;
+    }
+
+    public int EntityCount => (int)(ulong)Native.ls_entity_count(_handle);
+
+    /// <summary>Nodes the entity occupies; empty if it lies off-grid.</summary>
+    public uint[] EntityNodes(ulong id)
+    {
+        Native.ls_entity_nodes(_handle, id, null, UIntPtr.Zero, out var needed)
+            .ThrowIfNot(Status.BufferTooSmall, Status.Ok, nameof(Native.ls_entity_nodes));
+        var nodes = new uint[(int)(ulong)needed];
+        if (nodes.Length > 0)
+            Native.ls_entity_nodes(_handle, id, nodes, (UIntPtr)nodes.Length, out _).ThrowIfError(nameof(Native.ls_entity_nodes));
+        return nodes;
+    }
+
+    /// <summary>Closest point of the entity's bounds to <paramref name="from"/> (pure geometry).</summary>
+    public Vec3 EntityNearestPoint(ulong id, Vec3 from)
+    {
+        Native.ls_entity_nearest_point(_handle, id, from, out var p).ThrowIfError(nameof(Native.ls_entity_nearest_point));
+        return p;
+    }
+
+    // --- Player, announcement data, trackers ---
+
+    /// <summary>Update the player's position (each frame). A real move invalidates cached reachability.</summary>
+    public void SetPlayer(Vec3 position) =>
+        Native.ls_player_set(_handle, position).ThrowIfError(nameof(Native.ls_player_set));
+
+    /// <summary>Bearing, elevation, distance and step count from the player to the entity's nearest point.</summary>
+    public EntityVector EntityVector(ulong id)
+    {
+        Native.ls_entity_vector(_handle, id, out var v).ThrowIfError(nameof(Native.ls_entity_vector));
+        return v;
+    }
+
+    /// <summary>Create a tracker (a selection state machine) with a declarative, AND-combined filter list.
+    /// The core has no built-in visibility rules — even hiding is just a <see cref="FilterDesc.Flags"/> filter.</summary>
+    public uint CreateTracker(FilterDesc[]? filters = null, bool includeAll = true)
+    {
+        var count = filters?.Length ?? 0;
+        Native.ls_tracker_create(_handle, count == 0 ? null : filters, (UIntPtr)count, includeAll, out var id)
+            .ThrowIfError(nameof(Native.ls_tracker_create));
+        return id;
+    }
+
+    public void DestroyTracker(uint tracker) =>
+        Native.ls_tracker_destroy(_handle, tracker).ThrowIfError(nameof(Native.ls_tracker_destroy));
+
+    public void SetTrackerFilters(uint tracker, FilterDesc[]? filters)
+    {
+        var count = filters?.Length ?? 0;
+        Native.ls_tracker_set_filters(_handle, tracker, count == 0 ? null : filters, (UIntPtr)count)
+            .ThrowIfError(nameof(Native.ls_tracker_set_filters));
+    }
+
+    /// <summary>Enable or disable one filter by index — the hotkey-toggle primitive.</summary>
+    public void SetTrackerFilterEnabled(uint tracker, int index, bool enabled) =>
+        Native.ls_tracker_set_filter_enabled(_handle, tracker, (UIntPtr)index, enabled).ThrowIfError(nameof(Native.ls_tracker_set_filter_enabled));
+
+    /// <summary>Set the tracker's cycle order (<see cref="TrackerOrder.Distance"/> = nearest first, the scanner order).</summary>
+    public void SetTrackerOrder(uint tracker, TrackerOrder order) =>
+        Native.ls_tracker_set_order(_handle, tracker, order).ThrowIfError(nameof(Native.ls_tracker_set_order));
+
+    /// <summary>Jump the tracker to a category (<see cref="Selection.AllCategories"/> = the all-categories view)
+    /// without cycling; clears the selection. A category with nothing visible just lists nothing.</summary>
+    public void SetTrackerCategory(uint tracker, uint category) =>
+        Native.ls_tracker_set_category(_handle, tracker, category).ThrowIfError(nameof(Native.ls_tracker_set_category));
+
+    public Selection TrackerAct(uint tracker, TrackerAction action)
+    {
+        Native.ls_tracker_act(_handle, tracker, action, out var s).ThrowIfError(nameof(Native.ls_tracker_act));
+        return s;
+    }
+
+    /// <summary>Size of the selected entity's group in the tracker's current view; 0 when nothing is selected.</summary>
+    public uint TrackerGroupCount(uint tracker)
+    {
+        Native.ls_tracker_group_count(_handle, tracker, out var n).ThrowIfError(nameof(Native.ls_tracker_group_count));
+        return n;
+    }
+
+    /// <summary>Visible entity count under the tracker's filters, in one category or all.</summary>
+    public uint TrackerCount(uint tracker, uint category = Selection.AllCategories)
+    {
+        Native.ls_tracker_count(_handle, tracker, category, out var n).ThrowIfError(nameof(Native.ls_tracker_count));
+        return n;
+    }
+
+    public void Dispose() => _handle.Dispose();
+}
+
+/// <summary>A tile-grid context (spec §4): a <see cref="Context"/> with a grid map, so entities project into
+/// nodes and paths and reachability work.</summary>
+public sealed class TileContext : Context
+{
+    private TileContext(ContextHandle handle) : base(handle) { }
 
     /// <summary>
     /// Build from per-cell walkability: <c>width * height * layers</c> bytes, layer-major then
@@ -172,45 +299,7 @@ public sealed class TileContext : IDisposable
     public void ClearGroups(uint mask) =>
         Native.ls_groups_clear(_handle, mask).ThrowIfError(nameof(Native.ls_groups_clear));
 
-    // --- Entities ---
-
-    /// <summary>Insert or replace one entity by id.</summary>
-    public void UpsertEntity(in EntityDesc entity) =>
-        Native.ls_entity_upsert(_handle, entity).ThrowIfError(nameof(Native.ls_entity_upsert));
-
-    public void RemoveEntity(ulong id) =>
-        Native.ls_entity_remove(_handle, id).ThrowIfError(nameof(Native.ls_entity_remove));
-
-    /// <summary>
-    /// Declarative snapshot sync: send everything you see each frame; the library diffs,
-    /// re-projects only what changed, and removes entities absent from the snapshot.
-    /// </summary>
-    public SyncStats SyncEntities(EntityDesc[] entities)
-    {
-        Native.ls_entities_sync(_handle, entities.Length == 0 ? null : entities, (UIntPtr)entities.Length, out var stats)
-            .ThrowIfError(nameof(Native.ls_entities_sync));
-        return stats;
-    }
-
-    public int EntityCount => (int)(ulong)Native.ls_entity_count(_handle);
-
-    /// <summary>Nodes the entity occupies; empty if it lies off-grid.</summary>
-    public uint[] EntityNodes(ulong id)
-    {
-        Native.ls_entity_nodes(_handle, id, null, UIntPtr.Zero, out var needed)
-            .ThrowIfNot(Status.BufferTooSmall, Status.Ok, nameof(Native.ls_entity_nodes));
-        var nodes = new uint[(int)(ulong)needed];
-        if (nodes.Length > 0)
-            Native.ls_entity_nodes(_handle, id, nodes, (UIntPtr)nodes.Length, out _).ThrowIfError(nameof(Native.ls_entity_nodes));
-        return nodes;
-    }
-
-    /// <summary>Closest point of the entity's bounds to <paramref name="from"/> (pure geometry).</summary>
-    public Vec3 EntityNearestPoint(ulong id, Vec3 from)
-    {
-        Native.ls_entity_nearest_point(_handle, id, from, out var p).ThrowIfError(nameof(Native.ls_entity_nearest_point));
-        return p;
-    }
+    // --- Paths and reachability ---
 
     /// <summary>Path to an entity; goal mode comes from its <see cref="EntityFlags.PathfindAdjacent"/> flag.
     /// Null if unreachable.</summary>
@@ -230,19 +319,6 @@ public sealed class TileContext : IDisposable
         return reachable;
     }
 
-    // --- Player, announcement data, trackers ---
-
-    /// <summary>Update the player's position (each frame). A real move invalidates cached reachability.</summary>
-    public void SetPlayer(Vec3 position) =>
-        Native.ls_player_set(_handle, position).ThrowIfError(nameof(Native.ls_player_set));
-
-    /// <summary>Bearing, elevation, distance and step count from the player to the entity's nearest point.</summary>
-    public EntityVector EntityVector(ulong id)
-    {
-        Native.ls_entity_vector(_handle, id, out var v).ThrowIfError(nameof(Native.ls_entity_vector));
-        return v;
-    }
-
     /// <summary>Cached reachability of an entity from the player — cheap to call per announcement.</summary>
     public bool EntityReachableFromPlayer(ulong id, uint profile = 0, uint blockedMask = 0)
     {
@@ -251,45 +327,6 @@ public sealed class TileContext : IDisposable
         status.ThrowIfError(nameof(Native.ls_entity_reachable_from_player));
         return reachable;
     }
-
-    /// <summary>Create a tracker (a selection state machine) with a declarative, AND-combined filter list.
-    /// The core has no built-in visibility rules — even hiding is just a <see cref="FilterDesc.Flags"/> filter.</summary>
-    public uint CreateTracker(FilterDesc[]? filters = null, bool includeAll = true)
-    {
-        var count = filters?.Length ?? 0;
-        Native.ls_tracker_create(_handle, count == 0 ? null : filters, (UIntPtr)count, includeAll, out var id)
-            .ThrowIfError(nameof(Native.ls_tracker_create));
-        return id;
-    }
-
-    public void DestroyTracker(uint tracker) =>
-        Native.ls_tracker_destroy(_handle, tracker).ThrowIfError(nameof(Native.ls_tracker_destroy));
-
-    public void SetTrackerFilters(uint tracker, FilterDesc[]? filters)
-    {
-        var count = filters?.Length ?? 0;
-        Native.ls_tracker_set_filters(_handle, tracker, count == 0 ? null : filters, (UIntPtr)count)
-            .ThrowIfError(nameof(Native.ls_tracker_set_filters));
-    }
-
-    /// <summary>Enable or disable one filter by index — the hotkey-toggle primitive.</summary>
-    public void SetTrackerFilterEnabled(uint tracker, int index, bool enabled) =>
-        Native.ls_tracker_set_filter_enabled(_handle, tracker, (UIntPtr)index, enabled).ThrowIfError(nameof(Native.ls_tracker_set_filter_enabled));
-
-    public Selection TrackerAct(uint tracker, TrackerAction action)
-    {
-        Native.ls_tracker_act(_handle, tracker, action, out var s).ThrowIfError(nameof(Native.ls_tracker_act));
-        return s;
-    }
-
-    /// <summary>Visible entity count under the tracker's filters, in one category or all.</summary>
-    public uint TrackerCount(uint tracker, uint category = Selection.AllCategories)
-    {
-        Native.ls_tracker_count(_handle, tracker, category, out var n).ThrowIfError(nameof(Native.ls_tracker_count));
-        return n;
-    }
-
-    // --- Paths and reachability ---
 
     /// <summary>Path from the node containing <paramref name="start"/> to the one containing
     /// <paramref name="goal"/>, or null if no route exists.</summary>
@@ -348,5 +385,4 @@ public sealed class TileContext : IDisposable
         }
     }
 
-    public void Dispose() => _handle.Dispose();
 }

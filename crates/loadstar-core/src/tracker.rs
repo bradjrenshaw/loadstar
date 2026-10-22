@@ -32,6 +32,18 @@ pub struct FilterEntry {
     pub enabled: bool,
 }
 
+/// Cycle order of a tracker's entities.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Order {
+    /// `(category, sort_key, id)`: a fixed, mod-defined order.
+    #[default]
+    SortKey,
+    /// Nearest first: distance from the player to the entity's nearest point, re-evaluated
+    /// on every action (ties fall back to `SortKey` order). The scanner order, without the
+    /// mod rewriting `sort_key` (and so dirtying every entity) whenever the player moves.
+    Distance,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Next,
@@ -40,6 +52,14 @@ pub enum Action {
     CategoryPrev,
     /// Re-report the current selection without moving.
     Current,
+    /// The first entity of the next / previous group (spec §8 group browsing). Groups are
+    /// ordered by their first member in cycle order: with `Distance` order, nearest member
+    /// first. The selection's `index` is its position within its group.
+    GroupNext,
+    GroupPrev,
+    /// The next / previous entity within the selected entity's group, wrapping.
+    InGroupNext,
+    InGroupPrev,
 }
 
 /// What a tracker action produced. `entity_id == 0` means nothing is selected; `category`
@@ -67,6 +87,7 @@ pub struct Tracker {
     pub filters: Vec<FilterEntry>,
     /// Whether an "all categories" view precedes the per-category views.
     pub include_all: bool,
+    pub order: Order,
     /// `None` = the ALL view (or, without `include_all`, "not yet chosen").
     pub(crate) category: Option<u16>,
     pub(crate) selected: Option<EntityId>,
@@ -77,6 +98,7 @@ impl Tracker {
         Tracker {
             filters,
             include_all,
+            order: Order::default(),
             category: None,
             selected: None,
         }
@@ -95,6 +117,13 @@ impl Tracker {
     /// Replace the filter list. Selection is kept; it is re-validated on the next action.
     pub fn set_filters(&mut self, filters: Vec<FilterEntry>) {
         self.filters = filters;
+    }
+
+    /// Jump to a category view (`None` = the ALL view) without cycling to it; clears the
+    /// selection. A category with nothing visible is allowed: it just lists nothing.
+    pub fn set_category(&mut self, category: Option<u16>) {
+        self.category = category;
+        self.selected = None;
     }
 
     pub fn current_category(&self) -> u32 {

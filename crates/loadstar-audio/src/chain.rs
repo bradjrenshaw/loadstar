@@ -465,9 +465,9 @@ impl Chain {
                     Self::tune(desc.kind, filters, *current, rate);
                 }
                 for f in 0..frames {
-                    for c in 0..channels.min(2) {
+                    for (c, filter) in filters.iter_mut().enumerate().take(channels.min(2)) {
                         let i = f * channels + c;
-                        buf[i] = filters[c].process(buf[i]);
+                        buf[i] = filter.process(buf[i]);
                     }
                 }
             }

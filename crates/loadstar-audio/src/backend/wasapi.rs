@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
-    AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
     AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, IAudioClient,
     IAudioClient3, IAudioRenderClient, IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX,
     WAVEFORMATEXTENSIBLE, eConsole, eRender,
@@ -202,39 +202,29 @@ unsafe fn open_stream(cfg: &WasapiConfig, engine_rate: Option<u32>) -> Result<St
         let mut period_frames: u32 = 0;
 
         // Low-latency path: only with the engine's own mix format, which is what IAudioClient3 requires.
-        if mix_is_ours && engine_rate.is_none_or(|r| r == mix_rate) {
-            if let Ok(client3) = client.cast::<IAudioClient3>() {
-                let (mut default, mut fundamental, mut min, mut max) = (0u32, 0u32, 0u32, 0u32);
+        if mix_is_ours
+            && engine_rate.is_none_or(|r| r == mix_rate)
+            && let Ok(client3) = client.cast::<IAudioClient3>()
+        {
+            let (mut default, mut fundamental, mut min, mut max) = (0u32, 0u32, 0u32, 0u32);
+            if client3
+                .GetSharedModeEnginePeriod(mix, &mut default, &mut fundamental, &mut min, &mut max)
+                .is_ok()
+            {
+                let fundamental = fundamental.max(1);
+                let want = if cfg.period_frames == 0 {
+                    min
+                } else {
+                    let p = (cfg.period_frames as u32).clamp(min, max);
+                    (p / fundamental * fundamental).max(min)
+                };
                 if client3
-                    .GetSharedModeEnginePeriod(
-                        mix,
-                        &mut default,
-                        &mut fundamental,
-                        &mut min,
-                        &mut max,
-                    )
+                    .InitializeSharedAudioStream(AUDCLNT_STREAMFLAGS_EVENTCALLBACK, want, mix, None)
                     .is_ok()
                 {
-                    let fundamental = fundamental.max(1);
-                    let want = if cfg.period_frames == 0 {
-                        min
-                    } else {
-                        let p = (cfg.period_frames as u32).clamp(min, max);
-                        (p / fundamental * fundamental).max(min)
-                    };
-                    if client3
-                        .InitializeSharedAudioStream(
-                            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                            want,
-                            mix,
-                            None,
-                        )
-                        .is_ok()
-                    {
-                        low_latency = true;
-                        rate = mix_rate;
-                        period_frames = want;
-                    }
+                    low_latency = true;
+                    rate = mix_rate;
+                    period_frames = want;
                 }
             }
         }
@@ -307,11 +297,8 @@ unsafe fn run(
             Ok(p) => p,
             Err(e) => {
                 status.last_hresult.store(e.code().0, Ordering::Relaxed);
-                return if e.code() == AUDCLNT_E_DEVICE_INVALIDATED {
-                    Exit::DeviceLost
-                } else {
-                    Exit::DeviceLost
-                };
+                // Invalidated or any other failure: reopen the device either way.
+                return Exit::DeviceLost;
             }
         };
         let mut available = stream.buffer_frames.saturating_sub(padding);

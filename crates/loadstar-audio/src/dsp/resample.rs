@@ -73,7 +73,7 @@ impl Streaming {
         }
         let sample = |i: isize| -> f32 { if i < 0 { self.prev } else { mono(i as usize) } };
         // Output while both neighbours of the position exist (the right neighbour must be a real frame).
-        while self.pos.floor() as isize + 1 <= frames as isize - 1 {
+        while (self.pos.floor() as isize) < frames as isize - 1 {
             let idx = self.pos.floor() as isize;
             let frac = (self.pos - idx as f64) as f32;
             let a = sample(idx);

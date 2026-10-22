@@ -866,7 +866,7 @@ mod tests {
         let keys: Vec<&str> = t.categories.iter().map(|c| c.key.as_str()).collect();
         assert_eq!(keys, vec![tree::SCREEN_READERS, tree::SAPI5]);
         assert_eq!(t.leaves_in(ids::category_id(tree::SAPI5)).count(), 2);
-        assert!(s.refresh() || true);
+        let _ = s.refresh(); // must not panic; whether the tree changed doesn't matter here
         let empty = s.speak(0, &Profile::default(), "", 0).unwrap();
         assert_eq!(
             s.utterance(empty).0,

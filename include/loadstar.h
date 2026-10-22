@@ -42,7 +42,8 @@ typedef enum LsStatus {
    */
   LsStatus_VoiceUnavailable = 7,
   /**
-   * Speech: a feature the call needs is not in the resolved voice's set.
+   * A capability the call needs is missing: a feature not in the resolved voice's set
+   * (speech), or a map call on a context created without a map (`ls_context_create`).
    */
   LsStatus_NotSupported = 8,
   /**
@@ -80,7 +81,8 @@ typedef struct LsAudioDevice LsAudioDevice;
 #endif
 
 /**
- * Opaque: a map plus everything consistent with it (spec §4). Exported to C as `LsContext`.
+ * Opaque: a map (optional) plus everything consistent with it (spec §4). Exported to C as
+ * `LsContext`.
  */
 typedef struct LsContext LsContext;
 
@@ -165,7 +167,11 @@ typedef struct LsEntityDesc {
    * Mod-defined; the core only groups by equality.
    */
   uint16_t category;
-  uint16_t _reserved;
+  /**
+   * Mod-defined group for group browsing: entities sharing a nonzero value form one group.
+   * 0 = ungrouped. (Formerly reserved, so old callers that zeroed it are unaffected.)
+   */
+  uint16_t group;
   /**
    * Blocking-group bitmask projected onto the entity's nodes. 0 = doesn't block.
    */
@@ -466,6 +472,9 @@ uint32_t ls_abi_version(void);
 
 /**
  * Smoke test for bindings: writes `a + b` into `out`. Exercises by-value struct passing and out-params.
+ *
+ * # Safety
+ * `out` must be null or valid for writing one `Vec3`.
  */
 enum LsStatus ls_vec3_add(struct LsVec3 a,
                           struct LsVec3 b,
@@ -477,6 +486,10 @@ enum LsStatus ls_vec3_add(struct LsVec3 a,
  * `walkable` holds `width * height * layers` bytes, layer-major then row-major
  * (`index = layer * width * height + row * width + col`); nonzero = walkable.
  * On success `*out` receives a handle that must be released with [`ls_context_destroy`].
+ *
+ * # Safety
+ * - `walkable` must be null or valid for reading `walkable_len` elements.
+ * - `out` must be null or valid for writing one pointer.
  */
 enum LsStatus ls_tile_context_create(uint32_t width,
                                      uint32_t height,
@@ -492,6 +505,11 @@ enum LsStatus ls_tile_context_create(uint32_t width,
  * set means the node may be left in direction `d` (0 = south/+row, 1 = north/-row,
  * 2 = east/+col, 3 = west/-col). `overrides` (may be null when `overrides_len` is 0)
  * lists the edges that change layer or cost.
+ *
+ * # Safety
+ * - `masks` must be null or valid for reading `masks_len` elements.
+ * - `overrides` must be null or valid for reading `overrides_len` elements.
+ * - `out` must be null or valid for writing one pointer.
  */
 enum LsStatus ls_tile_context_create_edges(uint32_t width,
                                            uint32_t height,
@@ -503,12 +521,30 @@ enum LsStatus ls_tile_context_create_edges(uint32_t width,
                                            struct LsContext **out);
 
 /**
+ * Create a context without a map (spec §4): the entity registry, the player, entity
+ * vectors and trackers, for spaces the core doesn't model. Map calls on it return
+ * `NotSupported`; its entities project to no nodes and never pass a reachability filter.
+ * On success `*out` receives a handle that must be released with [`ls_context_destroy`].
+ *
+ * # Safety
+ * `out` must be null or valid for writing one pointer.
+ */
+enum LsStatus ls_context_create(struct LsContext **out);
+
+/**
  * Release a context and everything it owns. Null is a no-op.
+ *
+ * # Safety
+ * `ctx` must be null or a context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create` that has not been released, and no other call may be using it. It is dangling after this call.
  */
 void ls_context_destroy(struct LsContext *ctx);
 
 /**
  * Node id for `(col, row, layer)`. `InvalidArgument` if outside the grid.
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing one `u32`.
  */
 enum LsStatus ls_node_id(const struct LsContext *ctx,
                          uint32_t col,
@@ -518,6 +554,12 @@ enum LsStatus ls_node_id(const struct LsContext *ctx,
 
 /**
  * `(col, row, layer)` of a node. Any out-pointer may be null to skip it.
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `out_col` must be null or valid for writing one `u32`.
+ * - `out_row` must be null or valid for writing one `u32`.
+ * - `out_layer` must be null or valid for writing one `u32`.
  */
 enum LsStatus ls_node_coords(const struct LsContext *ctx,
                              uint32_t node,
@@ -527,17 +569,33 @@ enum LsStatus ls_node_coords(const struct LsContext *ctx,
 
 /**
  * Center position of a node. `InvalidArgument` if `node` is out of range.
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing one `Vec3`.
  */
-enum LsStatus ls_node_position(const struct LsContext *ctx, uint32_t node, struct LsVec3 *out);
+enum LsStatus ls_node_position(const struct LsContext *ctx,
+                               uint32_t node,
+                               struct LsVec3 *out);
 
 /**
  * The node containing `pos`. `InvalidArgument` if outside the grid.
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing one `u32`.
  */
-enum LsStatus ls_node_from_position(const struct LsContext *ctx, struct LsVec3 pos, uint32_t *out);
+enum LsStatus ls_node_from_position(const struct LsContext *ctx,
+                                    struct LsVec3 pos,
+                                    uint32_t *out);
 
 /**
  * Register an agent profile; `*out` receives its id for `PathOptions.profile`.
  * `InvalidArgument` if the footprint is 0 or over 255.
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing one `u32`.
  */
 enum LsStatus ls_profile_register(struct LsContext *ctx,
                                   struct LsProfileDesc profile,
@@ -545,41 +603,81 @@ enum LsStatus ls_profile_register(struct LsContext *ctx,
 
 /**
  * Clearance of a node: the largest square footprint that fits anchored there (0 = wall).
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing one `u32`.
  */
-enum LsStatus ls_node_clearance(const struct LsContext *ctx, uint32_t node, uint32_t *out);
+enum LsStatus ls_node_clearance(const struct LsContext *ctx,
+                                uint32_t node,
+                                uint32_t *out);
 
 /**
  * Group bitmask of a node. `InvalidArgument` if out of range.
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing one `u32`.
  */
-enum LsStatus ls_node_get_groups(const struct LsContext *ctx, uint32_t node, uint32_t *out);
+enum LsStatus ls_node_get_groups(const struct LsContext *ctx,
+                                 uint32_t node,
+                                 uint32_t *out);
 
 /**
  * Replace a node's groups.
+ *
+ * # Safety
+ * `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
  */
-enum LsStatus ls_node_set_groups(struct LsContext *ctx, uint32_t node, uint32_t mask);
+enum LsStatus ls_node_set_groups(struct LsContext *ctx,
+                                 uint32_t node,
+                                 uint32_t mask);
 
 /**
  * OR `mask` into a node's groups.
+ *
+ * # Safety
+ * `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
  */
-enum LsStatus ls_node_add_groups(struct LsContext *ctx, uint32_t node, uint32_t mask);
+enum LsStatus ls_node_add_groups(struct LsContext *ctx,
+                                 uint32_t node,
+                                 uint32_t mask);
 
 /**
  * Clear `mask` bits from a node's groups.
+ *
+ * # Safety
+ * `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
  */
-enum LsStatus ls_node_remove_groups(struct LsContext *ctx, uint32_t node, uint32_t mask);
+enum LsStatus ls_node_remove_groups(struct LsContext *ctx,
+                                    uint32_t node,
+                                    uint32_t mask);
 
 /**
  * Clear `mask` bits from every node.
+ *
+ * # Safety
+ * `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
  */
-enum LsStatus ls_groups_clear(struct LsContext *ctx, uint32_t mask);
+enum LsStatus ls_groups_clear(struct LsContext *ctx,
+                              uint32_t mask);
 
 /**
  * Open or close one directed edge (`node` leaving in `dir`). The reverse edge is untouched.
+ *
+ * # Safety
+ * `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
  */
-enum LsStatus ls_tile_set_edge(struct LsContext *ctx, uint32_t node, uint8_t dir, bool passable);
+enum LsStatus ls_tile_set_edge(struct LsContext *ctx,
+                               uint32_t node,
+                               uint8_t dir,
+                               bool passable);
 
 /**
  * Set the layer/cost override for one directed edge (ramps, terrain costs).
+ *
+ * # Safety
+ * `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
  */
 enum LsStatus ls_tile_set_edge_override(struct LsContext *ctx,
                                         uint32_t node,
@@ -589,38 +687,70 @@ enum LsStatus ls_tile_set_edge_override(struct LsContext *ctx,
 
 /**
  * Remove an override, restoring "same layer, cost 1". Clearing a missing override is `Ok`.
+ *
+ * # Safety
+ * `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
  */
-enum LsStatus ls_tile_clear_edge_override(struct LsContext *ctx, uint32_t node, uint8_t dir);
+enum LsStatus ls_tile_clear_edge_override(struct LsContext *ctx,
+                                          uint32_t node,
+                                          uint8_t dir);
 
 /**
  * Add a link, or replace the one with the same id. Endpoints must be inside the grid.
+ *
+ * # Safety
+ * `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
  */
-enum LsStatus ls_link_add(struct LsContext *ctx, struct LsLinkDesc link);
+enum LsStatus ls_link_add(struct LsContext *ctx,
+                          struct LsLinkDesc link);
 
 /**
  * Remove a link. `InvalidArgument` if the id is unknown.
+ *
+ * # Safety
+ * `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
  */
-enum LsStatus ls_link_remove(struct LsContext *ctx, uint64_t id);
+enum LsStatus ls_link_remove(struct LsContext *ctx,
+                             uint64_t id);
 
 /**
  * Enable or disable a link without removing it (unpowered teleporter, locked door).
+ *
+ * # Safety
+ * `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
  */
-enum LsStatus ls_link_set_enabled(struct LsContext *ctx, uint64_t id, bool enabled);
+enum LsStatus ls_link_set_enabled(struct LsContext *ctx,
+                                  uint64_t id,
+                                  bool enabled);
 
 /**
  * Insert or replace one entity by id. `InvalidArgument` for an unknown bounds kind.
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `entity` must be null or valid for reading one `EntityDesc`.
  */
-enum LsStatus ls_entity_upsert(struct LsContext *ctx, const struct LsEntityDesc *entity);
+enum LsStatus ls_entity_upsert(struct LsContext *ctx,
+                               const struct LsEntityDesc *entity);
 
 /**
  * Remove an entity. `InvalidArgument` if the id is unknown.
+ *
+ * # Safety
+ * `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
  */
-enum LsStatus ls_entity_remove(struct LsContext *ctx, uint64_t id);
+enum LsStatus ls_entity_remove(struct LsContext *ctx,
+                               uint64_t id);
 
 /**
  * Declarative snapshot sync (spec §5): upsert every record, remove every entity absent
  * from the snapshot. The core diffs, so re-sending unchanged records costs nothing.
  * `stats` may be null. Rejects the whole snapshot on any invalid bounds kind.
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `entities` must be null or valid for reading `entities_len` elements.
+ * - `stats` must be null or valid for writing one `SyncStats`.
  */
 enum LsStatus ls_entities_sync(struct LsContext *ctx,
                                const struct LsEntityDesc *entities,
@@ -629,12 +759,20 @@ enum LsStatus ls_entities_sync(struct LsContext *ctx,
 
 /**
  * Number of entities in the registry.
+ *
+ * # Safety
+ * `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
  */
 uintptr_t ls_entity_count(const struct LsContext *ctx);
 
 /**
  * Nodes an entity occupies (its bounds projected through the grid). Same buffer convention
  * as [`ls_path_nodes`]. `InvalidArgument` for an unknown id; an off-grid entity writes zero.
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing `capacity` elements.
+ * - `written` must be null or valid for writing one `usize`.
  */
 enum LsStatus ls_entity_nodes(const struct LsContext *ctx,
                               uint64_t id,
@@ -644,6 +782,10 @@ enum LsStatus ls_entity_nodes(const struct LsContext *ctx,
 
 /**
  * Closest point of an entity's bounds to `from` — pure geometry, no map involved.
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing one `Vec3`.
  */
 enum LsStatus ls_entity_nearest_point(const struct LsContext *ctx,
                                       uint64_t id,
@@ -653,6 +795,10 @@ enum LsStatus ls_entity_nearest_point(const struct LsContext *ctx,
 /**
  * Path to an entity. Goal mode comes from the entity's `PathfindAdjacent` flag, not `opts`.
  * `InvalidArgument` for an unknown id; otherwise the [`ls_find_path`] result convention.
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing one pointer.
  */
 enum LsStatus ls_find_path_to_entity(const struct LsContext *ctx,
                                      struct LsVec3 start,
@@ -664,6 +810,10 @@ enum LsStatus ls_find_path_to_entity(const struct LsContext *ctx,
  * Whether an entity is reachable from `start`: any of its nodes, or any node one step away
  * from them, is reachable under `opts.blocked_mask`. Runs a fresh flood fill each call.
  * `NoPath` if `start` is off-grid; `InvalidArgument` for an unknown id.
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing one `bool`.
  */
 enum LsStatus ls_entity_reachable(const struct LsContext *ctx,
                                   struct LsVec3 start,
@@ -673,11 +823,19 @@ enum LsStatus ls_entity_reachable(const struct LsContext *ctx,
 
 /**
  * Update the player's position (each frame). A real move invalidates cached reachability.
+ *
+ * # Safety
+ * `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
  */
-enum LsStatus ls_player_set(struct LsContext *ctx, struct LsVec3 position);
+enum LsStatus ls_player_set(struct LsContext *ctx,
+                            struct LsVec3 position);
 
 /**
  * Bearing, elevation, distance and step count from the player to an entity's nearest point.
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing one `EntityVector`.
  */
 enum LsStatus ls_entity_vector(const struct LsContext *ctx,
                                uint64_t id,
@@ -686,6 +844,10 @@ enum LsStatus ls_entity_vector(const struct LsContext *ctx,
 /**
  * [`ls_entity_reachable`] from the player's position, using the reachability cache — cheap
  * to call per announcement. `NoPath` if the player is off-grid.
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing one `bool`.
  */
 enum LsStatus ls_entity_reachable_from_player(const struct LsContext *ctx,
                                               uint64_t id,
@@ -696,6 +858,11 @@ enum LsStatus ls_entity_reachable_from_player(const struct LsContext *ctx,
 /**
  * Create a tracker with an initial filter list (may be empty; `filters` may then be null).
  * `include_all` adds an all-categories view ahead of the per-category views.
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `filters` must be null or valid for reading `filters_len` elements.
+ * - `out` must be null or valid for writing one `u32`.
  */
 enum LsStatus ls_tracker_create(struct LsContext *ctx,
                                 const struct LsFilterDesc *filters,
@@ -705,11 +872,19 @@ enum LsStatus ls_tracker_create(struct LsContext *ctx,
 
 /**
  * Destroy a tracker. `InvalidArgument` if unknown.
+ *
+ * # Safety
+ * `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
  */
-enum LsStatus ls_tracker_destroy(struct LsContext *ctx, uint32_t tracker);
+enum LsStatus ls_tracker_destroy(struct LsContext *ctx,
+                                 uint32_t tracker);
 
 /**
  * Replace a tracker's filter list wholesale. The selection is re-validated on the next action.
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `filters` must be null or valid for reading `filters_len` elements.
  */
 enum LsStatus ls_tracker_set_filters(struct LsContext *ctx,
                                      uint32_t tracker,
@@ -718,6 +893,9 @@ enum LsStatus ls_tracker_set_filters(struct LsContext *ctx,
 
 /**
  * Enable or disable one filter by index (hotkey toggles).
+ *
+ * # Safety
+ * `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
  */
 enum LsStatus ls_tracker_set_filter_enabled(struct LsContext *ctx,
                                             uint32_t tracker,
@@ -725,7 +903,32 @@ enum LsStatus ls_tracker_set_filter_enabled(struct LsContext *ctx,
                                             bool enabled);
 
 /**
+ * Set a tracker's cycle order. `order` is a `TrackerOrder` discriminant.
+ *
+ * # Safety
+ * `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ */
+enum LsStatus ls_tracker_set_order(struct LsContext *ctx,
+                                   uint32_t tracker,
+                                   uint32_t order);
+
+/**
+ * Jump a tracker to `category` (`UINT32_MAX` = the all-categories view) without cycling;
+ * clears the selection. A category with nothing visible is allowed and lists nothing.
+ *
+ * # Safety
+ * `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ */
+enum LsStatus ls_tracker_set_category(struct LsContext *ctx,
+                                      uint32_t tracker,
+                                      uint32_t category);
+
+/**
  * Drive a tracker. `action` is a `TrackerAction` discriminant.
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing one `Selection`.
  */
 enum LsStatus ls_tracker_act(struct LsContext *ctx,
                              uint32_t tracker,
@@ -733,7 +936,23 @@ enum LsStatus ls_tracker_act(struct LsContext *ctx,
                              struct LsSelection *out);
 
 /**
+ * Size of the selected entity's group in the tracker's current view; 0 when nothing is
+ * selected. `InvalidArgument` for an unknown tracker.
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing one `u32`.
+ */
+enum LsStatus ls_tracker_group_count(const struct LsContext *ctx,
+                                     uint32_t tracker,
+                                     uint32_t *out);
+
+/**
  * Visible entity count under the tracker's filters, in `category` or (`UINT32_MAX`) all.
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing one `u32`.
  */
 enum LsStatus ls_tracker_count(const struct LsContext *ctx,
                                uint32_t tracker,
@@ -745,6 +964,10 @@ enum LsStatus ls_tracker_count(const struct LsContext *ctx,
  *
  * On `Ok`, `*out` receives a path handle (release with [`ls_path_free`]).
  * On `NoPath`, `*out` is set to null and nothing needs freeing.
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing one pointer.
  */
 enum LsStatus ls_find_path(const struct LsContext *ctx,
                            struct LsVec3 start,
@@ -755,6 +978,11 @@ enum LsStatus ls_find_path(const struct LsContext *ctx,
 /**
  * Find a path from the node containing `start` to the cheapest of `targets` (node ids),
  * interpreted per `opts.goal_mode`. Same result convention as [`ls_find_path`].
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `targets` must be null or valid for reading `targets_len` elements.
+ * - `out` must be null or valid for writing one pointer.
  */
 enum LsStatus ls_find_path_to_nodes(const struct LsContext *ctx,
                                     struct LsVec3 start,
@@ -767,6 +995,11 @@ enum LsStatus ls_find_path_to_nodes(const struct LsContext *ctx,
  * Reachability from the node containing `start`: one byte per node (nonzero = reachable),
  * same buffer convention as [`ls_path_nodes`]. `opts.goal_mode` is ignored.
  * `NoPath` if `start` is off-grid and cannot be snapped.
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing `capacity` elements.
+ * - `written` must be null or valid for writing one `usize`.
  */
 enum LsStatus ls_reachable_nodes(const struct LsContext *ctx,
                                  struct LsVec3 start,
@@ -777,17 +1010,28 @@ enum LsStatus ls_reachable_nodes(const struct LsContext *ctx,
 
 /**
  * Number of nodes in a path (both endpoints included). Zero for a null handle.
+ *
+ * # Safety
+ * `path` must be null or a live path handle from a path query (`ls_find_path`, `ls_find_path_to_nodes` or `ls_find_path_to_entity`).
  */
 uintptr_t ls_path_len(const struct LsPath *path);
 
 /**
  * Total traversal cost of a path. Zero for a null handle.
+ *
+ * # Safety
+ * `path` must be null or a live path handle from a path query (`ls_find_path`, `ls_find_path_to_nodes` or `ls_find_path_to_entity`).
  */
 float ls_path_cost(const struct LsPath *path);
 
 /**
  * Copy the path's node ids into `out` (capacity `capacity`). `*written` receives the count
  * needed; if it exceeds `capacity`, nothing is copied and `BufferTooSmall` is returned.
+ *
+ * # Safety
+ * - `path` must be null or a live path handle from a path query (`ls_find_path`, `ls_find_path_to_nodes` or `ls_find_path_to_entity`).
+ * - `out` must be null or valid for writing `capacity` elements.
+ * - `written` must be null or valid for writing one `usize`.
  */
 enum LsStatus ls_path_nodes(const struct LsPath *path,
                             uint32_t *out,
@@ -797,6 +1041,11 @@ enum LsStatus ls_path_nodes(const struct LsPath *path,
 /**
  * Copy the path's link traversals into `out`. Same buffer convention as [`ls_path_nodes`].
  * A path with no link traversals writes zero and returns `Ok`.
+ *
+ * # Safety
+ * - `path` must be null or a live path handle from a path query (`ls_find_path`, `ls_find_path_to_nodes` or `ls_find_path_to_entity`).
+ * - `out` must be null or valid for writing `capacity` elements.
+ * - `written` must be null or valid for writing one `usize`.
  */
 enum LsStatus ls_path_links(const struct LsPath *path,
                             struct LsPathLink *out,
@@ -807,6 +1056,12 @@ enum LsStatus ls_path_links(const struct LsPath *path,
  * Compress a path into direction runs broken at link traversals ("north 5, east 2, take
  * the teleporter" as data). Needs the context the path was found on. Same buffer
  * convention as [`ls_path_nodes`].
+ *
+ * # Safety
+ * - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+ * - `path` must be null or a live path handle from a path query (`ls_find_path`, `ls_find_path_to_nodes` or `ls_find_path_to_entity`).
+ * - `out` must be null or valid for writing `capacity` elements.
+ * - `written` must be null or valid for writing one `usize`.
  */
 enum LsStatus ls_path_segments(const struct LsContext *ctx,
                                const struct LsPath *path,
@@ -816,12 +1071,18 @@ enum LsStatus ls_path_segments(const struct LsContext *ctx,
 
 /**
  * Release a path. Null is a no-op.
+ *
+ * # Safety
+ * `path` must be null or a path handle from a path query (`ls_find_path`, `ls_find_path_to_nodes` or `ls_find_path_to_entity`) that has not been released, and no other call may be using it. It is dangling after this call.
  */
 void ls_path_free(struct LsPath *path);
 
 #if defined(LOADSTAR_AUDIO)
 /**
  * Open the default audio output (WASAPI shared mode on Windows). `DeviceUnavailable` if none.
+ *
+ * # Safety
+ * `out` must be null or valid for writing one pointer.
  */
 enum LsStatus la_device_open(struct LsAudioDeviceConfig cfg, struct LsAudioDevice **out);
 #endif
@@ -830,6 +1091,9 @@ enum LsStatus la_device_open(struct LsAudioDeviceConfig cfg, struct LsAudioDevic
 /**
  * Open a device with no hardware: periods are rendered on demand with [`la_device_render`].
  * For tests and harnesses.
+ *
+ * # Safety
+ * `out` must be null or valid for writing one pointer.
  */
 enum LsStatus la_device_open_null(struct LsAudioDeviceConfig cfg,
                                   uint32_t sample_rate,
@@ -840,6 +1104,9 @@ enum LsStatus la_device_open_null(struct LsAudioDeviceConfig cfg,
 #if defined(LOADSTAR_AUDIO)
 /**
  * Close a device, stopping its audio thread and releasing every space and buffer. Null is a no-op.
+ *
+ * # Safety
+ * `dev` must be null or a audio device handle from `la_device_open` or `la_device_open_null` that has not been released, and no other call may be using it. It is dangling after this call.
  */
 void la_device_close(struct LsAudioDevice *dev);
 #endif
@@ -847,20 +1114,36 @@ void la_device_close(struct LsAudioDevice *dev);
 #if defined(LOADSTAR_AUDIO)
 /**
  * The format the backend actually opened.
+ *
+ * # Safety
+ * - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing one `AudioStreamInfo`.
  */
-enum LsStatus la_device_info(struct LsAudioDevice *dev, struct LsAudioStreamInfo *out);
+enum LsStatus la_device_info(struct LsAudioDevice *dev,
+                             struct LsAudioStreamInfo *out);
 #endif
 
 #if defined(LOADSTAR_AUDIO)
-enum LsStatus la_device_master_gain(struct LsAudioDevice *dev, float gain);
+/**
+ * # Safety
+ * `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ */
+enum LsStatus la_device_master_gain(struct LsAudioDevice *dev,
+                                    float gain);
 #endif
 
 #if defined(LOADSTAR_AUDIO)
 /**
  * Null devices only: apply pending commands and render `frames` frames of interleaved
  * stereo into `out` (`2 * frames` floats). A no-op on hardware devices.
+ *
+ * # Safety
+ * - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing `2 * frames` floats.
  */
-enum LsStatus la_device_render(struct LsAudioDevice *dev, float *out, uintptr_t frames);
+enum LsStatus la_device_render(struct LsAudioDevice *dev,
+                               float *out,
+                               uintptr_t frames);
 #endif
 
 #if defined(LOADSTAR_AUDIO)
@@ -868,6 +1151,11 @@ enum LsStatus la_device_render(struct LsAudioDevice *dev, float *out, uintptr_t 
  * Drain the `(space, id)` pairs whose sequences ended since the last call. Buffer convention
  * as `ls_path_nodes`: `*written` receives the count; `BufferTooSmall` if it exceeds `capacity`
  * (nothing is consumed in that case).
+ *
+ * # Safety
+ * - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing `capacity` elements.
+ * - `written` must be null or valid for writing one `usize`.
  */
 enum LsStatus la_device_finished(struct LsAudioDevice *dev,
                                  struct LsAudioFinished *out,
@@ -878,6 +1166,10 @@ enum LsStatus la_device_finished(struct LsAudioDevice *dev,
 #if defined(LOADSTAR_AUDIO)
 /**
  * Create a space. `mode` is an `AudioSpaceMode`; `unit_scale` = units per metre (0 = 1).
+ *
+ * # Safety
+ * - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing one `u32`.
  */
 enum LsStatus la_space_create(struct LsAudioDevice *dev,
                               uint32_t mode,
@@ -887,16 +1179,30 @@ enum LsStatus la_space_create(struct LsAudioDevice *dev,
 #endif
 
 #if defined(LOADSTAR_AUDIO)
-enum LsStatus la_space_destroy(struct LsAudioDevice *dev, uint32_t space);
+/**
+ * # Safety
+ * `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ */
+enum LsStatus la_space_destroy(struct LsAudioDevice *dev,
+                               uint32_t space);
 #endif
 
 #if defined(LOADSTAR_AUDIO)
-enum LsStatus la_space_gain(struct LsAudioDevice *dev, uint32_t space, float gain);
+/**
+ * # Safety
+ * `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ */
+enum LsStatus la_space_gain(struct LsAudioDevice *dev,
+                            uint32_t space,
+                            float gain);
 #endif
 
 #if defined(LOADSTAR_AUDIO)
 /**
  * Listener pose for a space, each frame.
+ *
+ * # Safety
+ * `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
  */
 enum LsStatus la_listener_set(struct LsAudioDevice *dev,
                               uint32_t space,
@@ -908,21 +1214,46 @@ enum LsStatus la_listener_set(struct LsAudioDevice *dev,
 #if defined(LOADSTAR_AUDIO)
 /**
  * Per-frame hook for simulating renderers (audio spec §3). A no-op for the head model.
+ *
+ * # Safety
+ * `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
  */
-enum LsStatus la_space_update(struct LsAudioDevice *dev, uint32_t space, float dt);
+enum LsStatus la_space_update(struct LsAudioDevice *dev,
+                              uint32_t space,
+                              float dt);
 #endif
 
 #if defined(LOADSTAR_AUDIO)
-enum LsStatus la_bus_create(struct LsAudioDevice *dev, uint32_t space, float gain, uint32_t *out);
+/**
+ * # Safety
+ * - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing one `u32`.
+ */
+enum LsStatus la_bus_create(struct LsAudioDevice *dev,
+                            uint32_t space,
+                            float gain,
+                            uint32_t *out);
 #endif
 
 #if defined(LOADSTAR_AUDIO)
-enum LsStatus la_bus_gain(struct LsAudioDevice *dev, uint32_t space, uint32_t bus, float gain);
+/**
+ * # Safety
+ * `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ */
+enum LsStatus la_bus_gain(struct LsAudioDevice *dev,
+                          uint32_t space,
+                          uint32_t bus,
+                          float gain);
 #endif
 
 #if defined(LOADSTAR_AUDIO)
 /**
  * Upload interleaved PCM; converted to mono at the mixer rate (copied — the caller keeps ownership).
+ *
+ * # Safety
+ * - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ * - `samples` must be null or valid for reading `samples_len` elements.
+ * - `out` must be null or valid for writing one `u32`.
  */
 enum LsStatus la_buffer_create(struct LsAudioDevice *dev,
                                const float *samples,
@@ -933,10 +1264,22 @@ enum LsStatus la_buffer_create(struct LsAudioDevice *dev,
 #endif
 
 #if defined(LOADSTAR_AUDIO)
-enum LsStatus la_buffer_click(struct LsAudioDevice *dev, float ms, uint32_t *out);
+/**
+ * # Safety
+ * - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing one `u32`.
+ */
+enum LsStatus la_buffer_click(struct LsAudioDevice *dev,
+                              float ms,
+                              uint32_t *out);
 #endif
 
 #if defined(LOADSTAR_AUDIO)
+/**
+ * # Safety
+ * - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing one `u32`.
+ */
 enum LsStatus la_buffer_tone(struct LsAudioDevice *dev,
                              float hz,
                              float ms,
@@ -946,7 +1289,12 @@ enum LsStatus la_buffer_tone(struct LsAudioDevice *dev,
 #endif
 
 #if defined(LOADSTAR_AUDIO)
-enum LsStatus la_buffer_free(struct LsAudioDevice *dev, uint32_t buffer);
+/**
+ * # Safety
+ * `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ */
+enum LsStatus la_buffer_free(struct LsAudioDevice *dev,
+                             uint32_t buffer);
 #endif
 
 #if defined(LOADSTAR_AUDIO)
@@ -954,6 +1302,10 @@ enum LsStatus la_buffer_free(struct LsAudioDevice *dev, uint32_t buffer);
  * Create a streaming source (audio spec §3): a ring of `capacity` mono frames at the mixer rate
  * that starts playing once `prefill` frames are in. Reference it from a source record with
  * `kind = Stream` and `buffer = id`; feed it with `la_stream_write`.
+ *
+ * # Safety
+ * - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ * - `out` must be null or valid for writing `capacity` elements.
  */
 enum LsStatus la_stream_create(struct LsAudioDevice *dev,
                                uintptr_t capacity,
@@ -965,6 +1317,11 @@ enum LsStatus la_stream_create(struct LsAudioDevice *dev,
 /**
  * Write mono samples at the mixer rate; `written` receives how many were taken (the rest did not
  * fit — come back next frame).
+ *
+ * # Safety
+ * - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ * - `samples` must be null or valid for reading `samples_len` elements.
+ * - `written` must be null or valid for writing one `usize`.
  */
 enum LsStatus la_stream_write(struct LsAudioDevice *dev,
                               uint32_t stream,
@@ -976,6 +1333,12 @@ enum LsStatus la_stream_write(struct LsAudioDevice *dev,
 #if defined(LOADSTAR_AUDIO)
 /**
  * Frames written and played so far, and whether the producer has finished.
+ *
+ * # Safety
+ * - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ * - `written` must be null or valid for writing one `u64`.
+ * - `played` must be null or valid for writing one `u64`.
+ * - `finished` must be null or valid for writing one `bool`.
  */
 enum LsStatus la_stream_progress(struct LsAudioDevice *dev,
                                  uint32_t stream,
@@ -987,21 +1350,33 @@ enum LsStatus la_stream_progress(struct LsAudioDevice *dev,
 #if defined(LOADSTAR_AUDIO)
 /**
  * No more samples will come: the voice ends once the ring drains.
+ *
+ * # Safety
+ * `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
  */
-enum LsStatus la_stream_finish(struct LsAudioDevice *dev, uint32_t stream);
+enum LsStatus la_stream_finish(struct LsAudioDevice *dev,
+                               uint32_t stream);
 #endif
 
 #if defined(LOADSTAR_AUDIO)
 /**
  * Release the stream id (after its voice finished).
+ *
+ * # Safety
+ * `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
  */
-enum LsStatus la_stream_free(struct LsAudioDevice *dev, uint32_t stream);
+enum LsStatus la_stream_free(struct LsAudioDevice *dev,
+                             uint32_t stream);
 #endif
 
 #if defined(LOADSTAR_AUDIO)
 /**
  * Declarative snapshot of a space's declared sources (audio spec §3). `InvalidArgument`
  * rejects the whole snapshot on any bad bounds kind.
+ *
+ * # Safety
+ * - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ * - `descs` must be null or valid for reading `descs_len` elements.
  */
 enum LsStatus la_space_sync(struct LsAudioDevice *dev,
                             uint32_t space,
@@ -1010,18 +1385,33 @@ enum LsStatus la_space_sync(struct LsAudioDevice *dev,
 #endif
 
 #if defined(LOADSTAR_AUDIO)
+/**
+ * # Safety
+ * - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ * - `desc` must be null or valid for reading one `AudioSourceDesc`.
+ */
 enum LsStatus la_source_upsert(struct LsAudioDevice *dev,
                                uint32_t space,
                                const struct LsAudioSourceDesc *desc);
 #endif
 
 #if defined(LOADSTAR_AUDIO)
-enum LsStatus la_source_remove(struct LsAudioDevice *dev, uint32_t space, uint64_t id);
+/**
+ * # Safety
+ * `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ */
+enum LsStatus la_source_remove(struct LsAudioDevice *dev,
+                               uint32_t space,
+                               uint64_t id);
 #endif
 
 #if defined(LOADSTAR_AUDIO)
 /**
  * Play a sequence and remove the source when it drains (audio spec §3, fired sources).
+ *
+ * # Safety
+ * - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ * - `desc` must be null or valid for reading one `AudioSourceDesc`.
  */
 enum LsStatus la_space_fire(struct LsAudioDevice *dev,
                             uint32_t space,
@@ -1029,12 +1419,22 @@ enum LsStatus la_space_fire(struct LsAudioDevice *dev,
 #endif
 
 #if defined(LOADSTAR_AUDIO)
-enum LsStatus la_source_stop(struct LsAudioDevice *dev, uint32_t space, uint64_t id);
+/**
+ * # Safety
+ * `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ */
+enum LsStatus la_source_stop(struct LsAudioDevice *dev,
+                             uint32_t space,
+                             uint64_t id);
 #endif
 
 #if defined(LOADSTAR_AUDIO)
 /**
  * Replace a chain wholesale (`nodes` may be null when `nodes_len` is 0).
+ *
+ * # Safety
+ * - `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ * - `nodes` must be null or valid for reading `nodes_len` elements.
  */
 enum LsStatus la_chain_set(struct LsAudioDevice *dev,
                            struct LsAudioChainTarget target,
@@ -1045,6 +1445,9 @@ enum LsStatus la_chain_set(struct LsAudioDevice *dev,
 #if defined(LOADSTAR_AUDIO)
 /**
  * Retune one parameter of one node in place.
+ *
+ * # Safety
+ * `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
  */
 enum LsStatus la_effect_set_param(struct LsAudioDevice *dev,
                                   struct LsAudioChainTarget target,
@@ -1056,6 +1459,9 @@ enum LsStatus la_effect_set_param(struct LsAudioDevice *dev,
 #if defined(LOADSTAR_AUDIO)
 /**
  * Enable or disable one node, crossfaded.
+ *
+ * # Safety
+ * `dev` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
  */
 enum LsStatus la_effect_set_enabled(struct LsAudioDevice *dev,
                                     struct LsAudioChainTarget target,
@@ -1066,13 +1472,21 @@ enum LsStatus la_effect_set_enabled(struct LsAudioDevice *dev,
 #if defined(LOADSTAR_SPEECH)
 /**
  * Open a speech context. Cheap: backends probe on the worker; nothing speaks.
+ *
+ * # Safety
+ * - `cfg` must be null or valid for reading one `SpeechConfig`. If its `prism_path` is non-null, that must point to a NUL-terminated string.
+ * - `out_ctx` must be null or valid for writing one pointer.
  */
-enum LsStatus lv_create(const struct LsSpeechConfig *cfg, struct LsSpeech_ **out_ctx);
+enum LsStatus lv_create(const struct LsSpeechConfig *cfg,
+                        struct LsSpeech_ **out_ctx);
 #endif
 
 #if defined(LOADSTAR_SPEECH)
 /**
  * Close a context: stops every queue, joins the worker. Null is a no-op.
+ *
+ * # Safety
+ * `ctx` must be null or a speech context handle from `lv_create` that has not been released, and no other call may be using it. It is dangling after this call.
  */
 void lv_destroy(struct LsSpeech_ *ctx);
 #endif
@@ -1081,6 +1495,11 @@ void lv_destroy(struct LsSpeech_ *ctx);
 /**
  * The Prism tag this build was validated against, and where the library was loaded from
  * (`"v0.18.3 @ C:\...\prism.dll"`); empty when Prism is not loaded.
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `buf` must be null or valid for writing `cap` bytes.
+ * - `written` must be null or valid for writing one `usize`.
  */
 enum LsStatus lv_prism_version(struct LsSpeech_ *ctx, char *buf, uintptr_t cap, uintptr_t *written);
 #endif
@@ -1089,6 +1508,10 @@ enum LsStatus lv_prism_version(struct LsSpeech_ *ctx, char *buf, uintptr_t cap, 
 /**
  * Ask for a re-probe; `changed` reports whether the tree's shape changed since the last call
  * (the re-probe lands asynchronously — call again next frame to see its result).
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `changed` must be null or valid for writing one `bool`.
  */
 enum LsStatus lv_tree_refresh(struct LsSpeech_ *ctx, bool *changed);
 #endif
@@ -1096,21 +1519,40 @@ enum LsStatus lv_tree_refresh(struct LsSpeech_ *ctx, bool *changed);
 #if defined(LOADSTAR_SPEECH)
 /**
  * Snapshot generation; 0 until the first probe has published.
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `generation` must be null or valid for writing one `u64`.
  */
 enum LsStatus lv_tree_generation(struct LsSpeech_ *ctx, uint64_t *generation);
 #endif
 
 #if defined(LOADSTAR_SPEECH)
+/**
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `count` must be null or valid for writing one `usize`.
+ */
 enum LsStatus lv_category_count(struct LsSpeech_ *ctx, uintptr_t *count);
 #endif
 
 #if defined(LOADSTAR_SPEECH)
+/**
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `id` must be null or valid for writing one `u64`.
+ */
 enum LsStatus lv_category_at(struct LsSpeech_ *ctx, uintptr_t index, uint64_t *id);
 #endif
 
 #if defined(LOADSTAR_SPEECH)
 /**
  * The category's fixed key (`screen_readers`, `sapi5`, …) — what a mod localizes.
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `buf` must be null or valid for writing `cap` bytes.
+ * - `written` must be null or valid for writing one `usize`.
  */
 enum LsStatus lv_category_key(struct LsSpeech_ *ctx,
                               uint64_t id,
@@ -1122,6 +1564,11 @@ enum LsStatus lv_category_key(struct LsSpeech_ *ctx,
 #if defined(LOADSTAR_SPEECH)
 /**
  * The category's default (English) display name — the fallback for unknown keys.
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `buf` must be null or valid for writing `cap` bytes.
+ * - `written` must be null or valid for writing one `usize`.
  */
 enum LsStatus lv_category_name(struct LsSpeech_ *ctx,
                                uint64_t id,
@@ -1131,25 +1578,50 @@ enum LsStatus lv_category_name(struct LsSpeech_ *ctx,
 #endif
 
 #if defined(LOADSTAR_SPEECH)
+/**
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `rank` must be null or valid for writing one `i32`.
+ */
 enum LsStatus lv_category_rank(struct LsSpeech_ *ctx, uint64_t id, int32_t *rank);
 #endif
 
 #if defined(LOADSTAR_SPEECH)
 /**
  * The voice id that means "this category's best".
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `voice` must be null or valid for writing one `u64`.
  */
 enum LsStatus lv_category_auto(struct LsSpeech_ *ctx, uint64_t id, uint64_t *voice);
 #endif
 
 #if defined(LOADSTAR_SPEECH)
+/**
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `count` must be null or valid for writing one `usize`.
+ */
 enum LsStatus lv_voice_count(struct LsSpeech_ *ctx, uint64_t category, uintptr_t *count);
 #endif
 
 #if defined(LOADSTAR_SPEECH)
+/**
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `id` must be null or valid for writing one `u64`.
+ */
 enum LsStatus lv_voice_at(struct LsSpeech_ *ctx, uint64_t category, uintptr_t index, uint64_t *id);
 #endif
 
 #if defined(LOADSTAR_SPEECH)
+/**
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `buf` must be null or valid for writing `cap` bytes.
+ * - `written` must be null or valid for writing one `usize`.
+ */
 enum LsStatus lv_voice_name(struct LsSpeech_ *ctx,
                             uint64_t id,
                             char *buf,
@@ -1160,6 +1632,11 @@ enum LsStatus lv_voice_name(struct LsSpeech_ *ctx,
 #if defined(LOADSTAR_SPEECH)
 /**
  * BCP-47 where the backend knows it; empty otherwise.
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `buf` must be null or valid for writing `cap` bytes.
+ * - `written` must be null or valid for writing one `usize`.
  */
 enum LsStatus lv_voice_language(struct LsSpeech_ *ctx,
                                 uint64_t id,
@@ -1169,12 +1646,21 @@ enum LsStatus lv_voice_language(struct LsSpeech_ *ctx,
 #endif
 
 #if defined(LOADSTAR_SPEECH)
+/**
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `category` must be null or valid for writing one `u64`.
+ */
 enum LsStatus lv_voice_category(struct LsSpeech_ *ctx, uint64_t id, uint64_t *category);
 #endif
 
 #if defined(LOADSTAR_SPEECH)
 /**
  * Bitwise OR of `SpeechFeature`.
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `bits` must be null or valid for writing one `u64`.
  */
 enum LsStatus lv_voice_features(struct LsSpeech_ *ctx, uint64_t id, uint64_t *bits);
 #endif
@@ -1182,6 +1668,10 @@ enum LsStatus lv_voice_features(struct LsSpeech_ *ctx, uint64_t id, uint64_t *bi
 #if defined(LOADSTAR_SPEECH)
 /**
  * Whether the leaf can speak right now (reader running, voice installed).
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `available` must be null or valid for writing one `bool`.
  */
 enum LsStatus lv_voice_available(struct LsSpeech_ *ctx, uint64_t id, bool *available);
 #endif
@@ -1190,6 +1680,13 @@ enum LsStatus lv_voice_available(struct LsSpeech_ *ctx, uint64_t id, bool *avail
 /**
  * What `profile` would use right now for a call needing `required` features. `voice` is the
  * leaf that would speak (0 = nothing, with `VoiceUnavailable`), `missing` the required bits it lacks.
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `profile_` must be null or valid for reading one `SpeechProfile`.
+ * - `voice` must be null or valid for writing one `u64`.
+ * - `fell_back` must be null or valid for writing one `bool`.
+ * - `missing` must be null or valid for writing one `u64`.
  */
 enum LsStatus lv_resolve(struct LsSpeech_ *ctx,
                          const struct LsSpeechProfile *profile_,
@@ -1202,6 +1699,11 @@ enum LsStatus lv_resolve(struct LsSpeech_ *ctx,
 #if defined(LOADSTAR_SPEECH)
 /**
  * Create a queue (`options` may be null for sequential, no gap). Queue 0 always exists.
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `options` must be null or valid for reading one `SpeechQueueOptions`.
+ * - `queue` must be null or valid for writing one `u32`.
  */
 enum LsStatus lv_queue_create(struct LsSpeech_ *ctx,
                               const struct LsSpeechQueueOptions *options,
@@ -1209,18 +1711,33 @@ enum LsStatus lv_queue_create(struct LsSpeech_ *ctx,
 #endif
 
 #if defined(LOADSTAR_SPEECH)
+/**
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `options` must be null or valid for reading one `SpeechQueueOptions`.
+ */
 enum LsStatus lv_queue_set(struct LsSpeech_ *ctx,
                            uint32_t queue,
                            const struct LsSpeechQueueOptions *options);
 #endif
 
 #if defined(LOADSTAR_SPEECH)
+/**
+ * # Safety
+ * `ctx` must be null or a live speech context handle from `lv_create`.
+ */
 enum LsStatus lv_queue_destroy(struct LsSpeech_ *ctx, uint32_t queue);
 #endif
 
 #if defined(LOADSTAR_SPEECH)
 /**
  * Speak `text` (NUL-terminated UTF-8) on `queue` through `profile`. Returns the utterance id.
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `profile_` must be null or valid for reading one `SpeechProfile`.
+ * - `text` must be null or point to a NUL-terminated string.
+ * - `utterance` must be null or valid for writing one `u64`.
  */
 enum LsStatus lv_speak(struct LsSpeech_ *ctx,
                        uint32_t queue,
@@ -1233,6 +1750,12 @@ enum LsStatus lv_speak(struct LsSpeech_ *ctx,
 #if defined(LOADSTAR_SPEECH)
 /**
  * Speech plus braille where the leaf supports both (`lv_speak` with `BrailleToo`).
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `profile_` must be null or valid for reading one `SpeechProfile`.
+ * - `text` must be null or point to a NUL-terminated string.
+ * - `utterance` must be null or valid for writing one `u64`.
  */
 enum LsStatus lv_output(struct LsSpeech_ *ctx,
                         uint32_t queue,
@@ -1245,6 +1768,12 @@ enum LsStatus lv_output(struct LsSpeech_ *ctx,
 #if defined(LOADSTAR_SPEECH)
 /**
  * Braille only.
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `profile_` must be null or valid for reading one `SpeechProfile`.
+ * - `text` must be null or point to a NUL-terminated string.
+ * - `utterance` must be null or valid for writing one `u64`.
  */
 enum LsStatus lv_braille(struct LsSpeech_ *ctx,
                          uint32_t queue,
@@ -1256,6 +1785,10 @@ enum LsStatus lv_braille(struct LsSpeech_ *ctx,
 #if defined(LOADSTAR_SPEECH)
 /**
  * Silence as a queue item.
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `utterance` must be null or valid for writing one `u64`.
  */
 enum LsStatus lv_gap(struct LsSpeech_ *ctx, uint32_t queue, uint32_t ms, uint64_t *utterance);
 #endif
@@ -1263,6 +1796,9 @@ enum LsStatus lv_gap(struct LsSpeech_ *ctx, uint32_t queue, uint32_t ms, uint64_
 #if defined(LOADSTAR_SPEECH)
 /**
  * Cut what this queue is speaking; keep what is pending.
+ *
+ * # Safety
+ * `ctx` must be null or a live speech context handle from `lv_create`.
  */
 enum LsStatus lv_stop(struct LsSpeech_ *ctx, uint32_t queue);
 #endif
@@ -1270,21 +1806,35 @@ enum LsStatus lv_stop(struct LsSpeech_ *ctx, uint32_t queue);
 #if defined(LOADSTAR_SPEECH)
 /**
  * Drop everything pending on this queue; keep what is speaking.
+ *
+ * # Safety
+ * `ctx` must be null or a live speech context handle from `lv_create`.
  */
 enum LsStatus lv_flush(struct LsSpeech_ *ctx, uint32_t queue);
 #endif
 
 #if defined(LOADSTAR_SPEECH)
+/**
+ * # Safety
+ * `ctx` must be null or a live speech context handle from `lv_create`.
+ */
 enum LsStatus lv_pause(struct LsSpeech_ *ctx, uint32_t queue);
 #endif
 
 #if defined(LOADSTAR_SPEECH)
+/**
+ * # Safety
+ * `ctx` must be null or a live speech context handle from `lv_create`.
+ */
 enum LsStatus lv_resume(struct LsSpeech_ *ctx, uint32_t queue);
 #endif
 
 #if defined(LOADSTAR_SPEECH)
 /**
  * One utterance: cut if speaking, drop if pending.
+ *
+ * # Safety
+ * `ctx` must be null or a live speech context handle from `lv_create`.
  */
 enum LsStatus lv_cancel(struct LsSpeech_ *ctx, uint64_t utterance);
 #endif
@@ -1292,6 +1842,9 @@ enum LsStatus lv_cancel(struct LsSpeech_ *ctx, uint64_t utterance);
 #if defined(LOADSTAR_SPEECH)
 /**
  * Every queue, every backend.
+ *
+ * # Safety
+ * `ctx` must be null or a live speech context handle from `lv_create`.
  */
 enum LsStatus lv_stop_all(struct LsSpeech_ *ctx);
 #endif
@@ -1299,6 +1852,10 @@ enum LsStatus lv_stop_all(struct LsSpeech_ *ctx);
 #if defined(LOADSTAR_SPEECH)
 /**
  * `UtteranceState`, possibly with `Flat` OR-ed in.
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `state` must be null or valid for writing one `u32`.
  */
 enum LsStatus lv_utterance_state(struct LsSpeech_ *ctx, uint64_t utterance, uint32_t *state);
 #endif
@@ -1306,6 +1863,10 @@ enum LsStatus lv_utterance_state(struct LsSpeech_ *ctx, uint64_t utterance, uint
 #if defined(LOADSTAR_SPEECH)
 /**
  * The leaf that spoke (or will speak) the utterance after any fallback; 0 if not yet known.
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `voice` must be null or valid for writing one `u64`.
  */
 enum LsStatus lv_utterance_voice(struct LsSpeech_ *ctx, uint64_t utterance, uint64_t *voice);
 #endif
@@ -1313,6 +1874,12 @@ enum LsStatus lv_utterance_voice(struct LsSpeech_ *ctx, uint64_t utterance, uint
 #if defined(LOADSTAR_SPEECH)
 /**
  * Start a render job (worker thread, polled). `NotSupported` synchronously if the voice cannot render.
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `profile_` must be null or valid for reading one `SpeechProfile`.
+ * - `text` must be null or point to a NUL-terminated string.
+ * - `job` must be null or valid for writing one `u64`.
  */
 enum LsStatus lv_render(struct LsSpeech_ *ctx,
                         const struct LsSpeechProfile *profile_,
@@ -1322,6 +1889,11 @@ enum LsStatus lv_render(struct LsSpeech_ *ctx,
 #endif
 
 #if defined(LOADSTAR_SPEECH)
+/**
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `state` must be null or valid for writing one `u32`.
+ */
 enum LsStatus lv_render_poll(struct LsSpeech_ *ctx, uint64_t job, uint32_t *state);
 #endif
 
@@ -1329,6 +1901,13 @@ enum LsStatus lv_render_poll(struct LsSpeech_ *ctx, uint64_t job, uint32_t *stat
 /**
  * The finished PCM (interleaved f32), library-owned and valid until `lv_render_free`.
  * `InvalidArgument` while the job is not done.
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `samples` must be null or valid for writing one pointer.
+ * - `frames` must be null or valid for writing one `usize`.
+ * - `channels` must be null or valid for writing one `u32`.
+ * - `rate` must be null or valid for writing one `u32`.
  */
 enum LsStatus lv_render_take(struct LsSpeech_ *ctx,
                              uint64_t job,
@@ -1339,6 +1918,10 @@ enum LsStatus lv_render_take(struct LsSpeech_ *ctx,
 #endif
 
 #if defined(LOADSTAR_SPEECH)
+/**
+ * # Safety
+ * `ctx` must be null or a live speech context handle from `lv_create`.
+ */
 enum LsStatus lv_render_free(struct LsSpeech_ *ctx, uint64_t job);
 #endif
 
@@ -1349,6 +1932,14 @@ enum LsStatus lv_render_free(struct LsSpeech_ *ctx, uint64_t job);
  * the PLAYING/AUTO_REMOVE flags are the library's), honouring the queue like any utterance.
  * `source` is the mod's handle for `la_source_stop` / `la_source_upsert` from the moment this
  * returns.
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `profile_` must be null or valid for reading one `SpeechProfile`.
+ * - `text` must be null or point to a NUL-terminated string.
+ * - `device` must be null or a live audio device handle from `la_device_open` or `la_device_open_null`, not in use by any other call (on any thread) during this one.
+ * - `desc` must be null or valid for reading one `crate::audio::AudioSourceDesc`.
+ * - `utterance` must be null or valid for writing one `u64`.
+ * - `source` must be null or valid for writing one `u64`.
  */
 enum LsStatus lv_speak_at(struct LsSpeech_ *ctx,
                           uint32_t queue,

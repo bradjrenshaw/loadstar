@@ -30,7 +30,8 @@ public enum Status
     Busy = 6,
     /// <summary>Speech: the chosen voice is absent and NoFallback was set, or nothing at all can speak.</summary>
     VoiceUnavailable = 7,
-    /// <summary>Speech: a feature the call needs is not in the resolved voice's set.</summary>
+    /// <summary>A capability the call needs is missing: a feature not in the resolved voice's set (speech),
+    /// or a map call on a context created without a map (<see cref="Context.Create"/>).</summary>
     NotSupported = 8,
     Panic = 100,
 }
@@ -206,15 +207,16 @@ public struct EntityDesc
 {
     public ulong Id;
     public ushort Category;
-    private ushort _reserved;
+    /// <summary>Entities sharing a nonzero group are browsed as one group (<see cref="TrackerAction.GroupNext"/>); 0 = ungrouped.</summary>
+    public ushort Group;
     public uint Blocking;
     public EntityFlags Flags;
     public uint SortKey;
     public Bounds Bounds;
 
-    public EntityDesc(ulong id, ushort category, Bounds bounds, uint blocking = 0, EntityFlags flags = EntityFlags.None, uint sortKey = 0)
+    public EntityDesc(ulong id, ushort category, Bounds bounds, uint blocking = 0, EntityFlags flags = EntityFlags.None, uint sortKey = 0, ushort group = 0)
     {
-        Id = id; Category = category; _reserved = 0; Blocking = blocking; Flags = flags; SortKey = sortKey; Bounds = bounds;
+        Id = id; Category = category; Group = group; Blocking = blocking; Flags = flags; SortKey = sortKey; Bounds = bounds;
     }
 }
 
@@ -290,6 +292,21 @@ public enum TrackerAction : uint
     CategoryPrev = 3,
     /// <summary>Re-report the current selection without moving.</summary>
     Current = 4,
+    /// <summary>First entity of the next group (groups ordered by their first member: nearest, in distance order). <see cref="Selection.Index"/> is the position within the group.</summary>
+    GroupNext = 5,
+    GroupPrev = 6,
+    /// <summary>Next entity within the selected entity's group, wrapping.</summary>
+    InGroupNext = 7,
+    InGroupPrev = 8,
+}
+
+/// <summary>Mirrors <c>LsTrackerOrder</c>: a tracker's cycle order.</summary>
+public enum TrackerOrder : uint
+{
+    /// <summary>(category, sort key, id): a fixed, mod-defined order. The default.</summary>
+    SortKey = 0,
+    /// <summary>Nearest to the player first, re-evaluated on every action; ties fall back to <see cref="SortKey"/>.</summary>
+    Distance = 1,
 }
 
 /// <summary>Mirrors <c>LsSelection</c>. <see cref="EntityId"/> 0 means nothing is selected.</summary>
@@ -356,6 +373,8 @@ internal static class Native
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_vec3_add(Vec3 a, Vec3 b, out Vec3 result);
 
     // Contexts
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_context_create(out ContextHandle context);
+
     [DllImport(Lib, CallingConvention = Cc)]
     public static extern Status ls_tile_context_create(
         uint width, uint height, uint layers,
@@ -414,7 +433,10 @@ internal static class Native
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_tracker_destroy(ContextHandle context, uint tracker);
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_tracker_set_filters(ContextHandle context, uint tracker, FilterDesc[]? filters, UIntPtr filtersLen);
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_tracker_set_filter_enabled(ContextHandle context, uint tracker, UIntPtr index, [MarshalAs(UnmanagedType.U1)] bool enabled);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_tracker_set_order(ContextHandle context, uint tracker, TrackerOrder order);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_tracker_set_category(ContextHandle context, uint tracker, uint category);
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_tracker_act(ContextHandle context, uint tracker, TrackerAction action, out Selection selection);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_tracker_group_count(ContextHandle context, uint tracker, out uint count);
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status ls_tracker_count(ContextHandle context, uint tracker, uint category, out uint count);
 
     // Paths and reachability

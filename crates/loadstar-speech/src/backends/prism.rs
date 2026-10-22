@@ -342,24 +342,23 @@ impl PrismBackend {
     fn apply(api: &Api, inst: &mut Instance, params: &Params) {
         // SAFETY: optional setters on a live backend; failures are ignored (the text still speaks).
         unsafe {
-            if let (Some(f), true) = (api.set_rate, inst.features & pf::SUPPORTS_SET_RATE != 0) {
-                if inst.rate != Some(params.rate) {
-                    let _ = f(inst.be, params.rate.clamp(0.0, 1.0));
-                    inst.rate = Some(params.rate);
-                }
+            if let (Some(f), true) = (api.set_rate, inst.features & pf::SUPPORTS_SET_RATE != 0)
+                && inst.rate != Some(params.rate)
+            {
+                let _ = f(inst.be, params.rate.clamp(0.0, 1.0));
+                inst.rate = Some(params.rate);
             }
             if let (Some(f), true) = (api.set_volume, inst.features & pf::SUPPORTS_SET_VOLUME != 0)
+                && inst.volume != Some(params.volume)
             {
-                if inst.volume != Some(params.volume) {
-                    let _ = f(inst.be, params.volume.clamp(0.0, 1.0));
-                    inst.volume = Some(params.volume);
-                }
+                let _ = f(inst.be, params.volume.clamp(0.0, 1.0));
+                inst.volume = Some(params.volume);
             }
-            if let (Some(f), true) = (api.set_pitch, inst.features & pf::SUPPORTS_SET_PITCH != 0) {
-                if inst.pitch != Some(params.pitch) {
-                    let _ = f(inst.be, params.pitch.clamp(0.0, 1.0));
-                    inst.pitch = Some(params.pitch);
-                }
+            if let (Some(f), true) = (api.set_pitch, inst.features & pf::SUPPORTS_SET_PITCH != 0)
+                && inst.pitch != Some(params.pitch)
+            {
+                let _ = f(inst.be, params.pitch.clamp(0.0, 1.0));
+                inst.pitch = Some(params.pitch);
             }
         }
     }

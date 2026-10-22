@@ -203,6 +203,50 @@ using (var ctx = TileContext.FromWalkable(W, H, 1, cells))
     catch (LoadstarException e) { Expect(e.Status == Status.InvalidArgument, $"destroyed tracker → {e.Status}"); }
 }
 
+// --- A context without a map: a scanner over world coordinates, nearest first. ---
+{
+    const ushort CatChest = 3, CatNpc = 1;
+    using var ctx = Context.Create();
+    ctx.SyncEntities(new[]
+    {
+        new EntityDesc(1, CatChest, Bounds.Point(new Vec3(-20, 0, -10))),
+        new EntityDesc(2, CatNpc, Bounds.Box(new Vec3(-12, 0, -10), new Vec3(0.5f, 0, 0.5f)), blocking: 1),
+        new EntityDesc(3, CatChest, Bounds.Point(new Vec3(-10, 0, -4))),
+    });
+    ctx.SetPlayer(new Vec3(-10, 0, -10));
+    Expect(ctx.EntityNodes(2).Length == 0, "no map: entities project to nothing");
+
+    var scan = ctx.CreateTracker();
+    ctx.SetTrackerOrder(scan, TrackerOrder.Distance);
+    var order = new[] { 0, 1, 2 }.Select(_ => ctx.TrackerAct(scan, TrackerAction.Next).EntityId).ToArray();
+    Expect(order.SequenceEqual(new ulong[] { 2, 3, 1 }), "distance order: " + string.Join(", ", order));
+    ctx.SetPlayer(new Vec3(-20, 0, -10));
+    ctx.SetTrackerCategory(scan, Selection.AllCategories);
+    Expect(ctx.TrackerAct(scan, TrackerAction.Next).EntityId == 1, "re-sorted after the player moves");
+    ctx.SetTrackerCategory(scan, CatChest);
+    var chests = new[] { 0, 1 }.Select(_ => ctx.TrackerAct(scan, TrackerAction.Next).EntityId).ToArray();
+    Expect(chests.SequenceEqual(new ulong[] { 1, 3 }), "category jump keeps distance order: " + string.Join(", ", chests));
+
+    var v = ctx.EntityVector(1);
+    Expect(v.Distance == 0, $"standing on chest 1: {v.Distance}");
+
+    // Group browsing: the two chests are one group, the NPC its own.
+    ctx.SyncEntities(new[]
+    {
+        new EntityDesc(1, CatChest, Bounds.Point(new Vec3(-20, 0, -10)), group: 4),
+        new EntityDesc(2, CatNpc, Bounds.Box(new Vec3(-12, 0, -10), new Vec3(0.5f, 0, 0.5f)), blocking: 1),
+        new EntityDesc(3, CatChest, Bounds.Point(new Vec3(-10, 0, -4)), group: 4),
+    });
+    ctx.SetTrackerCategory(scan, Selection.AllCategories);
+    var g = ctx.TrackerAct(scan, TrackerAction.GroupNext);
+    Expect(g.EntityId == 1 && ctx.TrackerGroupCount(scan) == 2, $"nearest group first, on its nearest member: {g}");
+    g = ctx.TrackerAct(scan, TrackerAction.InGroupNext);
+    Expect(g.EntityId == 3 && g.Index == 1, $"within the group: {g}");
+    Expect(ctx.TrackerAct(scan, TrackerAction.GroupNext).EntityId == 2 && ctx.TrackerGroupCount(scan) == 1, "ungrouped NPC is a group of one");
+    try { ctx.TrackerCount(ctx.CreateTracker(new[] { FilterDesc.Reachable(0, 0) })); }
+    catch (LoadstarException) { Expect(false, "reachability filter must not throw on a context without a map"); }
+}
+
 // --- Segments and the companion's default phrasing. ---
 {
     var line = Enumerable.Repeat((byte)1, 10).ToArray();

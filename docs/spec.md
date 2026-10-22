@@ -71,6 +71,7 @@ A **context** bundles exactly the state that must stay mutually consistent:
 > one map + one entity registry + agent profiles + all derived caches (clearance fields, group projections, reachability, tracker selection).
 
 - Created typed: `ls_tile_context_create(...)` / `ls_mesh_context_create(...)`. The constructor fixes the map family; tile-only functions exist only on tile contexts.
+- **The map is optional.** `ls_context_create(&ctx)` makes a context with no map: the entity registry, the player, `ls_entity_vector`, ranges, categories, flags and trackers all work, because they are pure geometry (layers 1, 4 and 5). It is for spaces the core doesn't model — continuous worlds, worlds too large or too dynamic to mirror — where the mod still wants scanning. Map calls (nodes, edges, links, groups, paths, reachability, segments) return `NOT_SUPPORTED`; entities project to no nodes, never block, and never pass a `REACHABLE` filter. World coordinates may be negative.
 - Multiple contexts coexist. Example (SMT3 Nocturne): one tile context for the 2D overworld, one 3D context per dungeon, all alive at once. Example (CSTW): one context rebuilt per map transition, or one cached context per map ID (~104 maps fit trivially in memory; revisiting preserves tracker state and skips rebuild).
 - **A context is a handle, not a lifecycle.** No active/inactive flag, no modes, no ticking. "Which context is current" = which handle the mod passes. Switching maps = calling into a different handle.
 - Destruction frees everything; no unsubscribe choreography.
@@ -91,6 +92,7 @@ LsEntity {
     blocking:      u32     // bitmask of blocking groups (0 = doesn't block)
     flags:         u32     // PATHFIND_ADJACENT | HIDDEN | ...
     sort_key:      u32     // explicit browse order within category
+    group:         u16     // browse group (§8 group browsing); 0 = ungrouped
 }
 ```
 
@@ -246,8 +248,13 @@ Filter = REACHABLE  { profile, blocked_mask }   // uses the context's shared flo
        | CATEGORIES { mask }                    // subset scanner ("quest items only")
        | FLAGS      { require, forbid }         // mod-defined entity flag bits
 
+ls_tracker_set_order(tracker, SORT_KEY | DISTANCE)  // cycle order, below
+ls_tracker_set_category(tracker, category | ALL)    // jump to a view without cycling; clears the selection
+
 ls_tracker_act(tracker, action: enum) → { entity_id: u64, category: u16, index: u32 }
-// actions: NEXT, PREV, CATEGORY_NEXT, CATEGORY_PREV, CURRENT
+// actions: NEXT, PREV, CATEGORY_NEXT, CATEGORY_PREV, CURRENT,
+//          GROUP_NEXT, GROUP_PREV, IN_GROUP_NEXT, IN_GROUP_PREV (below)
+ls_tracker_group_count(tracker) → u32      // size of the selection's group in the current view
 // entity_id 0 = empty list. The tracker computes no spatial data and
 // presumes no announcement policy.
 ```
@@ -274,7 +281,10 @@ ls_tracker_count(tracker, category | ALL) → u32
 
 Composability is safe because the library never mutates between the mod's calls: a follow-up query is guaranteed consistent with the selection it follows. The full wayfinder-style announcement is three or four calls; "Shopkeeper" alone is one.
 
-- Categories cycled = distinct category values present among that tracker's visible entities, ascending; a virtual ALL category optional via tracker config. Entities ordered by (sort_key, id).
+- Categories cycled = distinct category values present among that tracker's visible entities, ascending; a virtual ALL category optional via tracker config.
+- Entities are ordered per the tracker's **order**: `SORT_KEY` (default) = (category, sort_key, id); `DISTANCE` = nearest point to the player first, re-evaluated on every action, ties falling back to `SORT_KEY` order. `DISTANCE` is the scanner order: the alternative, the mod rewriting `sort_key` as the player moves, dirties every entity on every sync.
+- **Group browsing** (the Civ VI scanner: "Mushroom, 1 of 5" rather than five separate list entries). An entity's `group` (u16, 0 = ungrouped) is mod-assigned: entities sharing a nonzero value are one group, an ungrouped entity a group of its own. Groups are ordered by their first member in cycle order, so with `DISTANCE` the group with the nearest member comes first. `GROUP_NEXT/PREV` land on a group's first member; `IN_GROUP_NEXT/PREV` cycle within the selection's group, wrapping. `index` is then the position within the group, and `ls_tracker_group_count` gives "of N".
+- **Two-level browsing** (category → subcategory, the wotr scanner) needs no tree in the core: give each leaf its own category value, select a parent with a `CATEGORIES` mask of its leaves plus `ls_tracker_set_category(ALL)`, and cycle the leaves with `CATEGORY_NEXT/PREV`.
 - The mod looks up its own label table by `entity_id`, formats, and speaks. The core never says a word.
 
 ---
@@ -285,6 +295,7 @@ Composability is safe because the library never mutates between the mod's calls:
 - **Flat data only**: ints, floats, packed structs, caller-visible arrays. No callbacks. No strings anywhere in the core or audio ABI; the speech surface (`lv_*`) is the explicit exception and carries them as NUL-terminated UTF-8 (`speech-spec.md` §7).
 - **Buffers**: two-call pattern (call with null buffer → required count) or caller-provided buffer + capacity → written count. Library-owned results (paths) are handle-addressed and freed via `ls_path_free` / freed wholesale with the context.
 - **Errors**: every function returns a status code; results via out-params. No panics across the boundary (catch_unwind at the ABI edge).
+- **Unsafety is declared, not hidden**: every export taking a pointer is `pub unsafe extern "C" fn` with a `# Safety` section (pointers null or valid for the stated reads/writes; handles live and, for contexts and audio devices, not in concurrent use). That contract binds Rust callers of the crate directly and reaches C callers as header comments. Null is always tolerated and reported as `NULL_POINTER` (or ignored where documented), never dereferenced.
 - **Versioning**: `ls_abi_version()` checked by companions at load.
 - **Bindings**: `cbindgen` → C header (Unreal/C++, LuaJIT FFI); `csbindgen` or `interoptopus` → C# P/Invoke. IL2CPP note: no callbacks in the ABI means no `[MonoPInvokeCallback]` hazards at all.
 - **Builds**: `x86_64-pc-windows-msvc` and `i686-pc-windows-msvc` from day one (CSTW is a 32-bit .NET Framework 4.7.2 process); Linux targets when a consumer needs them.

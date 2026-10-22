@@ -2,6 +2,12 @@
 //!
 //! Rules of this crate (see `docs/spec.md` §9):
 //! - Every exported function is `extern "C"`, takes flat data, and returns a [`Status`].
+//! - Every export that takes a pointer is `pub unsafe extern "C" fn` with a `# Safety` section
+//!   stating what its pointers must be (Rust callers are bound by it; C callers see it in the
+//!   header). Inside, raw pointers become references once, at the top, under that contract;
+//!   helpers that take closures only ever see references, and helpers that still take raw
+//!   pointers are `unsafe fn` with their own `# Safety`. Run `cargo clippy --workspace
+//!   --all-targets` before committing: it must stay clean.
 //! - No callbacks. No strings. No panics escape — every entry point runs inside [`guard`].
 //! - Handles are opaque pointers owned by the library; each has a matching `*_destroy`/`*_free`.
 //! - `bool` parameters are C `_Bool` (one byte); bindings must marshal them as such.
@@ -16,14 +22,16 @@ pub mod audio;
 pub mod speech;
 
 use loadstar_core::context::{
-    GoalMode as CoreGoalMode, PathOptions as CorePathOptions, Profile, TileContext,
+    Context as CoreContext, GoalMode as CoreGoalMode, PathOptions as CorePathOptions, Profile,
 };
 use loadstar_core::entities::{Entity, SyncStats as CoreSyncStats};
 use loadstar_core::geometry::Bounds;
 pub use loadstar_core::geometry::Vec3;
 use loadstar_core::graph::LinkId;
 use loadstar_core::tile::{Dir, EdgeOverride, GridError, Link, Segment, TileGrid};
-use loadstar_core::tracker::{Action as CoreAction, Filter, FilterEntry, Tracker};
+use loadstar_core::tracker::{
+    Action as CoreAction, Filter, FilterEntry, Order as CoreOrder, Tracker,
+};
 
 /// Bumped only on breaking ABI changes. Companions check this via [`ls_abi_version`] at load.
 const ABI_VERSION: u32 = 1;
@@ -45,14 +53,16 @@ pub enum Status {
     Busy = 6,
     /// Speech: the chosen voice is absent and `NoFallback` was set, or nothing at all can speak.
     VoiceUnavailable = 7,
-    /// Speech: a feature the call needs is not in the resolved voice's set.
+    /// A capability the call needs is missing: a feature not in the resolved voice's set
+    /// (speech), or a map call on a context created without a map (`ls_context_create`).
     NotSupported = 8,
     /// Internal panic caught at the boundary. The context may be inconsistent; the host is intact.
     Panic = 100,
 }
 
-/// Opaque: a map plus everything consistent with it (spec §4). Exported to C as `LsContext`.
-pub struct Context(TileContext);
+/// Opaque: a map (optional) plus everything consistent with it (spec §4). Exported to C as
+/// `LsContext`.
+pub struct Context(CoreContext);
 
 /// Opaque: a path result (spec §8). Exported to C as `LsPath`.
 pub struct Path(loadstar_core::graph::Path);
@@ -267,7 +277,9 @@ pub struct EntityDesc {
     pub id: u64,
     /// Mod-defined; the core only groups by equality.
     pub category: u16,
-    pub _reserved: u16,
+    /// Mod-defined group for group browsing: entities sharing a nonzero value form one group.
+    /// 0 = ungrouped. (Formerly reserved, so old callers that zeroed it are unaffected.)
+    pub group: u16,
     /// Blocking-group bitmask projected onto the entity's nodes. 0 = doesn't block.
     pub blocking: u32,
     /// Bitwise OR of `EntityFlags` and mod-defined bits.
@@ -286,6 +298,7 @@ impl EntityDesc {
             blocking: self.blocking,
             flags: self.flags,
             sort_key: self.sort_key,
+            group: self.group,
         })
     }
 }
@@ -378,6 +391,22 @@ pub enum TrackerAction {
     CategoryPrev = 3,
     /// Re-report the current selection without moving.
     Current = 4,
+    /// First entity of the next / previous group; `index` is the position within the group.
+    GroupNext = 5,
+    GroupPrev = 6,
+    /// Next / previous entity within the selected entity's group, wrapping.
+    InGroupNext = 7,
+    InGroupPrev = 8,
+}
+
+/// Cycle order of a tracker (spec §8), set with [`ls_tracker_set_order`].
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackerOrder {
+    /// `(category, sort_key, id)`; the default.
+    SortKey = 0,
+    /// Nearest to the player first, re-evaluated on every action; ties fall back to `SortKey`.
+    Distance = 1,
 }
 
 /// Result of [`ls_tracker_act`]. `entity_id == 0` means nothing is selected; `category` is
@@ -391,7 +420,11 @@ pub struct Selection {
     pub index: u32,
 }
 
-fn parse_filters(filters: *const FilterDesc, len: usize) -> Option<Vec<FilterEntry>> {
+/// Filter records into core filters; `None` on a bad kind or a null `filters` with `len > 0`.
+///
+/// # Safety
+/// `filters` must be null or valid for reading `len` records.
+unsafe fn parse_filters(filters: *const FilterDesc, len: usize) -> Option<Vec<FilterEntry>> {
     if len == 0 {
         return Some(Vec::new());
     }
@@ -435,8 +468,11 @@ pub extern "C" fn ls_abi_version() -> u32 {
 }
 
 /// Smoke test for bindings: writes `a + b` into `out`. Exercises by-value struct passing and out-params.
+///
+/// # Safety
+/// `out` must be null or valid for writing one `Vec3`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_vec3_add(a: Vec3, b: Vec3, out: *mut Vec3) -> Status {
+pub unsafe extern "C" fn ls_vec3_add(a: Vec3, b: Vec3, out: *mut Vec3) -> Status {
     guard(|| {
         if out.is_null() {
             return Status::NullPointer;
@@ -456,8 +492,12 @@ pub extern "C" fn ls_vec3_add(a: Vec3, b: Vec3, out: *mut Vec3) -> Status {
 /// `walkable` holds `width * height * layers` bytes, layer-major then row-major
 /// (`index = layer * width * height + row * width + col`); nonzero = walkable.
 /// On success `*out` receives a handle that must be released with [`ls_context_destroy`].
+///
+/// # Safety
+/// - `walkable` must be null or valid for reading `walkable_len` elements.
+/// - `out` must be null or valid for writing one pointer.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_tile_context_create(
+pub unsafe extern "C" fn ls_tile_context_create(
     width: u32,
     height: u32,
     layers: u32,
@@ -472,7 +512,8 @@ pub extern "C" fn ls_tile_context_create(
         // SAFETY: non-null checked; caller guarantees `walkable` is readable for `walkable_len`
         // bytes for the duration of this call (the grid copies what it needs).
         let cells = unsafe { std::slice::from_raw_parts(walkable, walkable_len) };
-        finish_create(TileGrid::from_walkable(width, height, layers, cells), out)
+        // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+        unsafe { finish_create(TileGrid::from_walkable(width, height, layers, cells), out) }
     })
 }
 
@@ -482,8 +523,13 @@ pub extern "C" fn ls_tile_context_create(
 /// set means the node may be left in direction `d` (0 = south/+row, 1 = north/-row,
 /// 2 = east/+col, 3 = west/-col). `overrides` (may be null when `overrides_len` is 0)
 /// lists the edges that change layer or cost.
+///
+/// # Safety
+/// - `masks` must be null or valid for reading `masks_len` elements.
+/// - `overrides` must be null or valid for reading `overrides_len` elements.
+/// - `out` must be null or valid for writing one pointer.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_tile_context_create_edges(
+pub unsafe extern "C" fn ls_tile_context_create_edges(
     width: u32,
     height: u32,
     layers: u32,
@@ -520,27 +566,61 @@ pub extern "C" fn ls_tile_context_create_edges(
                 },
             ));
         }
-        finish_create(
-            TileGrid::from_edges(width, height, layers, masks, &converted),
-            out,
-        )
+        // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+        unsafe {
+            finish_create(
+                TileGrid::from_edges(width, height, layers, masks, &converted),
+                out,
+            )
+        }
     })
 }
 
-fn finish_create(grid: Result<TileGrid, GridError>, out: *mut *mut Context) -> Status {
+/// Box a new context into `*out`.
+///
+/// # Safety
+/// `out` must be valid for writing one pointer (callers check it for null first).
+unsafe fn finish_create(grid: Result<TileGrid, GridError>, out: *mut *mut Context) -> Status {
     match grid {
         Ok(grid) => {
             // SAFETY: callers check `out` for null; caller guarantees it is writable.
-            unsafe { *out = Box::into_raw(Box::new(Context(TileContext::new(grid)))) };
+            unsafe { *out = Box::into_raw(Box::new(Context(CoreContext::new(grid)))) };
             Status::Ok
         }
         Err(_) => Status::InvalidArgument,
     }
 }
 
-/// Release a context and everything it owns. Null is a no-op.
+/// Create a context without a map (spec §4): the entity registry, the player, entity
+/// vectors and trackers, for spaces the core doesn't model. Map calls on it return
+/// `NotSupported`; its entities project to no nodes and never pass a reachability filter.
+/// On success `*out` receives a handle that must be released with [`ls_context_destroy`].
+///
+/// # Safety
+/// `out` must be null or valid for writing one pointer.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_context_destroy(ctx: *mut Context) {
+pub unsafe extern "C" fn ls_context_create(out: *mut *mut Context) -> Status {
+    guard(|| {
+        if out.is_null() {
+            return Status::NullPointer;
+        }
+        // SAFETY: non-null checked; caller guarantees it is writable.
+        unsafe { *out = Box::into_raw(Box::new(Context(CoreContext::without_map()))) };
+        Status::Ok
+    })
+}
+
+/// The context's map, or `NotSupported` for a context without one.
+fn grid_of(ctx: &Context) -> Result<&TileGrid, Status> {
+    ctx.0.grid().ok_or(Status::NotSupported)
+}
+
+/// Release a context and everything it owns. Null is a no-op.
+///
+/// # Safety
+/// `ctx` must be null or a context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create` that has not been released, and no other call may be using it. It is dangling after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ls_context_destroy(ctx: *mut Context) {
     let _ = guard(|| {
         if !ctx.is_null() {
             // SAFETY: `ctx` came from `Box::into_raw` in a create function and the caller
@@ -556,8 +636,12 @@ pub extern "C" fn ls_context_destroy(ctx: *mut Context) {
 // ---------------------------------------------------------------------------
 
 /// Node id for `(col, row, layer)`. `InvalidArgument` if outside the grid.
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing one `u32`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_node_id(
+pub unsafe extern "C" fn ls_node_id(
     ctx: *const Context,
     col: u32,
     row: u32,
@@ -570,7 +654,11 @@ pub extern "C" fn ls_node_id(
         }
         // SAFETY: non-null checked; a live context handle.
         let ctx = unsafe { &*ctx };
-        match ctx.0.grid().node_id(col, row, layer) {
+        let grid = match grid_of(ctx) {
+            Ok(g) => g,
+            Err(s) => return s,
+        };
+        match grid.node_id(col, row, layer) {
             // SAFETY: `out` non-null checked; caller guarantees it is writable.
             Some(id) => unsafe {
                 *out = id;
@@ -582,8 +670,14 @@ pub extern "C" fn ls_node_id(
 }
 
 /// `(col, row, layer)` of a node. Any out-pointer may be null to skip it.
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `out_col` must be null or valid for writing one `u32`.
+/// - `out_row` must be null or valid for writing one `u32`.
+/// - `out_layer` must be null or valid for writing one `u32`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_node_coords(
+pub unsafe extern "C" fn ls_node_coords(
     ctx: *const Context,
     node: u32,
     out_col: *mut u32,
@@ -596,7 +690,11 @@ pub extern "C" fn ls_node_coords(
         }
         // SAFETY: non-null checked; a live context handle.
         let ctx = unsafe { &*ctx };
-        let Some((col, row, layer)) = ctx.0.grid().node_coords(node) else {
+        let grid = match grid_of(ctx) {
+            Ok(g) => g,
+            Err(s) => return s,
+        };
+        let Some((col, row, layer)) = grid.node_coords(node) else {
             return Status::InvalidArgument;
         };
         // SAFETY: each out-pointer is written only if non-null; caller guarantees writability.
@@ -616,15 +714,27 @@ pub extern "C" fn ls_node_coords(
 }
 
 /// Center position of a node. `InvalidArgument` if `node` is out of range.
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing one `Vec3`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_node_position(ctx: *const Context, node: u32, out: *mut Vec3) -> Status {
+pub unsafe extern "C" fn ls_node_position(
+    ctx: *const Context,
+    node: u32,
+    out: *mut Vec3,
+) -> Status {
     guard(|| {
         if ctx.is_null() || out.is_null() {
             return Status::NullPointer;
         }
         // SAFETY: non-null checked; a live context handle.
         let ctx = unsafe { &*ctx };
-        match ctx.0.grid().node_position(node) {
+        let grid = match grid_of(ctx) {
+            Ok(g) => g,
+            Err(s) => return s,
+        };
+        match grid.node_position(node) {
             // SAFETY: `out` non-null checked; caller guarantees it is writable.
             Some(pos) => unsafe {
                 *out = pos;
@@ -636,15 +746,27 @@ pub extern "C" fn ls_node_position(ctx: *const Context, node: u32, out: *mut Vec
 }
 
 /// The node containing `pos`. `InvalidArgument` if outside the grid.
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing one `u32`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_node_from_position(ctx: *const Context, pos: Vec3, out: *mut u32) -> Status {
+pub unsafe extern "C" fn ls_node_from_position(
+    ctx: *const Context,
+    pos: Vec3,
+    out: *mut u32,
+) -> Status {
     guard(|| {
         if ctx.is_null() || out.is_null() {
             return Status::NullPointer;
         }
         // SAFETY: non-null checked; a live context handle.
         let ctx = unsafe { &*ctx };
-        match ctx.0.grid().node_from_position(pos) {
+        let grid = match grid_of(ctx) {
+            Ok(g) => g,
+            Err(s) => return s,
+        };
+        match grid.node_from_position(pos) {
             // SAFETY: `out` non-null checked; caller guarantees it is writable.
             Some(id) => unsafe {
                 *out = id;
@@ -659,19 +781,23 @@ pub extern "C" fn ls_node_from_position(ctx: *const Context, pos: Vec3, out: *mu
 // Edges and links (mutations)
 // ---------------------------------------------------------------------------
 
-fn with_ctx_mut(ctx: *mut Context, f: impl FnOnce(&mut TileContext) -> Status) -> Status {
-    guard(|| {
-        if ctx.is_null() {
-            return Status::NullPointer;
-        }
-        // SAFETY: non-null checked; a live context handle, and the caller (per the thread
-        // contract) is the only user of this context during the call.
-        f(&mut unsafe { &mut *ctx }.0)
+/// Run `f` on a context the export has already turned into a reference (`ctx.as_mut()`, under
+/// its `# Safety` contract): `None` (a null handle) is `NullPointer`.
+fn with_ctx_mut(ctx: Option<&mut Context>, f: impl FnOnce(&mut CoreContext) -> Status) -> Status {
+    guard(|| match ctx {
+        Some(c) => f(&mut c.0),
+        None => Status::NullPointer,
     })
 }
 
-fn with_grid(ctx: *mut Context, f: impl FnOnce(&mut TileGrid) -> Result<(), GridError>) -> Status {
-    with_ctx_mut(ctx, |c| status_of(f(c.grid_mut())))
+fn with_grid(
+    ctx: Option<&mut Context>,
+    f: impl FnOnce(&mut TileGrid) -> Result<(), GridError>,
+) -> Status {
+    with_ctx_mut(ctx, |c| match c.grid_mut() {
+        Some(g) => status_of(f(g)),
+        None => Status::NotSupported,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -680,13 +806,18 @@ fn with_grid(ctx: *mut Context, f: impl FnOnce(&mut TileGrid) -> Result<(), Grid
 
 /// Register an agent profile; `*out` receives its id for `PathOptions.profile`.
 /// `InvalidArgument` if the footprint is 0 or over 255.
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing one `u32`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_profile_register(
+pub unsafe extern "C" fn ls_profile_register(
     ctx: *mut Context,
     profile: ProfileDesc,
     out: *mut u32,
 ) -> Status {
-    with_ctx_mut(ctx, |c| {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_ctx_mut(unsafe { ctx.as_mut() }, |c| {
         if out.is_null() {
             return Status::NullPointer;
         }
@@ -708,14 +839,25 @@ pub extern "C" fn ls_profile_register(
 }
 
 /// Clearance of a node: the largest square footprint that fits anchored there (0 = wall).
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing one `u32`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_node_clearance(ctx: *const Context, node: u32, out: *mut u32) -> Status {
+pub unsafe extern "C" fn ls_node_clearance(
+    ctx: *const Context,
+    node: u32,
+    out: *mut u32,
+) -> Status {
     guard(|| {
         if ctx.is_null() || out.is_null() {
             return Status::NullPointer;
         }
         // SAFETY: non-null checked; a live context handle.
-        let grid = unsafe { &*ctx }.0.grid();
+        let grid = match grid_of(unsafe { &*ctx }) {
+            Ok(g) => g,
+            Err(s) => return s,
+        };
         if grid.node_coords(node).is_none() {
             return Status::InvalidArgument;
         }
@@ -730,14 +872,26 @@ pub extern "C" fn ls_node_clearance(ctx: *const Context, node: u32, out: *mut u3
 // ---------------------------------------------------------------------------
 
 /// Group bitmask of a node. `InvalidArgument` if out of range.
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing one `u32`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_node_get_groups(ctx: *const Context, node: u32, out: *mut u32) -> Status {
+pub unsafe extern "C" fn ls_node_get_groups(
+    ctx: *const Context,
+    node: u32,
+    out: *mut u32,
+) -> Status {
     guard(|| {
         if ctx.is_null() || out.is_null() {
             return Status::NullPointer;
         }
         // SAFETY: non-null checked; a live context handle.
-        match unsafe { &*ctx }.0.groups(node) {
+        let ctx = unsafe { &*ctx };
+        if let Err(s) = grid_of(ctx) {
+            return s;
+        }
+        match ctx.0.groups(node) {
             // SAFETY: `out` non-null checked; caller guarantees it is writable.
             Some(mask) => unsafe {
                 *out = mask;
@@ -749,9 +903,16 @@ pub extern "C" fn ls_node_get_groups(ctx: *const Context, node: u32, out: *mut u
 }
 
 /// Replace a node's groups.
+///
+/// # Safety
+/// `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_node_set_groups(ctx: *mut Context, node: u32, mask: u32) -> Status {
-    with_ctx_mut(ctx, |c| {
+pub unsafe extern "C" fn ls_node_set_groups(ctx: *mut Context, node: u32, mask: u32) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_ctx_mut(unsafe { ctx.as_mut() }, |c| {
+        if c.grid().is_none() {
+            return Status::NotSupported;
+        }
         if c.set_groups(node, mask) {
             Status::Ok
         } else {
@@ -761,9 +922,16 @@ pub extern "C" fn ls_node_set_groups(ctx: *mut Context, node: u32, mask: u32) ->
 }
 
 /// OR `mask` into a node's groups.
+///
+/// # Safety
+/// `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_node_add_groups(ctx: *mut Context, node: u32, mask: u32) -> Status {
-    with_ctx_mut(ctx, |c| {
+pub unsafe extern "C" fn ls_node_add_groups(ctx: *mut Context, node: u32, mask: u32) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_ctx_mut(unsafe { ctx.as_mut() }, |c| {
+        if c.grid().is_none() {
+            return Status::NotSupported;
+        }
         if c.add_groups(node, mask) {
             Status::Ok
         } else {
@@ -773,9 +941,16 @@ pub extern "C" fn ls_node_add_groups(ctx: *mut Context, node: u32, mask: u32) ->
 }
 
 /// Clear `mask` bits from a node's groups.
+///
+/// # Safety
+/// `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_node_remove_groups(ctx: *mut Context, node: u32, mask: u32) -> Status {
-    with_ctx_mut(ctx, |c| {
+pub unsafe extern "C" fn ls_node_remove_groups(ctx: *mut Context, node: u32, mask: u32) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_ctx_mut(unsafe { ctx.as_mut() }, |c| {
+        if c.grid().is_none() {
+            return Status::NotSupported;
+        }
         if c.remove_groups(node, mask) {
             Status::Ok
         } else {
@@ -785,47 +960,70 @@ pub extern "C" fn ls_node_remove_groups(ctx: *mut Context, node: u32, mask: u32)
 }
 
 /// Clear `mask` bits from every node.
+///
+/// # Safety
+/// `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_groups_clear(ctx: *mut Context, mask: u32) -> Status {
-    with_ctx_mut(ctx, |c| {
+pub unsafe extern "C" fn ls_groups_clear(ctx: *mut Context, mask: u32) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_ctx_mut(unsafe { ctx.as_mut() }, |c| {
+        if c.grid().is_none() {
+            return Status::NotSupported;
+        }
         c.clear_groups(mask);
         Status::Ok
     })
 }
 
 /// Open or close one directed edge (`node` leaving in `dir`). The reverse edge is untouched.
+///
+/// # Safety
+/// `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_tile_set_edge(
+pub unsafe extern "C" fn ls_tile_set_edge(
     ctx: *mut Context,
     node: u32,
     dir: u8,
     passable: bool,
 ) -> Status {
-    with_grid(ctx, |g| {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_grid(unsafe { ctx.as_mut() }, |g| {
         let dir = Dir::from_u8(dir).ok_or(GridError::InvalidNode(node))?;
         g.set_edge(node, dir, passable)
     })
 }
 
 /// Set the layer/cost override for one directed edge (ramps, terrain costs).
+///
+/// # Safety
+/// `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_tile_set_edge_override(
+pub unsafe extern "C" fn ls_tile_set_edge_override(
     ctx: *mut Context,
     node: u32,
     dir: u8,
     target_layer: u32,
     cost: f32,
 ) -> Status {
-    with_grid(ctx, |g| {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_grid(unsafe { ctx.as_mut() }, |g| {
         let dir = Dir::from_u8(dir).ok_or(GridError::InvalidNode(node))?;
         g.set_edge_override(node, dir, EdgeOverride { target_layer, cost })
     })
 }
 
 /// Remove an override, restoring "same layer, cost 1". Clearing a missing override is `Ok`.
+///
+/// # Safety
+/// `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_tile_clear_edge_override(ctx: *mut Context, node: u32, dir: u8) -> Status {
-    with_grid(ctx, |g| {
+pub unsafe extern "C" fn ls_tile_clear_edge_override(
+    ctx: *mut Context,
+    node: u32,
+    dir: u8,
+) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_grid(unsafe { ctx.as_mut() }, |g| {
         let dir = Dir::from_u8(dir).ok_or(GridError::InvalidNode(node))?;
         g.clear_edge_override(node, dir);
         Ok(())
@@ -833,9 +1031,13 @@ pub extern "C" fn ls_tile_clear_edge_override(ctx: *mut Context, node: u32, dir:
 }
 
 /// Add a link, or replace the one with the same id. Endpoints must be inside the grid.
+///
+/// # Safety
+/// `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_link_add(ctx: *mut Context, link: LinkDesc) -> Status {
-    with_grid(ctx, |g| {
+pub unsafe extern "C" fn ls_link_add(ctx: *mut Context, link: LinkDesc) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_grid(unsafe { ctx.as_mut() }, |g| {
         let from = g
             .node_from_position(link.from)
             .ok_or(GridError::InvalidNode(u32::MAX))?;
@@ -856,15 +1058,25 @@ pub extern "C" fn ls_link_add(ctx: *mut Context, link: LinkDesc) -> Status {
 }
 
 /// Remove a link. `InvalidArgument` if the id is unknown.
+///
+/// # Safety
+/// `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_link_remove(ctx: *mut Context, id: u64) -> Status {
-    with_grid(ctx, |g| g.remove_link(id as LinkId))
+pub unsafe extern "C" fn ls_link_remove(ctx: *mut Context, id: u64) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_grid(unsafe { ctx.as_mut() }, |g| g.remove_link(id as LinkId))
 }
 
 /// Enable or disable a link without removing it (unpowered teleporter, locked door).
+///
+/// # Safety
+/// `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_link_set_enabled(ctx: *mut Context, id: u64, enabled: bool) -> Status {
-    with_grid(ctx, |g| g.set_link_enabled(id as LinkId, enabled))
+pub unsafe extern "C" fn ls_link_set_enabled(ctx: *mut Context, id: u64, enabled: bool) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_grid(unsafe { ctx.as_mut() }, |g| {
+        g.set_link_enabled(id as LinkId, enabled)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -872,9 +1084,14 @@ pub extern "C" fn ls_link_set_enabled(ctx: *mut Context, id: u64, enabled: bool)
 // ---------------------------------------------------------------------------
 
 /// Insert or replace one entity by id. `InvalidArgument` for an unknown bounds kind.
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `entity` must be null or valid for reading one `EntityDesc`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_entity_upsert(ctx: *mut Context, entity: *const EntityDesc) -> Status {
-    with_ctx_mut(ctx, |c| {
+pub unsafe extern "C" fn ls_entity_upsert(ctx: *mut Context, entity: *const EntityDesc) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_ctx_mut(unsafe { ctx.as_mut() }, |c| {
         if entity.is_null() {
             return Status::NullPointer;
         }
@@ -890,9 +1107,13 @@ pub extern "C" fn ls_entity_upsert(ctx: *mut Context, entity: *const EntityDesc)
 }
 
 /// Remove an entity. `InvalidArgument` if the id is unknown.
+///
+/// # Safety
+/// `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_entity_remove(ctx: *mut Context, id: u64) -> Status {
-    with_ctx_mut(ctx, |c| {
+pub unsafe extern "C" fn ls_entity_remove(ctx: *mut Context, id: u64) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_ctx_mut(unsafe { ctx.as_mut() }, |c| {
         if c.remove_entity(id) {
             Status::Ok
         } else {
@@ -904,14 +1125,20 @@ pub extern "C" fn ls_entity_remove(ctx: *mut Context, id: u64) -> Status {
 /// Declarative snapshot sync (spec §5): upsert every record, remove every entity absent
 /// from the snapshot. The core diffs, so re-sending unchanged records costs nothing.
 /// `stats` may be null. Rejects the whole snapshot on any invalid bounds kind.
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `entities` must be null or valid for reading `entities_len` elements.
+/// - `stats` must be null or valid for writing one `SyncStats`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_entities_sync(
+pub unsafe extern "C" fn ls_entities_sync(
     ctx: *mut Context,
     entities: *const EntityDesc,
     entities_len: usize,
     stats: *mut SyncStats,
 ) -> Status {
-    with_ctx_mut(ctx, |c| {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_ctx_mut(unsafe { ctx.as_mut() }, |c| {
         if entities.is_null() && entities_len > 0 {
             return Status::NullPointer;
         }
@@ -938,8 +1165,11 @@ pub extern "C" fn ls_entities_sync(
 }
 
 /// Number of entities in the registry.
+///
+/// # Safety
+/// `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_entity_count(ctx: *const Context) -> usize {
+pub unsafe extern "C" fn ls_entity_count(ctx: *const Context) -> usize {
     if ctx.is_null() {
         return 0;
     }
@@ -949,8 +1179,13 @@ pub extern "C" fn ls_entity_count(ctx: *const Context) -> usize {
 
 /// Nodes an entity occupies (its bounds projected through the grid). Same buffer convention
 /// as [`ls_path_nodes`]. `InvalidArgument` for an unknown id; an off-grid entity writes zero.
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing `capacity` elements.
+/// - `written` must be null or valid for writing one `usize`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_entity_nodes(
+pub unsafe extern "C" fn ls_entity_nodes(
     ctx: *const Context,
     id: u64,
     out: *mut u32,
@@ -963,15 +1198,20 @@ pub extern "C" fn ls_entity_nodes(
         }
         // SAFETY: non-null checked; a live context handle.
         match unsafe { &*ctx }.0.entity_nodes(id) {
-            Some(nodes) => copy_out(nodes, out, capacity, written),
+            // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+            Some(nodes) => unsafe { copy_out(nodes, out, capacity, written) },
             None => Status::InvalidArgument,
         }
     })
 }
 
 /// Closest point of an entity's bounds to `from` — pure geometry, no map involved.
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing one `Vec3`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_entity_nearest_point(
+pub unsafe extern "C" fn ls_entity_nearest_point(
     ctx: *const Context,
     id: u64,
     from: Vec3,
@@ -995,8 +1235,12 @@ pub extern "C" fn ls_entity_nearest_point(
 
 /// Path to an entity. Goal mode comes from the entity's `PathfindAdjacent` flag, not `opts`.
 /// `InvalidArgument` for an unknown id; otherwise the [`ls_find_path`] result convention.
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing one pointer.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_find_path_to_entity(
+pub unsafe extern "C" fn ls_find_path_to_entity(
     ctx: *const Context,
     start: Vec3,
     id: u64,
@@ -1015,15 +1259,23 @@ pub extern "C" fn ls_find_path_to_entity(
         if ctx.0.entity(id).is_none() {
             return Status::InvalidArgument;
         }
-        finish_path(ctx.0.find_path_to_entity(start, id, opts), out)
+        if let Err(s) = grid_of(ctx) {
+            return s;
+        }
+        // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+        unsafe { finish_path(ctx.0.find_path_to_entity(start, id, opts), out) }
     })
 }
 
 /// Whether an entity is reachable from `start`: any of its nodes, or any node one step away
 /// from them, is reachable under `opts.blocked_mask`. Runs a fresh flood fill each call.
 /// `NoPath` if `start` is off-grid; `InvalidArgument` for an unknown id.
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing one `bool`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_entity_reachable(
+pub unsafe extern "C" fn ls_entity_reachable(
     ctx: *const Context,
     start: Vec3,
     id: u64,
@@ -1042,6 +1294,9 @@ pub extern "C" fn ls_entity_reachable(
         if ctx.0.entity(id).is_none() {
             return Status::InvalidArgument;
         }
+        if let Err(s) = grid_of(ctx) {
+            return s;
+        }
         let Some(reached) = ctx.0.reachable(start, opts) else {
             return Status::NoPath;
         };
@@ -1056,17 +1311,29 @@ pub extern "C" fn ls_entity_reachable(
 // ---------------------------------------------------------------------------
 
 /// Update the player's position (each frame). A real move invalidates cached reachability.
+///
+/// # Safety
+/// `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_player_set(ctx: *mut Context, position: Vec3) -> Status {
-    with_ctx_mut(ctx, |c| {
+pub unsafe extern "C" fn ls_player_set(ctx: *mut Context, position: Vec3) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_ctx_mut(unsafe { ctx.as_mut() }, |c| {
         c.set_player_position(position);
         Status::Ok
     })
 }
 
 /// Bearing, elevation, distance and step count from the player to an entity's nearest point.
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing one `EntityVector`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_entity_vector(ctx: *const Context, id: u64, out: *mut EntityVector) -> Status {
+pub unsafe extern "C" fn ls_entity_vector(
+    ctx: *const Context,
+    id: u64,
+    out: *mut EntityVector,
+) -> Status {
     guard(|| {
         if ctx.is_null() || out.is_null() {
             return Status::NullPointer;
@@ -1091,8 +1358,12 @@ pub extern "C" fn ls_entity_vector(ctx: *const Context, id: u64, out: *mut Entit
 
 /// [`ls_entity_reachable`] from the player's position, using the reachability cache — cheap
 /// to call per announcement. `NoPath` if the player is off-grid.
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing one `bool`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_entity_reachable_from_player(
+pub unsafe extern "C" fn ls_entity_reachable_from_player(
     ctx: *const Context,
     id: u64,
     profile: u32,
@@ -1108,6 +1379,9 @@ pub extern "C" fn ls_entity_reachable_from_player(
         if ctx.entity(id).is_none() || ctx.profile(profile).is_none() {
             return Status::InvalidArgument;
         }
+        if ctx.grid().is_none() {
+            return Status::NotSupported;
+        }
         match ctx.entity_reachable_from_player(id, profile, blocked_mask) {
             // SAFETY: `out` non-null checked; caller guarantees it is writable.
             Some(r) => unsafe {
@@ -1121,19 +1395,26 @@ pub extern "C" fn ls_entity_reachable_from_player(
 
 /// Create a tracker with an initial filter list (may be empty; `filters` may then be null).
 /// `include_all` adds an all-categories view ahead of the per-category views.
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `filters` must be null or valid for reading `filters_len` elements.
+/// - `out` must be null or valid for writing one `u32`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_tracker_create(
+pub unsafe extern "C" fn ls_tracker_create(
     ctx: *mut Context,
     filters: *const FilterDesc,
     filters_len: usize,
     include_all: bool,
     out: *mut u32,
 ) -> Status {
-    with_ctx_mut(ctx, |c| {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_ctx_mut(unsafe { ctx.as_mut() }, |c| {
         if out.is_null() {
             return Status::NullPointer;
         }
-        let Some(filters) = parse_filters(filters, filters_len) else {
+        // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+        let Some(filters) = (unsafe { parse_filters(filters, filters_len) }) else {
             return Status::InvalidArgument;
         };
         let id = c.tracker_create(Tracker::new(filters, include_all));
@@ -1144,9 +1425,13 @@ pub extern "C" fn ls_tracker_create(
 }
 
 /// Destroy a tracker. `InvalidArgument` if unknown.
+///
+/// # Safety
+/// `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_tracker_destroy(ctx: *mut Context, tracker: u32) -> Status {
-    with_ctx_mut(ctx, |c| {
+pub unsafe extern "C" fn ls_tracker_destroy(ctx: *mut Context, tracker: u32) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_ctx_mut(unsafe { ctx.as_mut() }, |c| {
         if c.tracker_destroy(tracker) {
             Status::Ok
         } else {
@@ -1156,15 +1441,21 @@ pub extern "C" fn ls_tracker_destroy(ctx: *mut Context, tracker: u32) -> Status 
 }
 
 /// Replace a tracker's filter list wholesale. The selection is re-validated on the next action.
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `filters` must be null or valid for reading `filters_len` elements.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_tracker_set_filters(
+pub unsafe extern "C" fn ls_tracker_set_filters(
     ctx: *mut Context,
     tracker: u32,
     filters: *const FilterDesc,
     filters_len: usize,
 ) -> Status {
-    with_ctx_mut(ctx, |c| {
-        let Some(filters) = parse_filters(filters, filters_len) else {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_ctx_mut(unsafe { ctx.as_mut() }, |c| {
+        // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+        let Some(filters) = (unsafe { parse_filters(filters, filters_len) }) else {
             return Status::InvalidArgument;
         };
         match c.tracker_mut(tracker) {
@@ -1178,14 +1469,18 @@ pub extern "C" fn ls_tracker_set_filters(
 }
 
 /// Enable or disable one filter by index (hotkey toggles).
+///
+/// # Safety
+/// `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_tracker_set_filter_enabled(
+pub unsafe extern "C" fn ls_tracker_set_filter_enabled(
     ctx: *mut Context,
     tracker: u32,
     index: usize,
     enabled: bool,
 ) -> Status {
-    with_ctx_mut(ctx, |c| match c.tracker_mut(tracker) {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_ctx_mut(unsafe { ctx.as_mut() }, |c| match c.tracker_mut(tracker) {
         Some(t) => {
             if t.set_filter_enabled(index, enabled) {
                 Status::Ok
@@ -1197,15 +1492,77 @@ pub extern "C" fn ls_tracker_set_filter_enabled(
     })
 }
 
-/// Drive a tracker. `action` is a `TrackerAction` discriminant.
+/// Set a tracker's cycle order. `order` is a `TrackerOrder` discriminant.
+///
+/// # Safety
+/// `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_tracker_act(
+pub unsafe extern "C" fn ls_tracker_set_order(
+    ctx: *mut Context,
+    tracker: u32,
+    order: u32,
+) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_ctx_mut(unsafe { ctx.as_mut() }, |c| {
+        let order = match order {
+            0 => CoreOrder::SortKey,
+            1 => CoreOrder::Distance,
+            _ => return Status::InvalidArgument,
+        };
+        match c.tracker_mut(tracker) {
+            Some(t) => {
+                t.order = order;
+                Status::Ok
+            }
+            None => Status::InvalidArgument,
+        }
+    })
+}
+
+/// Jump a tracker to `category` (`UINT32_MAX` = the all-categories view) without cycling;
+/// clears the selection. A category with nothing visible is allowed and lists nothing.
+///
+/// # Safety
+/// `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ls_tracker_set_category(
+    ctx: *mut Context,
+    tracker: u32,
+    category: u32,
+) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_ctx_mut(unsafe { ctx.as_mut() }, |c| {
+        let category = match category {
+            u32::MAX => None,
+            c => match u16::try_from(c) {
+                Ok(c) => Some(c),
+                Err(_) => return Status::InvalidArgument,
+            },
+        };
+        match c.tracker_mut(tracker) {
+            Some(t) => {
+                t.set_category(category);
+                Status::Ok
+            }
+            None => Status::InvalidArgument,
+        }
+    })
+}
+
+/// Drive a tracker. `action` is a `TrackerAction` discriminant.
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing one `Selection`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ls_tracker_act(
     ctx: *mut Context,
     tracker: u32,
     action: u32,
     out: *mut Selection,
 ) -> Status {
-    with_ctx_mut(ctx, |c| {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with_ctx_mut(unsafe { ctx.as_mut() }, |c| {
         if out.is_null() {
             return Status::NullPointer;
         }
@@ -1215,6 +1572,10 @@ pub extern "C" fn ls_tracker_act(
             2 => CoreAction::CategoryNext,
             3 => CoreAction::CategoryPrev,
             4 => CoreAction::Current,
+            5 => CoreAction::GroupNext,
+            6 => CoreAction::GroupPrev,
+            7 => CoreAction::InGroupNext,
+            8 => CoreAction::InGroupPrev,
             _ => return Status::InvalidArgument,
         };
         match c.tracker_act(tracker, action) {
@@ -1232,9 +1593,41 @@ pub extern "C" fn ls_tracker_act(
     })
 }
 
-/// Visible entity count under the tracker's filters, in `category` or (`UINT32_MAX`) all.
+/// Size of the selected entity's group in the tracker's current view; 0 when nothing is
+/// selected. `InvalidArgument` for an unknown tracker.
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing one `u32`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_tracker_count(
+pub unsafe extern "C" fn ls_tracker_group_count(
+    ctx: *const Context,
+    tracker: u32,
+    out: *mut u32,
+) -> Status {
+    guard(|| {
+        if ctx.is_null() || out.is_null() {
+            return Status::NullPointer;
+        }
+        // SAFETY: non-null checked; a live context handle.
+        match unsafe { &*ctx }.0.tracker_group_count(tracker) {
+            // SAFETY: `out` non-null checked; caller guarantees it is writable.
+            Some(n) => unsafe {
+                *out = n;
+                Status::Ok
+            },
+            None => Status::InvalidArgument,
+        }
+    })
+}
+
+/// Visible entity count under the tracker's filters, in `category` or (`UINT32_MAX`) all.
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing one `u32`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ls_tracker_count(
     ctx: *const Context,
     tracker: u32,
     category: u32,
@@ -1267,7 +1660,11 @@ pub extern "C" fn ls_tracker_count(
 // Paths
 // ---------------------------------------------------------------------------
 
-fn finish_path(result: Option<loadstar_core::graph::Path>, out: *mut *mut Path) -> Status {
+/// Box a path result into `*out`, or write null for `NoPath`.
+///
+/// # Safety
+/// `out` must be valid for writing one pointer (callers check it for null first).
+unsafe fn finish_path(result: Option<loadstar_core::graph::Path>, out: *mut *mut Path) -> Status {
     match result {
         // SAFETY: callers check `out` for null; caller guarantees it is writable.
         Some(path) => unsafe {
@@ -1285,8 +1682,12 @@ fn finish_path(result: Option<loadstar_core::graph::Path>, out: *mut *mut Path) 
 ///
 /// On `Ok`, `*out` receives a path handle (release with [`ls_path_free`]).
 /// On `NoPath`, `*out` is set to null and nothing needs freeing.
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing one pointer.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_find_path(
+pub unsafe extern "C" fn ls_find_path(
     ctx: *const Context,
     start: Vec3,
     goal: Vec3,
@@ -1301,14 +1702,24 @@ pub extern "C" fn ls_find_path(
             return Status::InvalidArgument;
         };
         // SAFETY: non-null checked; a live context handle.
-        finish_path(unsafe { &*ctx }.0.find_path(start, goal, opts), out)
+        let ctx = unsafe { &*ctx };
+        if let Err(s) = grid_of(ctx) {
+            return s;
+        }
+        // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+        unsafe { finish_path(ctx.0.find_path(start, goal, opts), out) }
     })
 }
 
 /// Find a path from the node containing `start` to the cheapest of `targets` (node ids),
 /// interpreted per `opts.goal_mode`. Same result convention as [`ls_find_path`].
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `targets` must be null or valid for reading `targets_len` elements.
+/// - `out` must be null or valid for writing one pointer.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_find_path_to_nodes(
+pub unsafe extern "C" fn ls_find_path_to_nodes(
     ctx: *const Context,
     start: Vec3,
     targets: *const u32,
@@ -1331,21 +1742,29 @@ pub extern "C" fn ls_find_path_to_nodes(
         };
         // SAFETY: non-null checked; a live context handle.
         let ctx = unsafe { &*ctx };
-        let n = ctx.0.grid().width() as usize
-            * ctx.0.grid().height() as usize
-            * ctx.0.grid().layers() as usize;
+        let grid = match grid_of(ctx) {
+            Ok(g) => g,
+            Err(s) => return s,
+        };
+        let n = grid.width() as usize * grid.height() as usize * grid.layers() as usize;
         if targets.iter().any(|&t| t as usize >= n) {
             return Status::InvalidArgument;
         }
-        finish_path(ctx.0.find_path_to_nodes(start, targets, opts), out)
+        // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+        unsafe { finish_path(ctx.0.find_path_to_nodes(start, targets, opts), out) }
     })
 }
 
 /// Reachability from the node containing `start`: one byte per node (nonzero = reachable),
 /// same buffer convention as [`ls_path_nodes`]. `opts.goal_mode` is ignored.
 /// `NoPath` if `start` is off-grid and cannot be snapped.
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `out` must be null or valid for writing `capacity` elements.
+/// - `written` must be null or valid for writing one `usize`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_reachable_nodes(
+pub unsafe extern "C" fn ls_reachable_nodes(
     ctx: *const Context,
     start: Vec3,
     opts: PathOptions,
@@ -1361,17 +1780,25 @@ pub extern "C" fn ls_reachable_nodes(
             return Status::InvalidArgument;
         };
         // SAFETY: non-null checked; a live context handle.
-        let Some(reached) = unsafe { &*ctx }.0.reachable(start, opts) else {
+        let ctx = unsafe { &*ctx };
+        if let Err(s) = grid_of(ctx) {
+            return s;
+        }
+        let Some(reached) = ctx.0.reachable(start, opts) else {
             return Status::NoPath;
         };
         let bytes: Vec<u8> = reached.iter().map(|&r| r as u8).collect();
-        copy_out(&bytes, out, capacity, written)
+        // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+        unsafe { copy_out(&bytes, out, capacity, written) }
     })
 }
 
 /// Number of nodes in a path (both endpoints included). Zero for a null handle.
+///
+/// # Safety
+/// `path` must be null or a live path handle from a path query (`ls_find_path`, `ls_find_path_to_nodes` or `ls_find_path_to_entity`).
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_path_len(path: *const Path) -> usize {
+pub unsafe extern "C" fn ls_path_len(path: *const Path) -> usize {
     if path.is_null() {
         return 0;
     }
@@ -1380,8 +1807,11 @@ pub extern "C" fn ls_path_len(path: *const Path) -> usize {
 }
 
 /// Total traversal cost of a path. Zero for a null handle.
+///
+/// # Safety
+/// `path` must be null or a live path handle from a path query (`ls_find_path`, `ls_find_path_to_nodes` or `ls_find_path_to_entity`).
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_path_cost(path: *const Path) -> f32 {
+pub unsafe extern "C" fn ls_path_cost(path: *const Path) -> f32 {
     if path.is_null() {
         return 0.0;
     }
@@ -1391,8 +1821,13 @@ pub extern "C" fn ls_path_cost(path: *const Path) -> f32 {
 
 /// Copy the path's node ids into `out` (capacity `capacity`). `*written` receives the count
 /// needed; if it exceeds `capacity`, nothing is copied and `BufferTooSmall` is returned.
+///
+/// # Safety
+/// - `path` must be null or a live path handle from a path query (`ls_find_path`, `ls_find_path_to_nodes` or `ls_find_path_to_entity`).
+/// - `out` must be null or valid for writing `capacity` elements.
+/// - `written` must be null or valid for writing one `usize`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_path_nodes(
+pub unsafe extern "C" fn ls_path_nodes(
     path: *const Path,
     out: *mut u32,
     capacity: usize,
@@ -1402,15 +1837,20 @@ pub extern "C" fn ls_path_nodes(
         if path.is_null() {
             return Status::NullPointer;
         }
-        // SAFETY: non-null checked; a live path handle.
-        copy_out(&unsafe { &*path }.0.nodes, out, capacity, written)
+        // SAFETY: non-null checked; a live path handle, and `out`/`written` per the contract.
+        unsafe { copy_out(&(*path).0.nodes, out, capacity, written) }
     })
 }
 
 /// Copy the path's link traversals into `out`. Same buffer convention as [`ls_path_nodes`].
 /// A path with no link traversals writes zero and returns `Ok`.
+///
+/// # Safety
+/// - `path` must be null or a live path handle from a path query (`ls_find_path`, `ls_find_path_to_nodes` or `ls_find_path_to_entity`).
+/// - `out` must be null or valid for writing `capacity` elements.
+/// - `written` must be null or valid for writing one `usize`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_path_links(
+pub unsafe extern "C" fn ls_path_links(
     path: *const Path,
     out: *mut PathLink,
     capacity: usize,
@@ -1431,15 +1871,22 @@ pub extern "C" fn ls_path_links(
                 _reserved: 0,
             })
             .collect();
-        copy_out(&links, out, capacity, written)
+        // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+        unsafe { copy_out(&links, out, capacity, written) }
     })
 }
 
 /// Compress a path into direction runs broken at link traversals ("north 5, east 2, take
 /// the teleporter" as data). Needs the context the path was found on. Same buffer
 /// convention as [`ls_path_nodes`].
+///
+/// # Safety
+/// - `ctx` must be null or a live context handle from `ls_tile_context_create`, `ls_tile_context_create_edges` or `ls_context_create`, not in use by any other call (on any thread) during this one.
+/// - `path` must be null or a live path handle from a path query (`ls_find_path`, `ls_find_path_to_nodes` or `ls_find_path_to_entity`).
+/// - `out` must be null or valid for writing `capacity` elements.
+/// - `written` must be null or valid for writing one `usize`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_path_segments(
+pub unsafe extern "C" fn ls_path_segments(
     ctx: *const Context,
     path: *const Path,
     out: *mut PathSegment,
@@ -1451,19 +1898,31 @@ pub extern "C" fn ls_path_segments(
             return Status::NullPointer;
         }
         // SAFETY: non-null checked; live context and path handles.
-        let segments: Vec<PathSegment> = unsafe { &*ctx }
-            .0
-            .grid()
+        let grid = match grid_of(unsafe { &*ctx }) {
+            Ok(g) => g,
+            Err(s) => return s,
+        };
+        let segments: Vec<PathSegment> = grid
             .segments(&unsafe { &*path }.0)
             .into_iter()
             .map(Into::into)
             .collect();
-        copy_out(&segments, out, capacity, written)
+        // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+        unsafe { copy_out(&segments, out, capacity, written) }
     })
 }
 
 /// Shared buffer convention: report the needed count, copy only if it fits.
-fn copy_out<T: Copy>(items: &[T], out: *mut T, capacity: usize, written: *mut usize) -> Status {
+///
+/// # Safety
+/// `written` must be null or valid for writing one `usize`; `out` must be null or valid for
+/// writing `capacity` elements.
+unsafe fn copy_out<T: Copy>(
+    items: &[T],
+    out: *mut T,
+    capacity: usize,
+    written: *mut usize,
+) -> Status {
     if written.is_null() {
         return Status::NullPointer;
     }
@@ -1484,8 +1943,11 @@ fn copy_out<T: Copy>(items: &[T], out: *mut T, capacity: usize, written: *mut us
 }
 
 /// Release a path. Null is a no-op.
+///
+/// # Safety
+/// `path` must be null or a path handle from a path query (`ls_find_path`, `ls_find_path_to_nodes` or `ls_find_path_to_entity`) that has not been released, and no other call may be using it. It is dangling after this call.
 #[unsafe(no_mangle)]
-pub extern "C" fn ls_path_free(path: *mut Path) {
+pub unsafe extern "C" fn ls_path_free(path: *mut Path) {
     let _ = guard(|| {
         if !path.is_null() {
             // SAFETY: `path` came from `Box::into_raw` in `ls_find_path`; caller won't reuse it.
@@ -1519,18 +1981,24 @@ mod tests {
 
     #[test]
     fn vec3_add_roundtrip() {
-        let mut out = Vec3::default();
-        let s = ls_vec3_add(Vec3::new(1.0, 2.0, 3.0), Vec3::new(1.0, 1.0, 1.0), &mut out);
-        assert_eq!(s, Status::Ok);
-        assert_eq!(out, Vec3::new(2.0, 3.0, 4.0));
+        // SAFETY: every pointer passed below is a live local or a handle created in this test.
+        unsafe {
+            let mut out = Vec3::default();
+            let s = ls_vec3_add(Vec3::new(1.0, 2.0, 3.0), Vec3::new(1.0, 1.0, 1.0), &mut out);
+            assert_eq!(s, Status::Ok);
+            assert_eq!(out, Vec3::new(2.0, 3.0, 4.0));
+        }
     }
 
     #[test]
     fn null_out_is_rejected_not_dereferenced() {
-        assert_eq!(
-            ls_vec3_add(Vec3::default(), Vec3::default(), std::ptr::null_mut()),
-            Status::NullPointer
-        );
+        // SAFETY: every pointer passed below is a live local or a handle created in this test.
+        unsafe {
+            assert_eq!(
+                ls_vec3_add(Vec3::default(), Vec3::default(), std::ptr::null_mut()),
+                Status::NullPointer
+            );
+        }
     }
 
     #[test]
@@ -1552,267 +2020,288 @@ mod tests {
     /// Full handle lifecycle through the C surface: 3x3 grid with a center wall.
     #[test]
     fn context_and_path_lifecycle() {
-        let cells = [1u8, 1, 1, 1, 0, 1, 1, 1, 1];
-        let mut ctx = std::ptr::null_mut();
-        assert_eq!(
-            ls_tile_context_create(3, 3, 1, cells.as_ptr(), cells.len(), &mut ctx),
-            Status::Ok
-        );
-        assert!(!ctx.is_null());
+        // SAFETY: every pointer passed below is a live local or a handle created in this test.
+        unsafe {
+            let cells = [1u8, 1, 1, 1, 0, 1, 1, 1, 1];
+            let mut ctx = std::ptr::null_mut();
+            assert_eq!(
+                ls_tile_context_create(3, 3, 1, cells.as_ptr(), cells.len(), &mut ctx),
+                Status::Ok
+            );
+            assert!(!ctx.is_null());
 
-        let mut path = std::ptr::null_mut();
-        assert_eq!(
-            ls_find_path(ctx, cell(0.0, 0.0), cell(2.0, 2.0), DEFAULT_OPTS, &mut path),
-            Status::Ok
-        );
-        assert_eq!(ls_path_len(path), 5);
-        assert_eq!(ls_path_cost(path), 4.0);
+            let mut path = std::ptr::null_mut();
+            assert_eq!(
+                ls_find_path(ctx, cell(0.0, 0.0), cell(2.0, 2.0), DEFAULT_OPTS, &mut path),
+                Status::Ok
+            );
+            assert_eq!(ls_path_len(path), 5);
+            assert_eq!(ls_path_cost(path), 4.0);
 
-        let mut buf = [0u32; 2];
-        let mut n = 0usize;
-        assert_eq!(
-            ls_path_nodes(path, buf.as_mut_ptr(), buf.len(), &mut n),
-            Status::BufferTooSmall
-        );
-        assert_eq!(n, 5);
+            let mut buf = [0u32; 2];
+            let mut n = 0usize;
+            assert_eq!(
+                ls_path_nodes(path, buf.as_mut_ptr(), buf.len(), &mut n),
+                Status::BufferTooSmall
+            );
+            assert_eq!(n, 5);
 
-        let mut buf = [0u32; 8];
-        assert_eq!(
-            ls_path_nodes(path, buf.as_mut_ptr(), buf.len(), &mut n),
-            Status::Ok
-        );
-        assert_eq!(&buf[..n], &[0, 1, 2, 5, 8]);
+            let mut buf = [0u32; 8];
+            assert_eq!(
+                ls_path_nodes(path, buf.as_mut_ptr(), buf.len(), &mut n),
+                Status::Ok
+            );
+            assert_eq!(&buf[..n], &[0, 1, 2, 5, 8]);
 
-        let mut links = [PathLink {
-            link_id: 0,
-            index: 0,
-            _reserved: 0,
-        }; 1];
-        assert_eq!(
-            ls_path_links(path, links.as_mut_ptr(), 1, &mut n),
-            Status::Ok
-        );
-        assert_eq!(n, 0);
+            let mut links = [PathLink {
+                link_id: 0,
+                index: 0,
+                _reserved: 0,
+            }; 1];
+            assert_eq!(
+                ls_path_links(path, links.as_mut_ptr(), 1, &mut n),
+                Status::Ok
+            );
+            assert_eq!(n, 0);
 
-        let mut pos = Vec3::default();
-        assert_eq!(ls_node_position(ctx, 8, &mut pos), Status::Ok);
-        assert_eq!(pos, cell(2.0, 2.0));
-        assert_eq!(ls_node_position(ctx, 9, &mut pos), Status::InvalidArgument);
+            let mut pos = Vec3::default();
+            assert_eq!(ls_node_position(ctx, 8, &mut pos), Status::Ok);
+            assert_eq!(pos, cell(2.0, 2.0));
+            assert_eq!(ls_node_position(ctx, 9, &mut pos), Status::InvalidArgument);
 
-        let (mut c, mut r, mut l) = (0, 0, 0);
-        assert_eq!(ls_node_coords(ctx, 7, &mut c, &mut r, &mut l), Status::Ok);
-        assert_eq!((c, r, l), (1, 2, 0));
-        let mut id = 0;
-        assert_eq!(ls_node_id(ctx, 1, 2, 0, &mut id), Status::Ok);
-        assert_eq!(id, 7);
-        assert_eq!(
-            ls_node_from_position(ctx, cell(1.0, 2.0), &mut id),
-            Status::Ok
-        );
-        assert_eq!(id, 7);
+            let (mut c, mut r, mut l) = (0, 0, 0);
+            assert_eq!(ls_node_coords(ctx, 7, &mut c, &mut r, &mut l), Status::Ok);
+            assert_eq!((c, r, l), (1, 2, 0));
+            let mut id = 0;
+            assert_eq!(ls_node_id(ctx, 1, 2, 0, &mut id), Status::Ok);
+            assert_eq!(id, 7);
+            assert_eq!(
+                ls_node_from_position(ctx, cell(1.0, 2.0), &mut id),
+                Status::Ok
+            );
+            assert_eq!(id, 7);
 
-        ls_path_free(path);
-        ls_context_destroy(ctx);
+            ls_path_free(path);
+            ls_context_destroy(ctx);
+        }
     }
 
     #[test]
     fn edges_overrides_and_links_through_the_abi() {
-        // 4x1, two layers, tier-2 masks: everything open on both layers.
-        let open = (1 << Dir::East as u8) | (1 << Dir::West as u8);
-        let masks = [open; 8];
-        // Ramp: leaving node 1 eastward lands on layer 1.
-        let ramp = TileEdgeOverride {
-            node: 1,
-            dir: Dir::East as u8,
-            target_layer: 1,
-            cost: 1.0,
-        };
-        let mut ctx = std::ptr::null_mut();
-        assert_eq!(
-            ls_tile_context_create_edges(4, 1, 2, masks.as_ptr(), masks.len(), &ramp, 1, &mut ctx),
-            Status::Ok
-        );
+        // SAFETY: every pointer passed below is a live local or a handle created in this test.
+        unsafe {
+            // 4x1, two layers, tier-2 masks: everything open on both layers.
+            let open = (1 << Dir::East as u8) | (1 << Dir::West as u8);
+            let masks = [open; 8];
+            // Ramp: leaving node 1 eastward lands on layer 1.
+            let ramp = TileEdgeOverride {
+                node: 1,
+                dir: Dir::East as u8,
+                target_layer: 1,
+                cost: 1.0,
+            };
+            let mut ctx = std::ptr::null_mut();
+            assert_eq!(
+                ls_tile_context_create_edges(
+                    4,
+                    1,
+                    2,
+                    masks.as_ptr(),
+                    masks.len(),
+                    &ramp,
+                    1,
+                    &mut ctx
+                ),
+                Status::Ok
+            );
 
-        let upper = |col: f32| Vec3::new(col + 0.5, 1.0, 0.5);
-        let mut path = std::ptr::null_mut();
-        assert_eq!(
-            ls_find_path(ctx, cell(0.0, 0.0), upper(3.0), DEFAULT_OPTS, &mut path),
-            Status::Ok
-        );
-        assert_eq!(ls_path_len(path), 4);
-        ls_path_free(path);
+            let upper = |col: f32| Vec3::new(col + 0.5, 1.0, 0.5);
+            let mut path = std::ptr::null_mut();
+            assert_eq!(
+                ls_find_path(ctx, cell(0.0, 0.0), upper(3.0), DEFAULT_OPTS, &mut path),
+                Status::Ok
+            );
+            assert_eq!(ls_path_len(path), 4);
+            ls_path_free(path);
 
-        // Close the ramp edge; the layers disconnect.
-        assert_eq!(ls_tile_set_edge(ctx, 1, Dir::East as u8, false), Status::Ok);
-        assert_eq!(
-            ls_find_path(ctx, cell(0.0, 0.0), upper(3.0), DEFAULT_OPTS, &mut path),
-            Status::NoPath
-        );
+            // Close the ramp edge; the layers disconnect.
+            assert_eq!(ls_tile_set_edge(ctx, 1, Dir::East as u8, false), Status::Ok);
+            assert_eq!(
+                ls_find_path(ctx, cell(0.0, 0.0), upper(3.0), DEFAULT_OPTS, &mut path),
+                Status::NoPath
+            );
 
-        // A teleporter link bridges them instead, starting disabled.
-        let link = LinkDesc {
-            id: 9001,
-            from: cell(0.0, 0.0),
-            to: upper(3.0),
-            cost: 2.0,
-            flags: LinkFlags::Bidirectional as u32 | LinkFlags::StartDisabled as u32,
-        };
-        assert_eq!(ls_link_add(ctx, link), Status::Ok);
-        assert_eq!(
-            ls_find_path(ctx, cell(0.0, 0.0), upper(3.0), DEFAULT_OPTS, &mut path),
-            Status::NoPath
-        );
-        assert_eq!(ls_link_set_enabled(ctx, 9001, true), Status::Ok);
-        assert_eq!(
-            ls_find_path(ctx, upper(3.0), cell(0.0, 0.0), DEFAULT_OPTS, &mut path),
-            Status::Ok
-        );
-        assert_eq!(ls_path_len(path), 2);
-        let mut links = [PathLink {
-            link_id: 0,
-            index: 0,
-            _reserved: 0,
-        }; 2];
-        let mut n = 0;
-        assert_eq!(
-            ls_path_links(path, links.as_mut_ptr(), 2, &mut n),
-            Status::Ok
-        );
-        assert_eq!(n, 1);
-        assert_eq!((links[0].link_id, links[0].index), (9001, 1));
-        let mut segs = [PathSegment {
-            kind: 0,
-            dir: 0,
-            count: 0,
-            _reserved: 0,
-            link_id: 0,
-        }; 4];
-        assert_eq!(
-            ls_path_segments(ctx, path, segs.as_mut_ptr(), 4, &mut n),
-            Status::Ok
-        );
-        assert_eq!(n, 1);
-        assert_eq!(
-            segs[0],
-            PathSegment {
-                kind: 1,
+            // A teleporter link bridges them instead, starting disabled.
+            let link = LinkDesc {
+                id: 9001,
+                from: cell(0.0, 0.0),
+                to: upper(3.0),
+                cost: 2.0,
+                flags: LinkFlags::Bidirectional as u32 | LinkFlags::StartDisabled as u32,
+            };
+            assert_eq!(ls_link_add(ctx, link), Status::Ok);
+            assert_eq!(
+                ls_find_path(ctx, cell(0.0, 0.0), upper(3.0), DEFAULT_OPTS, &mut path),
+                Status::NoPath
+            );
+            assert_eq!(ls_link_set_enabled(ctx, 9001, true), Status::Ok);
+            assert_eq!(
+                ls_find_path(ctx, upper(3.0), cell(0.0, 0.0), DEFAULT_OPTS, &mut path),
+                Status::Ok
+            );
+            assert_eq!(ls_path_len(path), 2);
+            let mut links = [PathLink {
+                link_id: 0,
+                index: 0,
+                _reserved: 0,
+            }; 2];
+            let mut n = 0;
+            assert_eq!(
+                ls_path_links(path, links.as_mut_ptr(), 2, &mut n),
+                Status::Ok
+            );
+            assert_eq!(n, 1);
+            assert_eq!((links[0].link_id, links[0].index), (9001, 1));
+            let mut segs = [PathSegment {
+                kind: 0,
                 dir: 0,
                 count: 0,
                 _reserved: 0,
-                link_id: 9001
-            }
-        );
-        ls_path_free(path);
+                link_id: 0,
+            }; 4];
+            assert_eq!(
+                ls_path_segments(ctx, path, segs.as_mut_ptr(), 4, &mut n),
+                Status::Ok
+            );
+            assert_eq!(n, 1);
+            assert_eq!(
+                segs[0],
+                PathSegment {
+                    kind: 1,
+                    dir: 0,
+                    count: 0,
+                    _reserved: 0,
+                    link_id: 9001
+                }
+            );
+            ls_path_free(path);
 
-        assert_eq!(ls_link_remove(ctx, 9001), Status::Ok);
-        assert_eq!(ls_link_remove(ctx, 9001), Status::InvalidArgument);
-        assert_eq!(
-            ls_tile_set_edge(ctx, 0, 7, true),
-            Status::InvalidArgument,
-            "bad dir"
-        );
-        assert_eq!(
-            ls_tile_set_edge_override(ctx, 0, 2, 9, 1.0),
-            Status::InvalidArgument,
-            "bad layer"
-        );
-        ls_context_destroy(ctx);
+            assert_eq!(ls_link_remove(ctx, 9001), Status::Ok);
+            assert_eq!(ls_link_remove(ctx, 9001), Status::InvalidArgument);
+            assert_eq!(
+                ls_tile_set_edge(ctx, 0, 7, true),
+                Status::InvalidArgument,
+                "bad dir"
+            );
+            assert_eq!(
+                ls_tile_set_edge_override(ctx, 0, 2, 9, 1.0),
+                Status::InvalidArgument,
+                "bad layer"
+            );
+            ls_context_destroy(ctx);
+        }
     }
 
     #[test]
     fn unreachable_reports_no_path_with_null_handle() {
-        let cells = [1u8, 0, 1];
-        let mut ctx = std::ptr::null_mut();
-        assert_eq!(
-            ls_tile_context_create(3, 1, 1, cells.as_ptr(), cells.len(), &mut ctx),
-            Status::Ok
-        );
-        let mut path: *mut Path = std::ptr::dangling_mut();
-        assert_eq!(
-            ls_find_path(ctx, cell(0.0, 0.0), cell(2.0, 0.0), DEFAULT_OPTS, &mut path),
-            Status::NoPath
-        );
-        assert!(path.is_null());
-        ls_context_destroy(ctx);
+        // SAFETY: every pointer passed below is a live local or a handle created in this test.
+        unsafe {
+            let cells = [1u8, 0, 1];
+            let mut ctx = std::ptr::null_mut();
+            assert_eq!(
+                ls_tile_context_create(3, 1, 1, cells.as_ptr(), cells.len(), &mut ctx),
+                Status::Ok
+            );
+            let mut path: *mut Path = std::ptr::dangling_mut();
+            assert_eq!(
+                ls_find_path(ctx, cell(0.0, 0.0), cell(2.0, 0.0), DEFAULT_OPTS, &mut path),
+                Status::NoPath
+            );
+            assert!(path.is_null());
+            ls_context_destroy(ctx);
+        }
     }
 
     #[test]
     fn groups_goal_modes_and_reachability_through_the_abi() {
-        const NPC: u32 = 1;
-        // 5x3 open corridor; NPC at (2,1).
-        let mut ctx = std::ptr::null_mut();
-        assert_eq!(
-            ls_tile_context_create(5, 3, 1, [1u8; 15].as_ptr(), 15, &mut ctx),
-            Status::Ok
-        );
-        let npc = 7;
-        assert_eq!(ls_node_add_groups(ctx, npc, NPC), Status::Ok);
-        let mut mask = 0;
-        assert_eq!(ls_node_get_groups(ctx, npc, &mut mask), Status::Ok);
-        assert_eq!(mask, NPC);
-        assert_eq!(
-            ls_node_get_groups(ctx, 99, &mut mask),
-            Status::InvalidArgument
-        );
+        // SAFETY: every pointer passed below is a live local or a handle created in this test.
+        unsafe {
+            const NPC: u32 = 1;
+            // 5x3 open corridor; NPC at (2,1).
+            let mut ctx = std::ptr::null_mut();
+            assert_eq!(
+                ls_tile_context_create(5, 3, 1, [1u8; 15].as_ptr(), 15, &mut ctx),
+                Status::Ok
+            );
+            let npc = 7;
+            assert_eq!(ls_node_add_groups(ctx, npc, NPC), Status::Ok);
+            let mut mask = 0;
+            assert_eq!(ls_node_get_groups(ctx, npc, &mut mask), Status::Ok);
+            assert_eq!(mask, NPC);
+            assert_eq!(
+                ls_node_get_groups(ctx, 99, &mut mask),
+                Status::InvalidArgument
+            );
 
-        let blocked = PathOptions {
-            blocked_mask: NPC,
-            snap_radius: 0,
-            goal_mode: 0,
-            profile: 0,
-        };
-        let mut path = std::ptr::null_mut();
-        assert_eq!(
-            ls_find_path(ctx, cell(0.0, 1.0), cell(4.0, 1.0), blocked, &mut path),
-            Status::Ok
-        );
-        assert_eq!(ls_path_len(path), 7, "detours around the NPC");
-        ls_path_free(path);
+            let blocked = PathOptions {
+                blocked_mask: NPC,
+                snap_radius: 0,
+                goal_mode: 0,
+                profile: 0,
+            };
+            let mut path = std::ptr::null_mut();
+            assert_eq!(
+                ls_find_path(ctx, cell(0.0, 1.0), cell(4.0, 1.0), blocked, &mut path),
+                Status::Ok
+            );
+            assert_eq!(ls_path_len(path), 7, "detours around the NPC");
+            ls_path_free(path);
 
-        let adjacent = PathOptions {
-            blocked_mask: NPC,
-            snap_radius: 0,
-            goal_mode: 1,
-            profile: 0,
-        };
-        assert_eq!(
-            ls_find_path_to_nodes(ctx, cell(0.0, 1.0), &npc, 1, adjacent, &mut path),
-            Status::Ok
-        );
-        assert_eq!(
-            ls_path_len(path),
-            2,
-            "stops next to the NPC: (0,1) -> (1,1)"
-        );
-        ls_path_free(path);
-        assert_eq!(
-            ls_find_path_to_nodes(ctx, cell(0.0, 1.0), &99, 1, adjacent, &mut path),
-            Status::InvalidArgument
-        );
-        let bad_mode = PathOptions {
-            blocked_mask: 0,
-            snap_radius: 0,
-            goal_mode: 7,
-            profile: 0,
-        };
-        assert_eq!(
-            ls_find_path(ctx, cell(0.0, 1.0), cell(4.0, 1.0), bad_mode, &mut path),
-            Status::InvalidArgument
-        );
+            let adjacent = PathOptions {
+                blocked_mask: NPC,
+                snap_radius: 0,
+                goal_mode: 1,
+                profile: 0,
+            };
+            assert_eq!(
+                ls_find_path_to_nodes(ctx, cell(0.0, 1.0), &npc, 1, adjacent, &mut path),
+                Status::Ok
+            );
+            assert_eq!(
+                ls_path_len(path),
+                2,
+                "stops next to the NPC: (0,1) -> (1,1)"
+            );
+            ls_path_free(path);
+            assert_eq!(
+                ls_find_path_to_nodes(ctx, cell(0.0, 1.0), &99, 1, adjacent, &mut path),
+                Status::InvalidArgument
+            );
+            let bad_mode = PathOptions {
+                blocked_mask: 0,
+                snap_radius: 0,
+                goal_mode: 7,
+                profile: 0,
+            };
+            assert_eq!(
+                ls_find_path(ctx, cell(0.0, 1.0), cell(4.0, 1.0), bad_mode, &mut path),
+                Status::InvalidArgument
+            );
 
-        let mut reach = [0u8; 15];
-        let mut n = 0;
-        assert_eq!(
-            ls_reachable_nodes(ctx, cell(0.0, 0.0), blocked, reach.as_mut_ptr(), 15, &mut n),
-            Status::Ok
-        );
-        assert_eq!(n, 15);
-        assert_eq!(reach[npc as usize], 0);
-        assert_eq!(reach[14], 1, "corridor around the NPC is open");
-        assert_eq!(ls_groups_clear(ctx, NPC), Status::Ok);
-        assert_eq!(ls_node_get_groups(ctx, npc, &mut mask), Status::Ok);
-        assert_eq!(mask, 0);
-        ls_context_destroy(ctx);
+            let mut reach = [0u8; 15];
+            let mut n = 0;
+            assert_eq!(
+                ls_reachable_nodes(ctx, cell(0.0, 0.0), blocked, reach.as_mut_ptr(), 15, &mut n),
+                Status::Ok
+            );
+            assert_eq!(n, 15);
+            assert_eq!(reach[npc as usize], 0);
+            assert_eq!(reach[14], 1, "corridor around the NPC is open");
+            assert_eq!(ls_groups_clear(ctx, NPC), Status::Ok);
+            assert_eq!(ls_node_get_groups(ctx, npc, &mut mask), Status::Ok);
+            assert_eq!(mask, 0);
+            ls_context_destroy(ctx);
+        }
     }
 
     fn tile_rect(col: u32, row: u32, w: u32, h: u32) -> BoundsDesc {
@@ -1830,7 +2319,7 @@ mod tests {
         EntityDesc {
             id,
             category: 1,
-            _reserved: 0,
+            group: 0,
             blocking,
             flags,
             sort_key: 0,
@@ -1839,342 +2328,507 @@ mod tests {
     }
 
     #[test]
+    fn a_context_without_a_map_through_the_abi() {
+        // SAFETY: every pointer passed below is a live local or a handle created in this test.
+        unsafe {
+            let mut ctx = std::ptr::null_mut();
+            assert_eq!(ls_context_create(&mut ctx), Status::Ok);
+            assert!(!ctx.is_null());
+            assert_eq!(ls_context_create(std::ptr::null_mut()), Status::NullPointer);
+
+            // Negative world coordinates are fine: there is no grid to fall off.
+            let point = |x: f32, z: f32| BoundsDesc {
+                kind: BoundsKind::Point as u32,
+                layer: 0,
+                ref_id: 0,
+                _reserved: 0,
+                a: Vec3::new(x, 0.0, z),
+                b: Vec3::default(),
+            };
+            let mut far = entity(1, point(-20.0, -10.0), 1, 0);
+            far.category = 2;
+            let near = entity(2, point(-12.0, -10.0), 0, 0);
+            assert_eq!(
+                ls_entities_sync(ctx, [far, near].as_ptr(), 2, std::ptr::null_mut()),
+                Status::Ok
+            );
+            assert_eq!(ls_entity_count(ctx), 2);
+            assert_eq!(ls_player_set(ctx, Vec3::new(-10.0, 0.0, -10.0)), Status::Ok);
+
+            let mut v = EntityVector {
+                nearest_point: Vec3::default(),
+                bearing_deg: 0.0,
+                elevation_deg: 0.0,
+                distance: 0.0,
+                steps: 0.0,
+            };
+            assert_eq!(ls_entity_vector(ctx, 1, &mut v), Status::Ok);
+            assert_eq!((v.distance, v.bearing_deg), (10.0, 270.0), "due west");
+            let mut nodes = [0u32; 4];
+            let mut n = 99;
+            assert_eq!(
+                ls_entity_nodes(ctx, 1, nodes.as_mut_ptr(), 4, &mut n),
+                Status::Ok
+            );
+            assert_eq!(n, 0, "nothing to project into");
+
+            // Distance order, then a jump to one category and back.
+            let mut t = 0;
+            assert_eq!(
+                ls_tracker_create(ctx, std::ptr::null(), 0, true, &mut t),
+                Status::Ok
+            );
+            assert_eq!(
+                ls_tracker_set_order(ctx, t, TrackerOrder::Distance as u32),
+                Status::Ok
+            );
+            assert_eq!(ls_tracker_set_order(ctx, t, 9), Status::InvalidArgument);
+            let mut sel = Selection {
+                entity_id: 0,
+                category: 0,
+                index: 0,
+            };
+            assert_eq!(
+                ls_tracker_act(ctx, t, TrackerAction::Next as u32, &mut sel),
+                Status::Ok
+            );
+            assert_eq!(sel.entity_id, 2, "nearest first, whatever the category");
+            assert_eq!(ls_tracker_set_category(ctx, t, 2), Status::Ok);
+            assert_eq!(
+                ls_tracker_act(ctx, t, TrackerAction::Next as u32, &mut sel),
+                Status::Ok
+            );
+            assert_eq!((sel.entity_id, sel.category), (1, 2));
+            assert_eq!(ls_tracker_set_category(ctx, t, u32::MAX), Status::Ok);
+            assert_eq!(
+                ls_tracker_act(ctx, t, TrackerAction::Current as u32, &mut sel),
+                Status::Ok
+            );
+            assert_eq!(
+                (sel.entity_id, sel.category),
+                (0, u32::MAX),
+                "ALL, nothing selected"
+            );
+            assert_eq!(
+                ls_tracker_set_category(ctx, t, 70_000),
+                Status::InvalidArgument
+            );
+            assert_eq!(ls_tracker_set_category(ctx, 5, 1), Status::InvalidArgument);
+
+            // Group browsing: both in group 3, so one group of two, nearest first.
+            far.group = 3;
+            let mut near = near;
+            near.group = 3;
+            assert_eq!(
+                ls_entities_sync(ctx, [far, near].as_ptr(), 2, std::ptr::null_mut()),
+                Status::Ok
+            );
+            let mut group = 0;
+            assert_eq!(ls_tracker_group_count(ctx, t, &mut group), Status::Ok);
+            assert_eq!(group, 0, "nothing selected");
+            assert_eq!(
+                ls_tracker_act(ctx, t, TrackerAction::GroupNext as u32, &mut sel),
+                Status::Ok
+            );
+            assert_eq!((sel.entity_id, sel.index), (2, 0));
+            assert_eq!(ls_tracker_group_count(ctx, t, &mut group), Status::Ok);
+            assert_eq!(group, 2);
+            assert_eq!(
+                ls_tracker_act(ctx, t, TrackerAction::InGroupNext as u32, &mut sel),
+                Status::Ok
+            );
+            assert_eq!((sel.entity_id, sel.index), (1, 1));
+            assert_eq!(ls_tracker_act(ctx, t, 9, &mut sel), Status::InvalidArgument);
+            assert_eq!(
+                ls_tracker_group_count(ctx, 7, &mut group),
+                Status::InvalidArgument
+            );
+
+            // Every map call reports NotSupported rather than pretending.
+            let mut id = 0;
+            let mut mask = 0;
+            let mut reachable = false;
+            let opts = PathOptions {
+                blocked_mask: 0,
+                snap_radius: 0,
+                goal_mode: 0,
+                profile: 0,
+            };
+            let mut path = std::ptr::null_mut();
+            assert_eq!(ls_node_id(ctx, 0, 0, 0, &mut id), Status::NotSupported);
+            assert_eq!(
+                ls_node_from_position(ctx, Vec3::default(), &mut id),
+                Status::NotSupported
+            );
+            assert_eq!(ls_node_get_groups(ctx, 0, &mut mask), Status::NotSupported);
+            assert_eq!(ls_node_add_groups(ctx, 0, 1), Status::NotSupported);
+            assert_eq!(ls_groups_clear(ctx, 1), Status::NotSupported);
+            assert_eq!(ls_tile_set_edge(ctx, 0, 0, true), Status::NotSupported);
+            assert_eq!(
+                ls_find_path(ctx, Vec3::default(), Vec3::default(), opts, &mut path),
+                Status::NotSupported
+            );
+            assert_eq!(
+                ls_find_path_to_entity(ctx, Vec3::default(), 1, opts, &mut path),
+                Status::NotSupported
+            );
+            assert_eq!(
+                ls_entity_reachable_from_player(ctx, 1, 0, 0, &mut reachable),
+                Status::NotSupported
+            );
+            ls_context_destroy(ctx);
+        }
+    }
+
+    #[test]
     fn entities_through_the_abi() {
-        const NPC: u32 = 1;
-        let mut ctx = std::ptr::null_mut();
-        assert_eq!(
-            ls_tile_context_create(5, 3, 1, [1u8; 15].as_ptr(), 15, &mut ctx),
-            Status::Ok
-        );
+        // SAFETY: every pointer passed below is a live local or a handle created in this test.
+        unsafe {
+            const NPC: u32 = 1;
+            let mut ctx = std::ptr::null_mut();
+            assert_eq!(
+                ls_tile_context_create(5, 3, 1, [1u8; 15].as_ptr(), 15, &mut ctx),
+                Status::Ok
+            );
 
-        let npc = entity(
-            10,
-            tile_rect(2, 1, 1, 1),
-            NPC,
-            EntityFlags::PathfindAdjacent as u32,
-        );
-        let chest = entity(20, tile_rect(4, 2, 1, 1), 0, 0);
-        let snapshot = [npc, chest];
-        let mut stats = SyncStats::default();
-        assert_eq!(
-            ls_entities_sync(ctx, snapshot.as_ptr(), 2, &mut stats),
-            Status::Ok
-        );
-        assert_eq!(
-            stats,
-            SyncStats {
-                added: 2,
-                updated: 0,
-                removed: 0,
-                _reserved: 0
-            }
-        );
-        assert_eq!(ls_entity_count(ctx), 2);
-
-        let mut mask = 0;
-        assert_eq!(ls_node_get_groups(ctx, 7, &mut mask), Status::Ok);
-        assert_eq!(mask, NPC, "projection populated the blocking overlay");
-
-        let mut nodes = [0u32; 4];
-        let mut n = 0;
-        assert_eq!(
-            ls_entity_nodes(ctx, 10, nodes.as_mut_ptr(), 4, &mut n),
-            Status::Ok
-        );
-        assert_eq!(&nodes[..n], &[7]);
-        assert_eq!(
-            ls_entity_nodes(ctx, 99, nodes.as_mut_ptr(), 4, &mut n),
-            Status::InvalidArgument
-        );
-
-        let opts = PathOptions {
-            blocked_mask: NPC,
-            snap_radius: 0,
-            goal_mode: 0,
-            profile: 0,
-        };
-        let mut path = std::ptr::null_mut();
-        assert_eq!(
-            ls_find_path_to_entity(ctx, cell(0.0, 1.0), 10, opts, &mut path),
-            Status::Ok
-        );
-        assert_eq!(ls_path_len(path), 2, "adjacent flag: stops next to the NPC");
-        ls_path_free(path);
-        assert_eq!(
-            ls_find_path_to_entity(ctx, cell(0.0, 1.0), 99, opts, &mut path),
-            Status::InvalidArgument
-        );
-
-        let mut reachable = false;
-        assert_eq!(
-            ls_entity_reachable(ctx, cell(0.0, 1.0), 20, opts, &mut reachable),
-            Status::Ok
-        );
-        assert!(reachable);
-
-        let mut p = Vec3::default();
-        assert_eq!(
-            ls_entity_nearest_point(ctx, 20, cell(0.0, 0.0), &mut p),
-            Status::Ok
-        );
-        assert_eq!(p, Vec3::new(4.0, 0.0, 2.0));
-
-        // Moving the NPC by upsert frees the old cell; removing the chest shrinks the registry.
-        let moved = entity(
-            10,
-            tile_rect(2, 0, 1, 1),
-            NPC,
-            EntityFlags::PathfindAdjacent as u32,
-        );
-        assert_eq!(ls_entity_upsert(ctx, &moved), Status::Ok);
-        assert_eq!(ls_node_get_groups(ctx, 7, &mut mask), Status::Ok);
-        assert_eq!(mask, 0);
-        assert_eq!(ls_entity_remove(ctx, 20), Status::Ok);
-        assert_eq!(ls_entity_remove(ctx, 20), Status::InvalidArgument);
-        assert_eq!(ls_entity_count(ctx), 1);
-
-        let bad = entity(
-            30,
-            BoundsDesc {
-                kind: 9,
-                ..tile_rect(0, 0, 1, 1)
-            },
-            0,
-            0,
-        );
-        assert_eq!(ls_entity_upsert(ctx, &bad), Status::InvalidArgument);
-        assert_eq!(
-            ls_entities_sync(ctx, std::ptr::null(), 0, std::ptr::null_mut()),
-            Status::Ok,
-            "empty snapshot clears"
-        );
-        assert_eq!(ls_entity_count(ctx), 0);
-        ls_context_destroy(ctx);
-    }
-
-    #[test]
-    fn profiles_through_the_abi() {
-        // 4x3 open grid with a wall at (1,1).
-        let mut w = [1u8; 12];
-        w[5] = 0;
-        let mut ctx = std::ptr::null_mut();
-        assert_eq!(
-            ls_tile_context_create(4, 3, 1, w.as_ptr(), 12, &mut ctx),
-            Status::Ok
-        );
-
-        let mut clearance = 0;
-        assert_eq!(ls_node_clearance(ctx, 2, &mut clearance), Status::Ok);
-        assert_eq!(clearance, 2);
-        assert_eq!(ls_node_clearance(ctx, 5, &mut clearance), Status::Ok);
-        assert_eq!(clearance, 0);
-        assert_eq!(
-            ls_node_clearance(ctx, 99, &mut clearance),
-            Status::InvalidArgument
-        );
-
-        let mut big = 0;
-        let desc = ProfileDesc {
-            footprint: 2,
-            radius: 1.0,
-            height: 2.0,
-            step_height: 0.5,
-        };
-        assert_eq!(ls_profile_register(ctx, desc, &mut big), Status::Ok);
-        assert_eq!(big, 1);
-        assert_eq!(
-            ls_profile_register(
-                ctx,
-                ProfileDesc {
-                    footprint: 0,
-                    ..desc
-                },
-                &mut big
-            ),
-            Status::InvalidArgument
-        );
-
-        let wide = PathOptions {
-            blocked_mask: 0,
-            snap_radius: 0,
-            goal_mode: 0,
-            profile: 1,
-        };
-        let mut path = std::ptr::null_mut();
-        assert_eq!(
-            ls_find_path(ctx, cell(0.0, 0.0), cell(2.0, 1.0), wide, &mut path),
-            Status::NoPath
-        );
-        assert_eq!(
-            ls_find_path(ctx, cell(2.0, 0.0), cell(2.0, 1.0), wide, &mut path),
-            Status::Ok
-        );
-        assert_eq!(ls_path_len(path), 2);
-        ls_path_free(path);
-        let unknown = PathOptions { profile: 7, ..wide };
-        assert_eq!(
-            ls_find_path(ctx, cell(2.0, 0.0), cell(2.0, 1.0), unknown, &mut path),
-            Status::NoPath
-        );
-        ls_context_destroy(ctx);
-    }
-
-    #[test]
-    fn trackers_through_the_abi() {
-        const NPC: u32 = 1;
-        // 5x3 corridor: NPC at (2,1), chest at (4,2), hidden chest at (1,2).
-        let mut ctx = std::ptr::null_mut();
-        assert_eq!(
-            ls_tile_context_create(5, 3, 1, [1u8; 15].as_ptr(), 15, &mut ctx),
-            Status::Ok
-        );
-        let mut hidden = entity(31, tile_rect(1, 2, 1, 1), 0, EntityFlags::Hidden as u32);
-        hidden.category = 3;
-        let mut chest = entity(30, tile_rect(4, 2, 1, 1), 0, 0);
-        chest.category = 3;
-        let snapshot = [
-            entity(
+            let npc = entity(
                 10,
                 tile_rect(2, 1, 1, 1),
                 NPC,
                 EntityFlags::PathfindAdjacent as u32,
-            ),
-            chest,
-            hidden,
-        ];
-        assert_eq!(
-            ls_entities_sync(ctx, snapshot.as_ptr(), 3, std::ptr::null_mut()),
-            Status::Ok
-        );
-        assert_eq!(ls_player_set(ctx, cell(0.0, 1.0)), Status::Ok);
+            );
+            let chest = entity(20, tile_rect(4, 2, 1, 1), 0, 0);
+            let snapshot = [npc, chest];
+            let mut stats = SyncStats::default();
+            assert_eq!(
+                ls_entities_sync(ctx, snapshot.as_ptr(), 2, &mut stats),
+                Status::Ok
+            );
+            assert_eq!(
+                stats,
+                SyncStats {
+                    added: 2,
+                    updated: 0,
+                    removed: 0,
+                    _reserved: 0
+                }
+            );
+            assert_eq!(ls_entity_count(ctx), 2);
 
-        let no_hidden = FilterDesc {
-            kind: 3,
-            enabled: 1,
-            p0: 0,
-            p1: EntityFlags::Hidden as u32,
-            mask: 0,
-            value: 0.0,
-            _reserved: 0,
-        };
-        let reachable = FilterDesc {
-            kind: 0,
-            enabled: 0,
-            p0: 0,
-            p1: NPC,
-            mask: 0,
-            value: 0.0,
-            _reserved: 0,
-        };
-        let filters = [no_hidden, reachable];
-        let mut t = 0;
-        assert_eq!(
-            ls_tracker_create(ctx, filters.as_ptr(), 2, true, &mut t),
-            Status::Ok
-        );
+            let mut mask = 0;
+            assert_eq!(ls_node_get_groups(ctx, 7, &mut mask), Status::Ok);
+            assert_eq!(mask, NPC, "projection populated the blocking overlay");
 
-        let mut sel = Selection {
-            entity_id: 0,
-            category: 0,
-            index: 0,
-        };
-        assert_eq!(
-            ls_tracker_act(ctx, t, TrackerAction::Next as u32, &mut sel),
-            Status::Ok
-        );
-        assert_eq!(
-            sel,
-            Selection {
-                entity_id: 10,
-                category: 1,
-                index: 0
-            }
-        );
-        assert_eq!(
-            ls_tracker_act(ctx, t, TrackerAction::Next as u32, &mut sel),
-            Status::Ok
-        );
-        assert_eq!(sel.entity_id, 30, "hidden chest 31 is filtered out");
-        let mut n = 0;
-        assert_eq!(ls_tracker_count(ctx, t, u32::MAX, &mut n), Status::Ok);
-        assert_eq!(n, 2);
-        assert_eq!(ls_tracker_count(ctx, t, 3, &mut n), Status::Ok);
-        assert_eq!(n, 1);
+            let mut nodes = [0u32; 4];
+            let mut n = 0;
+            assert_eq!(
+                ls_entity_nodes(ctx, 10, nodes.as_mut_ptr(), 4, &mut n),
+                Status::Ok
+            );
+            assert_eq!(&nodes[..n], &[7]);
+            assert_eq!(
+                ls_entity_nodes(ctx, 99, nodes.as_mut_ptr(), 4, &mut n),
+                Status::InvalidArgument
+            );
 
-        let mut v = EntityVector {
-            nearest_point: Vec3::default(),
-            bearing_deg: 0.0,
-            elevation_deg: 0.0,
-            distance: 0.0,
-            steps: 0.0,
-        };
-        assert_eq!(ls_entity_vector(ctx, 30, &mut v), Status::Ok);
-        assert_eq!(v.nearest_point, Vec3::new(4.0, 0.0, 2.0));
-        assert!(
-            v.bearing_deg > 90.0 && v.bearing_deg < 180.0,
-            "south-east, got {}",
-            v.bearing_deg
-        );
-        assert_eq!(v.steps, 4.0);
+            let opts = PathOptions {
+                blocked_mask: NPC,
+                snap_radius: 0,
+                goal_mode: 0,
+                profile: 0,
+            };
+            let mut path = std::ptr::null_mut();
+            assert_eq!(
+                ls_find_path_to_entity(ctx, cell(0.0, 1.0), 10, opts, &mut path),
+                Status::Ok
+            );
+            assert_eq!(ls_path_len(path), 2, "adjacent flag: stops next to the NPC");
+            ls_path_free(path);
+            assert_eq!(
+                ls_find_path_to_entity(ctx, cell(0.0, 1.0), 99, opts, &mut path),
+                Status::InvalidArgument
+            );
 
-        let mut r = false;
-        assert_eq!(
-            ls_entity_reachable_from_player(ctx, 30, 0, NPC, &mut r),
-            Status::Ok
-        );
-        assert!(r);
-        assert_eq!(
-            ls_entity_reachable_from_player(ctx, 30, 9, NPC, &mut r),
-            Status::InvalidArgument,
-            "unknown profile"
-        );
+            let mut reachable = false;
+            assert_eq!(
+                ls_entity_reachable(ctx, cell(0.0, 1.0), 20, opts, &mut reachable),
+                Status::Ok
+            );
+            assert!(reachable);
 
-        assert_eq!(
-            ls_tracker_act(ctx, t, TrackerAction::CategoryNext as u32, &mut sel),
-            Status::Ok
-        );
-        assert_eq!(
-            sel,
-            Selection {
+            let mut p = Vec3::default();
+            assert_eq!(
+                ls_entity_nearest_point(ctx, 20, cell(0.0, 0.0), &mut p),
+                Status::Ok
+            );
+            assert_eq!(p, Vec3::new(4.0, 0.0, 2.0));
+
+            // Moving the NPC by upsert frees the old cell; removing the chest shrinks the registry.
+            let moved = entity(
+                10,
+                tile_rect(2, 0, 1, 1),
+                NPC,
+                EntityFlags::PathfindAdjacent as u32,
+            );
+            assert_eq!(ls_entity_upsert(ctx, &moved), Status::Ok);
+            assert_eq!(ls_node_get_groups(ctx, 7, &mut mask), Status::Ok);
+            assert_eq!(mask, 0);
+            assert_eq!(ls_entity_remove(ctx, 20), Status::Ok);
+            assert_eq!(ls_entity_remove(ctx, 20), Status::InvalidArgument);
+            assert_eq!(ls_entity_count(ctx), 1);
+
+            let bad = entity(
+                30,
+                BoundsDesc {
+                    kind: 9,
+                    ..tile_rect(0, 0, 1, 1)
+                },
+                0,
+                0,
+            );
+            assert_eq!(ls_entity_upsert(ctx, &bad), Status::InvalidArgument);
+            assert_eq!(
+                ls_entities_sync(ctx, std::ptr::null(), 0, std::ptr::null_mut()),
+                Status::Ok,
+                "empty snapshot clears"
+            );
+            assert_eq!(ls_entity_count(ctx), 0);
+            ls_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn profiles_through_the_abi() {
+        // SAFETY: every pointer passed below is a live local or a handle created in this test.
+        unsafe {
+            // 4x3 open grid with a wall at (1,1).
+            let mut w = [1u8; 12];
+            w[5] = 0;
+            let mut ctx = std::ptr::null_mut();
+            assert_eq!(
+                ls_tile_context_create(4, 3, 1, w.as_ptr(), 12, &mut ctx),
+                Status::Ok
+            );
+
+            let mut clearance = 0;
+            assert_eq!(ls_node_clearance(ctx, 2, &mut clearance), Status::Ok);
+            assert_eq!(clearance, 2);
+            assert_eq!(ls_node_clearance(ctx, 5, &mut clearance), Status::Ok);
+            assert_eq!(clearance, 0);
+            assert_eq!(
+                ls_node_clearance(ctx, 99, &mut clearance),
+                Status::InvalidArgument
+            );
+
+            let mut big = 0;
+            let desc = ProfileDesc {
+                footprint: 2,
+                radius: 1.0,
+                height: 2.0,
+                step_height: 0.5,
+            };
+            assert_eq!(ls_profile_register(ctx, desc, &mut big), Status::Ok);
+            assert_eq!(big, 1);
+            assert_eq!(
+                ls_profile_register(
+                    ctx,
+                    ProfileDesc {
+                        footprint: 0,
+                        ..desc
+                    },
+                    &mut big
+                ),
+                Status::InvalidArgument
+            );
+
+            let wide = PathOptions {
+                blocked_mask: 0,
+                snap_radius: 0,
+                goal_mode: 0,
+                profile: 1,
+            };
+            let mut path = std::ptr::null_mut();
+            assert_eq!(
+                ls_find_path(ctx, cell(0.0, 0.0), cell(2.0, 1.0), wide, &mut path),
+                Status::NoPath
+            );
+            assert_eq!(
+                ls_find_path(ctx, cell(2.0, 0.0), cell(2.0, 1.0), wide, &mut path),
+                Status::Ok
+            );
+            assert_eq!(ls_path_len(path), 2);
+            ls_path_free(path);
+            let unknown = PathOptions { profile: 7, ..wide };
+            assert_eq!(
+                ls_find_path(ctx, cell(2.0, 0.0), cell(2.0, 1.0), unknown, &mut path),
+                Status::NoPath
+            );
+            ls_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn trackers_through_the_abi() {
+        // SAFETY: every pointer passed below is a live local or a handle created in this test.
+        unsafe {
+            const NPC: u32 = 1;
+            // 5x3 corridor: NPC at (2,1), chest at (4,2), hidden chest at (1,2).
+            let mut ctx = std::ptr::null_mut();
+            assert_eq!(
+                ls_tile_context_create(5, 3, 1, [1u8; 15].as_ptr(), 15, &mut ctx),
+                Status::Ok
+            );
+            let mut hidden = entity(31, tile_rect(1, 2, 1, 1), 0, EntityFlags::Hidden as u32);
+            hidden.category = 3;
+            let mut chest = entity(30, tile_rect(4, 2, 1, 1), 0, 0);
+            chest.category = 3;
+            let snapshot = [
+                entity(
+                    10,
+                    tile_rect(2, 1, 1, 1),
+                    NPC,
+                    EntityFlags::PathfindAdjacent as u32,
+                ),
+                chest,
+                hidden,
+            ];
+            assert_eq!(
+                ls_entities_sync(ctx, snapshot.as_ptr(), 3, std::ptr::null_mut()),
+                Status::Ok
+            );
+            assert_eq!(ls_player_set(ctx, cell(0.0, 1.0)), Status::Ok);
+
+            let no_hidden = FilterDesc {
+                kind: 3,
+                enabled: 1,
+                p0: 0,
+                p1: EntityFlags::Hidden as u32,
+                mask: 0,
+                value: 0.0,
+                _reserved: 0,
+            };
+            let reachable = FilterDesc {
+                kind: 0,
+                enabled: 0,
+                p0: 0,
+                p1: NPC,
+                mask: 0,
+                value: 0.0,
+                _reserved: 0,
+            };
+            let filters = [no_hidden, reachable];
+            let mut t = 0;
+            assert_eq!(
+                ls_tracker_create(ctx, filters.as_ptr(), 2, true, &mut t),
+                Status::Ok
+            );
+
+            let mut sel = Selection {
                 entity_id: 0,
-                category: 1,
-                index: 0
-            }
-        );
-        assert_eq!(ls_tracker_set_filter_enabled(ctx, t, 1, true), Status::Ok);
-        assert_eq!(
-            ls_tracker_set_filter_enabled(ctx, t, 5, true),
-            Status::InvalidArgument
-        );
-        assert_eq!(ls_tracker_act(ctx, t, 9, &mut sel), Status::InvalidArgument);
-        assert_eq!(
-            ls_tracker_set_filters(ctx, t, std::ptr::null(), 0),
-            Status::Ok
-        );
-        assert_eq!(ls_tracker_count(ctx, t, u32::MAX, &mut n), Status::Ok);
-        assert_eq!(n, 3, "no filters: hidden chest visible again");
-        assert_eq!(ls_tracker_destroy(ctx, t), Status::Ok);
-        assert_eq!(ls_tracker_act(ctx, t, 0, &mut sel), Status::InvalidArgument);
-        let bad = FilterDesc {
-            kind: 9,
-            ..no_hidden
-        };
-        assert_eq!(
-            ls_tracker_create(ctx, &bad, 1, true, &mut t),
-            Status::InvalidArgument
-        );
-        ls_context_destroy(ctx);
+                category: 0,
+                index: 0,
+            };
+            assert_eq!(
+                ls_tracker_act(ctx, t, TrackerAction::Next as u32, &mut sel),
+                Status::Ok
+            );
+            assert_eq!(
+                sel,
+                Selection {
+                    entity_id: 10,
+                    category: 1,
+                    index: 0
+                }
+            );
+            assert_eq!(
+                ls_tracker_act(ctx, t, TrackerAction::Next as u32, &mut sel),
+                Status::Ok
+            );
+            assert_eq!(sel.entity_id, 30, "hidden chest 31 is filtered out");
+            let mut n = 0;
+            assert_eq!(ls_tracker_count(ctx, t, u32::MAX, &mut n), Status::Ok);
+            assert_eq!(n, 2);
+            assert_eq!(ls_tracker_count(ctx, t, 3, &mut n), Status::Ok);
+            assert_eq!(n, 1);
+
+            let mut v = EntityVector {
+                nearest_point: Vec3::default(),
+                bearing_deg: 0.0,
+                elevation_deg: 0.0,
+                distance: 0.0,
+                steps: 0.0,
+            };
+            assert_eq!(ls_entity_vector(ctx, 30, &mut v), Status::Ok);
+            assert_eq!(v.nearest_point, Vec3::new(4.0, 0.0, 2.0));
+            assert!(
+                v.bearing_deg > 90.0 && v.bearing_deg < 180.0,
+                "south-east, got {}",
+                v.bearing_deg
+            );
+            assert_eq!(v.steps, 4.0);
+
+            let mut r = false;
+            assert_eq!(
+                ls_entity_reachable_from_player(ctx, 30, 0, NPC, &mut r),
+                Status::Ok
+            );
+            assert!(r);
+            assert_eq!(
+                ls_entity_reachable_from_player(ctx, 30, 9, NPC, &mut r),
+                Status::InvalidArgument,
+                "unknown profile"
+            );
+
+            assert_eq!(
+                ls_tracker_act(ctx, t, TrackerAction::CategoryNext as u32, &mut sel),
+                Status::Ok
+            );
+            assert_eq!(
+                sel,
+                Selection {
+                    entity_id: 0,
+                    category: 1,
+                    index: 0
+                }
+            );
+            assert_eq!(ls_tracker_set_filter_enabled(ctx, t, 1, true), Status::Ok);
+            assert_eq!(
+                ls_tracker_set_filter_enabled(ctx, t, 5, true),
+                Status::InvalidArgument
+            );
+            assert_eq!(ls_tracker_act(ctx, t, 9, &mut sel), Status::InvalidArgument);
+            assert_eq!(
+                ls_tracker_set_filters(ctx, t, std::ptr::null(), 0),
+                Status::Ok
+            );
+            assert_eq!(ls_tracker_count(ctx, t, u32::MAX, &mut n), Status::Ok);
+            assert_eq!(n, 3, "no filters: hidden chest visible again");
+            assert_eq!(ls_tracker_destroy(ctx, t), Status::Ok);
+            assert_eq!(ls_tracker_act(ctx, t, 0, &mut sel), Status::InvalidArgument);
+            let bad = FilterDesc {
+                kind: 9,
+                ..no_hidden
+            };
+            assert_eq!(
+                ls_tracker_create(ctx, &bad, 1, true, &mut t),
+                Status::InvalidArgument
+            );
+            ls_context_destroy(ctx);
+        }
     }
 
     #[test]
     fn bad_grid_is_invalid_argument() {
-        let cells = [1u8; 3];
-        let mut ctx = std::ptr::null_mut();
-        assert_eq!(
-            ls_tile_context_create(2, 2, 1, cells.as_ptr(), cells.len(), &mut ctx),
-            Status::InvalidArgument
-        );
-        ls_context_destroy(std::ptr::null_mut()); // null must be harmless
-        ls_path_free(std::ptr::null_mut());
+        // SAFETY: every pointer passed below is a live local or a handle created in this test.
+        unsafe {
+            let cells = [1u8; 3];
+            let mut ctx = std::ptr::null_mut();
+            assert_eq!(
+                ls_tile_context_create(2, 2, 1, cells.as_ptr(), cells.len(), &mut ctx),
+                Status::InvalidArgument
+            );
+            ls_context_destroy(std::ptr::null_mut()); // null must be harmless
+            ls_path_free(std::ptr::null_mut());
+        }
     }
 }
