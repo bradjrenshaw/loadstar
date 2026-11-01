@@ -113,19 +113,83 @@ struct AudioSinkInner {
     trim: bool,
     leading: bool,
     held: Vec<f32>,
+    edges: Edges,
 }
 
 const TRIM_THRESHOLD: f32 = 0.002;
 const TRIM_TAIL_MS: usize = 50;
+/// A played line starts and ends on a short raised-cosine ramp: a synthesizer's output can begin
+/// or stop mid-waveform (AVSpeech ends some plosives that way — "hundred"), and a voice that
+/// starts or runs out on a non-zero sample clicks. Too short to hear as a fade.
+const FADE_IN_MS: usize = 2;
+const FADE_OUT_MS: usize = 4;
+
+/// The start and end ramps. Everything written passes through `send`, which ramps the first
+/// samples up and keeps the last `out_len` back; `close` ramps those down and writes them.
+#[cfg(feature = "audio")]
+struct Edges {
+    in_len: usize,
+    out_len: usize,
+    /// Samples sent so far (for the fade-in).
+    seen: usize,
+    tail: Vec<f32>,
+}
+
+#[cfg(feature = "audio")]
+impl Edges {
+    fn new(rate: u32) -> Edges {
+        let per_ms = rate as usize / 1000;
+        Edges {
+            in_len: (per_ms * FADE_IN_MS).max(1),
+            out_len: (per_ms * FADE_OUT_MS).max(1),
+            seen: 0,
+            tail: Vec::new(),
+        }
+    }
+
+    fn ramp(x: f32) -> f32 {
+        0.5 - 0.5 * (std::f32::consts::PI * x.clamp(0.0, 1.0)).cos()
+    }
+
+    fn send(&mut self, writer: &mut loadstar_audio::stream::StreamWriter, samples: &[f32]) -> bool {
+        let start = self.tail.len();
+        self.tail.extend_from_slice(samples);
+        for (i, s) in self.tail[start..].iter_mut().enumerate() {
+            let n = self.seen + i;
+            if n >= self.in_len {
+                break;
+            }
+            *s *= Self::ramp(n as f32 / self.in_len as f32);
+        }
+        self.seen += samples.len();
+        if self.tail.len() <= self.out_len {
+            return !writer.abandoned();
+        }
+        let ready = self.tail.len() - self.out_len;
+        let ok = writer.write_all(&self.tail[..ready]);
+        self.tail.drain(..ready);
+        ok
+    }
+
+    fn close(&mut self, writer: &mut loadstar_audio::stream::StreamWriter) {
+        let n = self.tail.len();
+        for (i, s) in self.tail.iter_mut().enumerate() {
+            *s *= Self::ramp((n - 1 - i) as f32 / n as f32); // ~1 down to 0 on the last sample
+        }
+        let _ = writer.write_all(&self.tail);
+        self.tail.clear();
+    }
+}
 
 #[cfg(feature = "audio")]
 impl AudioStreamSink {
     pub fn new(writer: loadstar_audio::stream::StreamWriter, trim: bool) -> AudioStreamSink {
         AudioStreamSink {
             inner: Mutex::new(AudioSinkInner {
-                writer,
                 resampler: None,
                 format: (0, 0),
+                edges: Edges::new(writer.rate()),
+                writer,
                 scratch: Vec::with_capacity(8192),
                 trim,
                 leading: trim,
@@ -140,7 +204,7 @@ impl AudioSinkInner {
     /// Send `scratch` (mono at the mixer rate) on, trimming silence if asked.
     fn emit(&mut self) -> bool {
         if !self.trim {
-            return self.writer.write_all(&self.scratch);
+            return self.edges.send(&mut self.writer, &self.scratch);
         }
         let mut out: &[f32] = &self.scratch;
         if self.leading {
@@ -156,7 +220,8 @@ impl AudioSinkInner {
         match out.iter().rposition(|s| s.abs() > TRIM_THRESHOLD) {
             Some(last) => {
                 let held = std::mem::take(&mut self.held);
-                let ok = self.writer.write_all(&held) && self.writer.write_all(&out[..=last]);
+                let ok = self.edges.send(&mut self.writer, &held)
+                    && self.edges.send(&mut self.writer, &out[..=last]);
                 self.held.extend_from_slice(&out[last + 1..]);
                 ok
             }
@@ -201,8 +266,9 @@ impl StreamSink for AudioStreamSink {
         if !g.held.is_empty() {
             let tail = (g.writer.rate() as usize * TRIM_TAIL_MS / 1000).min(g.held.len());
             let held = std::mem::take(&mut g.held);
-            let _ = g.writer.write_all(&held[..tail]);
+            let _ = g.edges.send(&mut g.writer, &held[..tail]);
         }
+        g.edges.close(&mut g.writer);
         g.writer.finish();
     }
 

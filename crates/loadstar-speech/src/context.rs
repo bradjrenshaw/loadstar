@@ -1070,14 +1070,32 @@ mod tests {
         );
         dev.render(&mut out);
         assert!(out.iter().all(|x| x.abs() < 1e-4), "silent after the fade");
-        // A short line finishes on its own once its stream drains.
+        // A short line finishes on its own once its stream drains, and starts and ends on a ramp:
+        // the fake voice's sine stops mid-swing, which would otherwise click.
         let b = s.speak(0, &samples, "hi", 0).unwrap();
         let t = Instant::now();
+        let mut played = Vec::new();
         while s.utterance(b).0 != UtteranceState::Done {
             assert!(t.elapsed() < Duration::from_secs(5), "never drained");
             dev.render(&mut out);
+            played.extend(out.iter().step_by(2).copied());
             std::thread::sleep(Duration::from_millis(1));
         }
+        let first = played
+            .iter()
+            .position(|x| x.abs() > 1e-4)
+            .expect("it played");
+        let last = played.iter().rposition(|x| x.abs() > 1e-4).unwrap();
+        let line = &played[first..=last];
+        assert!(line.len() > 48 * 10, "a whole line: {} samples", line.len());
+        let peak = |w: &[f32]| w.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(peak(&line[..8]) < 0.05, "ramps in: {}", peak(&line[..8]));
+        assert!(
+            peak(&line[line.len() - 8..]) < 0.05,
+            "ramps out: {}",
+            peak(&line[line.len() - 8..])
+        );
+        assert!(peak(line) > 0.4, "full level in between: {}", peak(line));
         // Without the flag the voice speaks through the OS as before.
         let c = s.speak(0, &Profile::default(), "plain", 0).unwrap();
         wait_until(
