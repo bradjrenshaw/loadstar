@@ -104,7 +104,7 @@ typedef struct LvProfile {
     float    rate;      // 0..1, 0.5 = the voice's default; ignored without SET_RATE
     float    pitch;     // 0..1, 0.5 = default; ignored without SET_PITCH
     float    volume;    // 0..1; ignored without SET_VOLUME
-    uint32_t flags;     // NO_FALLBACK, TRIM_SILENCE (render only)
+    uint32_t flags;     // NO_FALLBACK, TRIM_SILENCE (rendered speech), PLAY_SAMPLES (§6)
 } LvProfile;
 ```
 
@@ -230,6 +230,7 @@ It replaces Prism's AVSpeech backend, which `dispatch_sync`s every call onto the
 
 - **Live speech runs on the worker alone.** `speakUtterance` speaks with the main thread asleep. `isSpeaking` reads false for ~8 ms after the call, so an utterance is finished only once it has been seen speaking (or after a 2 s grace if it never is).
 - **Render does not.** `writeUtterance:toBufferCallback:` delivers its buffers on the main queue, so a render completes only while the host services it — a game's event loop does. The render thread waits with a timeout scaled to the text and returns `Failed` instead of hanging.
+- **Live speech clicks when cut.** `stopSpeakingAtBoundary(.immediate)` stops the waveform dead, and a quiet synthesizer pops as its output wakes; `PLAY_SAMPLES` (§6) plays the rendered samples through Loadstar's own output instead.
 
 Prism's VoiceOver backend is excluded (unreliable in practice), and Prism's AVSpeech is a leaf only when this backend is compiled out, so on macOS Prism contributes no leaves today.
 
@@ -262,6 +263,18 @@ lv_speak_at(ctx, queue, profile*, text, flags, device, space, desc*, out utteran
 **Why the worker fires directly.** The audio device's command path was single-producer (one `rtrb` producer, `&mut` methods, one control thread). The alternative — a per-frame `lv_pump` the mod calls to hand completed renders to the device on the game thread — was considered and rejected: its latency (one frame on a few-hundred-millisecond render) is harmless, but it is a call a mod can forget, and forgetting it fails *silently* (positional speech renders and never plays), and it stalls whenever the game thread stalls even though the audio thread is fine. Instead the audio crate gains a **locked in-process intake**: the command producer behind a mutex and buffer ids from an atomic, so a second in-process thread can upload and fire. The game thread's own FFI calls take the same uncontended lock (tens of nanoseconds); contention exists only in the instant a render completes. The ring stays single-producer underneath because the lock serialises the producers. Nothing about the ABI changes, no new call exists for mods to forget, and speech keeps flowing through GC pauses and load hitches. (`audio-spec.md` §threading records the relaxed contract.) This is not a library-driven update loop: the worker acts only on utterances the mod submitted.
 
 The source id is allocated at call time and is the mod's handle from then on: `la_source_stop` cuts it, and `la_source_upsert` with fresh bounds on that id each frame makes the line follow a unit that walks while it speaks (the audio crate accepts upserts on fired voices). That replaces wotr's live-tracked `SpatialSources` for speech. Bounds are in the space's frame and units — right-handed, north on −Z, `unit_scale` — exactly as for every other source. This is wotr's `PositionalSpeech` plus `SpatialSources` plus the render path collapsed into one queued item, and it is why the speech crate belongs next to the audio crate rather than in a companion. An events queue with `max_concurrent = 0` is the intended home for it.
+
+### Playing a voice's samples (`PLAY_SAMPLES`)
+
+A synthesizer left to speak through the OS cuts hard on an interrupt — `stopSpeakingAtBoundary(.immediate)`, SAPI's purge — at whatever sample it reached, and the cut clicks. Arrowing through a menu interrupts on every key, so the clicks pile up; and a synthesizer that has been quiet wakes its own audio path when it speaks again, which can pop. Both are properties of the OS's output, not of the voice, so the cure is to not use it: with the profile flag **`PLAY_SAMPLES`** (4), an ordinary `lv_speak` / `lv_output` on a leaf with `RENDER` takes the positional pipeline above without the position.
+
+- **The output.** The worker opens the default device (miniaudio) with one space on the first such utterance and keeps it running, so the hardware never idles between lines. Its garbage and finished rings are drained on the worker's wakes. If opening fails, the utterance speaks through the OS as if the flag were off, and opening is retried 30 s later. `Speech::use_output` points it at a harness's device instead.
+- **Per utterance.** Exactly step 2 above: a stream-kind source, here `RELATIVE` and centred, with gain √2 so that the constant-power pan's 1/√2 per side leaves each channel at the voice's own level, as the OS plays it; volume, rate and pitch go into the render. `TRIM_SILENCE` applies live. `Speaking` from the fire, `Done` when the stream drains.
+- **Cutting.** `INTERRUPT`, `lv_stop`, `lv_cancel` and `lv_stop_all` stop the source, which ramps to silence over one mixer period instead of stopping dead; the render is abandoned at its next chunk (AVSpeech checks between chunks too). The interrupting line starts at once on its own source.
+- **What ignores it.** Leaves without `RENDER` (screen readers, the clipboard): they speak as always, and so does braille. `lv_pause` / `lv_resume` do not pause played samples (the audio crate has no voice pause yet), the same as positional speech.
+- **AVSpeech specifics** (§5.5): rendered buffers arrive on the host's main queue, which a game services every frame — measured in Balatro at 60 fps, a menu line renders whole in 2–6 frames (30–100 ms, ~20× real time) and streaming plays the first chunk as it lands. The buffer callback only queues chunks; the render thread does the sink writes, so the host's main thread never waits on a full ring. The first render of a voice in a process costs ~400 ms, so `warm` synthesizes one silent word after each probe.
+
+It is a flag, off by default, because it changes where a mod's speech is mixed: a mod that already ducks or routes the OS voice keeps that behaviour until it opts in.
 
 ### Positioning a voice that cannot render
 
@@ -328,7 +341,8 @@ Two lines in `spec.md` move:
 4. **NVDA direct + the 32-bit validation**; Say the Spire 2 moves over.
 5. **OneCore**, SSML passthrough.
 6. ~~Streaming positional speech~~ **Shipped 2026-10-11**: `Stream`-kind sources in the audio crate (`la_stream_create/write/progress/finish/free`, the speech worker uses the in-process intake), SAPI renders into a forwarding COM stream, 2.7 ms to first sound warm. Finding on the way: SAPI synthesizes a two-second line in ~3 ms; the latency people hear from "SAPI" is its leading silence, hence `TRIM_SILENCE` live.
-7. Later: `lv_submit` batches if a mod hits the ordering race; the plugin ABI for third-party backends (the tree already has room); speech-dispatcher natively (AVSpeech shipped, §5.5); priorities only if two mods converge on the same scheme.
+7. ~~Played samples~~ **Shipped 2026-11-01**: `PLAY_SAMPLES` (§6) — rendering voices stream into the worker's own output, so interrupts fade instead of clicking and the device never idles. Found by ear in Blindfold on macOS (AVSpeech crackled on every menu move).
+8. Later: `lv_submit` batches if a mod hits the ordering race; the plugin ABI for third-party backends (the tree already has room); speech-dispatcher natively (AVSpeech shipped, §5.5); priorities only if two mods converge on the same scheme.
 
 ## 12. Open questions
 

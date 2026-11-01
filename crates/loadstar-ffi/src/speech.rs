@@ -58,6 +58,9 @@ pub enum SpeechProfileFlags {
     NoFallback = 1,
     /// Trim leading/trailing silence from rendered speech.
     TrimSilence = 2,
+    /// On a voice that renders, play its samples through Loadstar's own audio output instead of
+    /// the OS (click-free interrupts, an output that stays open). Others ignore it.
+    PlaySamples = 4,
 }
 
 /// `lv_speak` / `lv_speak_at` flags.

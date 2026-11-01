@@ -187,6 +187,11 @@ pub trait StreamSink: Send + Sync {
     fn write(&self, samples: &[f32], channels: u32, rate: u32) -> bool;
     /// No more audio will come.
     fn finish(&self);
+    /// The consumer is gone (the utterance was cut): a render waiting between chunks can give up
+    /// now instead of at its next `write`. Default: never.
+    fn abandoned(&self) -> bool {
+        false
+    }
 }
 
 /// A source of rendered speech. Lives on the render thread with its own instances.

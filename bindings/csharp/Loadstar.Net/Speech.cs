@@ -43,6 +43,10 @@ public enum ProfileFlags : uint
     NoFallback = 1,
     /// <summary>Trim leading/trailing silence from rendered speech.</summary>
     TrimSilence = 2,
+    /// <summary>On a voice that renders, play its samples through Loadstar's own audio output instead of
+    /// the OS: interrupts fade instead of clicking, and the output stays open between lines. Voices that
+    /// cannot render (screen readers, the clipboard) ignore it.</summary>
+    PlaySamples = 4,
 }
 
 [Flags]

@@ -34,7 +34,11 @@ fn main() {
         utt.setVoice(def.as_deref());
         let t = Instant::now();
         synth.speakUtterance(&utt);
-        println!("speakUtterance returned in {:?}, isSpeaking={}", t.elapsed(), synth.isSpeaking());
+        println!(
+            "speakUtterance returned in {:?}, isSpeaking={}",
+            t.elapsed(),
+            synth.isSpeaking()
+        );
         let mut started = None;
         while t.elapsed() < Duration::from_secs(10) {
             let s = synth.isSpeaking();
@@ -89,7 +93,13 @@ fn main() {
         let g = got.lock().unwrap();
         println!(
             "render: {} buffers, {} frames @ {} Hz x{} ch, end={} on_main={} after {:?}",
-            g.0, g.1, g.2, g.3, g.4, g.5, t.elapsed()
+            g.0,
+            g.1,
+            g.2,
+            g.3,
+            g.4,
+            g.5,
+            t.elapsed()
         );
     });
     // The main thread deliberately only sleeps.

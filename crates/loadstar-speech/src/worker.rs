@@ -47,6 +47,8 @@ pub enum Kind {
         output: bool,
         braille_only: bool,
         ssml: bool,
+        /// Trim silence when played as samples (PLAY_SAMPLES).
+        trim: bool,
     },
     Gap(Duration),
     #[cfg(feature = "audio")]
@@ -67,6 +69,9 @@ pub struct Item {
     pub no_fallback: bool,
     pub render_elsewhere: bool,
     pub speak_flat: bool,
+    /// Play a rendering voice's samples through the worker's own output instead of letting the
+    /// voice speak through the OS (profile flag PLAY_SAMPLES, speech-spec §6).
+    pub play_samples: bool,
     pub kind: Kind,
 }
 
@@ -186,7 +191,35 @@ impl StreamSink for AudioStreamSink {
         }
         g.writer.finish();
     }
+
+    fn abandoned(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .writer
+            .abandoned()
+    }
 }
+
+/// Where PLAY_SAMPLES speech plays: a device the worker opens on first use and keeps running, so
+/// speech starting after a pause never wakes the hardware (no start-up pop).
+#[cfg(feature = "audio")]
+enum Output {
+    /// Nothing has asked for it yet.
+    Closed,
+    Open {
+        /// `None` when a harness supplied the intake; it owns and pumps that device.
+        device: Option<Box<loadstar_audio::device::Device>>,
+        intake: loadstar_audio::device::DeviceIntake,
+        space: u32,
+    },
+    /// Opening failed: speak through the OS until this instant, then try again.
+    Failed(Instant),
+}
+
+/// How long a failed output open is left alone before the next PLAY_SAMPLES utterance retries.
+#[cfg(feature = "audio")]
+const OUTPUT_RETRY: Duration = Duration::from_secs(30);
 
 pub enum Msg {
     Speak {
@@ -224,6 +257,12 @@ pub enum Msg {
         result: Result<Pcm, BackendError>,
     },
     Refresh,
+    /// Play PLAY_SAMPLES speech here instead of opening the default device (harnesses, tests).
+    #[cfg(feature = "audio")]
+    UseOutput {
+        intake: loadstar_audio::device::DeviceIntake,
+        space: u32,
+    },
     Shutdown,
 }
 
@@ -305,6 +344,11 @@ pub struct Worker {
     next_probe: Vec<Option<Instant>>,
     /// Utterance → queue, for Cancel and Rendered.
     owner: HashMap<u64, u32>,
+    #[cfg(feature = "audio")]
+    output: Output,
+    /// Source ids on the worker's own output.
+    #[cfg(feature = "audio")]
+    next_source: u64,
 }
 
 impl Worker {
@@ -327,6 +371,10 @@ impl Worker {
             queues,
             next_probe: vec![None; n],
             owner: HashMap::new(),
+            #[cfg(feature = "audio")]
+            output: Output::Closed,
+            #[cfg(feature = "audio")]
+            next_source: 1,
         }
     }
 
@@ -612,6 +660,14 @@ impl Worker {
                 RenderToken::Warm => {}
             },
             Msg::Refresh => self.probe(),
+            #[cfg(feature = "audio")]
+            Msg::UseOutput { intake, space } => {
+                self.output = Output::Open {
+                    device: None,
+                    intake,
+                    space,
+                }
+            }
             Msg::Shutdown => return false,
         }
         true
@@ -684,6 +740,16 @@ impl Worker {
     fn service(&mut self) {
         let now = Instant::now();
         self.probe_due(now);
+        // The own output's device is owned here: drop what its audio thread handed back. Its
+        // finished ring is unused (utterances end on their stream draining) but must not fill.
+        #[cfg(feature = "audio")]
+        if let Output::Open {
+            device: Some(d), ..
+        } = &mut self.output
+        {
+            d.collect_garbage();
+            let _ = d.take_finished();
+        }
         let tree = self.tree();
         let mut ids: Vec<u32> = self.queues.keys().copied().collect();
         ids.sort_unstable();
@@ -851,6 +917,7 @@ impl Worker {
                 output,
                 braille_only,
                 ssml,
+                trim,
             } => {
                 let leaf = &tree.leaves[li];
                 table.set_voice(item.id, leaf.id);
@@ -861,6 +928,48 @@ impl Worker {
                     self.owner.remove(&item.id);
                     return false;
                 }
+                // PLAY_SAMPLES on a voice that renders: stream it into the worker's own output,
+                // where a cut fades instead of clicking. Anything that fails speaks through the OS.
+                #[cfg(feature = "audio")]
+                if item.play_samples
+                    && leaf.features & features::RENDER != 0
+                    && self.render_tx.is_some()
+                    && let Some((intake, space)) = self.own_output(now)
+                {
+                    use loadstar_audio::space::SourceDesc;
+                    use loadstar_core::geometry::{Bounds, Vec3};
+                    let source = self.next_source;
+                    self.next_source += 1;
+                    // Centred: constant-power pan puts 1/sqrt(2) on each side, so sqrt(2) gives
+                    // every channel the voice's own level, as the OS plays it.
+                    let target = Target {
+                        intake,
+                        space,
+                        desc: SourceDesc::buffer(
+                            source,
+                            0,
+                            Bounds::Point(Vec3::new(0.0, 0.0, 0.0)),
+                        )
+                        .relative(0.0)
+                        .with_gain(std::f32::consts::SQRT_2),
+                    };
+                    let selector = leaf.selector;
+                    if self.fire_stream(
+                        queue,
+                        item.id,
+                        b,
+                        selector,
+                        &text,
+                        item.params,
+                        ssml,
+                        trim,
+                        &target,
+                        now,
+                    ) {
+                        return true;
+                    }
+                }
+                let table = &self.shared.table;
                 match self.backends[b].speak(
                     leaf.selector,
                     &text,
@@ -934,11 +1043,13 @@ impl Worker {
                             no_fallback: item.no_fallback,
                             render_elsewhere: false,
                             speak_flat: true,
+                            play_samples: false,
                             kind: Kind::Speak {
                                 text,
                                 output: false,
                                 braille_only: false,
                                 ssml,
+                                trim,
                             },
                         };
                         return self.start(queue, flat, now, tree);
@@ -951,66 +1062,27 @@ impl Worker {
                 let leaf = &tree.leaves[li];
                 table.set_voice(item.id, leaf.id);
                 let Some(mut pcm) = pcm else {
-                    // Not rendered ahead: STREAM it. Fire a stream-kind source now (silent until its
-                    // prefill is in) and have the render thread fill the ring chunk by chunk, so the
-                    // first sound follows the first synthesized chunk, not the last.
-                    let rate = target.intake.info().sample_rate as usize;
-                    let created = target.intake.stream_create(rate * 8, rate / 100).and_then(
-                        |(stream_id, writer)| {
-                            use loadstar_audio::space::{SourceKind, flags};
-                            let progress = Arc::clone(writer.progress());
-                            let mut desc = target.desc;
-                            desc.kind = SourceKind::Stream;
-                            desc.buffer = stream_id;
-                            desc.repeat_count = 1;
-                            desc.flags |= flags::PLAYING | flags::AUTO_REMOVE;
-                            match target.intake.fire(target.space, desc) {
-                                Ok(()) => Ok((stream_id, writer, progress)),
-                                Err(e) => {
-                                    let _ = target.intake.stream_free(stream_id);
-                                    Err(e)
-                                }
-                            }
-                        },
-                    );
-                    let Ok((stream_id, writer, progress)) = created else {
-                        table.set(item.id, UtteranceState::Cancelled, false);
-                        self.owner.remove(&item.id);
-                        return false;
-                    };
-                    let sink: Arc<dyn StreamSink> = Arc::new(AudioStreamSink::new(writer, trim));
-                    let sent = self.render_tx.as_ref().map(|tx| {
-                        tx.send(RenderReq {
-                            token: RenderToken::Utterance(item.id),
-                            backend: leaf.backend,
-                            selector: leaf.selector,
-                            text,
-                            params: item.params,
-                            ssml,
-                            trim,
-                            stream: Some(Arc::clone(&sink)),
-                        })
-                        .is_ok()
-                    });
-                    if sent != Some(true) {
-                        sink.finish();
-                        let _ = target.intake.stop(target.space, target.desc.id);
-                        let _ = target.intake.stream_free(stream_id);
-                        table.set(item.id, UtteranceState::Cancelled, false);
-                        self.owner.remove(&item.id);
-                        return false;
+                    // Not rendered ahead: STREAM it, audible after the first synthesized chunk.
+                    let (backend, selector) = (leaf.backend, leaf.selector);
+                    if self.fire_stream(
+                        queue,
+                        item.id,
+                        backend,
+                        selector,
+                        &text,
+                        item.params,
+                        ssml,
+                        trim,
+                        &target,
+                        now,
+                    ) {
+                        return true;
                     }
-                    table.set(item.id, UtteranceState::Speaking, false);
-                    self.queues.get_mut(&queue).unwrap().active.push(Active {
-                        id: item.id,
-                        backend: None,
-                        slot: 0,
-                        expected_end: None,
-                        next_poll: Some(now + Duration::from_millis(10)),
-                        positional: Some((target.intake.clone(), target.space, target.desc.id)),
-                        stream: Some((stream_id, progress)),
-                    });
-                    return true;
+                    self.shared
+                        .table
+                        .set(item.id, UtteranceState::Cancelled, false);
+                    self.owner.remove(&item.id);
+                    return false;
                 };
                 if trim {
                     pcm.trim_silence(0.002);
@@ -1049,6 +1121,116 @@ impl Worker {
                         false
                     }
                 }
+            }
+        }
+    }
+
+    /// Fire a stream-kind source for `target` now (silent until its prefill is in) and have the
+    /// render thread fill its ring chunk by chunk, so the first sound follows the first
+    /// synthesized chunk, not the last. On success the utterance is Speaking and active; on
+    /// failure nothing is left behind and the caller decides (cancel, or speak through the OS).
+    #[cfg(feature = "audio")]
+    #[allow(clippy::too_many_arguments)]
+    fn fire_stream(
+        &mut self,
+        queue: u32,
+        id: u64,
+        backend: usize,
+        selector: u64,
+        text: &str,
+        params: Params,
+        ssml: bool,
+        trim: bool,
+        target: &Target,
+        now: Instant,
+    ) -> bool {
+        let Some(tx) = self.render_tx.clone() else {
+            return false;
+        };
+        let rate = target.intake.info().sample_rate as usize;
+        let created =
+            target
+                .intake
+                .stream_create(rate * 8, rate / 100)
+                .and_then(|(stream_id, writer)| {
+                    use loadstar_audio::space::{SourceKind, flags};
+                    let progress = Arc::clone(writer.progress());
+                    let mut desc = target.desc;
+                    desc.kind = SourceKind::Stream;
+                    desc.buffer = stream_id;
+                    desc.repeat_count = 1;
+                    desc.flags |= flags::PLAYING | flags::AUTO_REMOVE;
+                    match target.intake.fire(target.space, desc) {
+                        Ok(()) => Ok((stream_id, writer, progress)),
+                        Err(e) => {
+                            let _ = target.intake.stream_free(stream_id);
+                            Err(e)
+                        }
+                    }
+                });
+        let Ok((stream_id, writer, progress)) = created else {
+            return false;
+        };
+        let sink: Arc<dyn StreamSink> = Arc::new(AudioStreamSink::new(writer, trim));
+        let sent = tx
+            .send(RenderReq {
+                token: RenderToken::Utterance(id),
+                backend,
+                selector,
+                text: text.to_string(),
+                params,
+                ssml,
+                trim,
+                stream: Some(Arc::clone(&sink)),
+            })
+            .is_ok();
+        if !sent {
+            sink.finish();
+            let _ = target.intake.stop(target.space, target.desc.id);
+            let _ = target.intake.stream_free(stream_id);
+            return false;
+        }
+        self.shared.table.set(id, UtteranceState::Speaking, false);
+        self.queues.get_mut(&queue).unwrap().active.push(Active {
+            id,
+            backend: None,
+            slot: 0,
+            expected_end: None,
+            next_poll: Some(now + Duration::from_millis(10)),
+            positional: Some((target.intake.clone(), target.space, target.desc.id)),
+            stream: Some((stream_id, progress)),
+        });
+        true
+    }
+
+    /// The worker's own output for PLAY_SAMPLES speech, opened (default device, one space) on
+    /// first use. `None` while opening is failing; the caller speaks through the OS instead.
+    #[cfg(feature = "audio")]
+    fn own_output(&mut self, now: Instant) -> Option<(loadstar_audio::device::DeviceIntake, u32)> {
+        use loadstar_audio::device::{Device, DeviceConfig};
+        use loadstar_audio::space::SpaceMode;
+        match &self.output {
+            Output::Open { intake, space, .. } => return Some((intake.clone(), *space)),
+            Output::Failed(until) if now < *until => return None,
+            _ => {}
+        }
+        let opened = Device::open_default(DeviceConfig::default()).and_then(|mut d| {
+            let space = d.space_create(SpaceMode::Planar, 1.0, 1.0)?;
+            Ok((d, space))
+        });
+        match opened {
+            Ok((device, space)) => {
+                let intake = device.intake();
+                self.output = Output::Open {
+                    device: Some(Box::new(device)),
+                    intake: intake.clone(),
+                    space,
+                };
+                Some((intake, space))
+            }
+            Err(_) => {
+                self.output = Output::Failed(now + OUTPUT_RETRY);
+                None
             }
         }
     }

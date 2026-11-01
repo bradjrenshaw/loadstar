@@ -77,6 +77,9 @@ impl Profile {
     fn trim(&self) -> bool {
         self.flags & profile_flags::TRIM_SILENCE != 0
     }
+    fn play_samples(&self) -> bool {
+        self.flags & profile_flags::PLAY_SAMPLES != 0
+    }
 }
 
 pub mod profile_flags {
@@ -84,6 +87,11 @@ pub mod profile_flags {
     pub const NO_FALLBACK: u32 = 1;
     /// Trim leading/trailing silence from rendered speech.
     pub const TRIM_SILENCE: u32 = 2;
+    /// On a voice that renders, play its samples through Loadstar's own audio output instead of
+    /// letting the voice speak through the OS: interrupts fade instead of clicking, and the
+    /// output stays open between lines. Voices that cannot render (screen readers, the
+    /// clipboard) ignore it (speech-spec §6).
+    pub const PLAY_SAMPLES: u32 = 4;
 }
 
 pub mod speak_flags {
@@ -374,6 +382,7 @@ impl Speech {
             no_fallback: profile.no_fallback(),
             render_elsewhere: flags & speak_flags::RENDER_ELSEWHERE != 0,
             speak_flat: flags & speak_flags::SPEAK_FLAT != 0,
+            play_samples: profile.play_samples(),
             kind,
         };
         self.tx
@@ -414,6 +423,7 @@ impl Speech {
                 output: flags & speak_flags::BRAILLE_TOO != 0,
                 braille_only: false,
                 ssml: flags & speak_flags::SSML != 0,
+                trim: profile.trim(),
             },
         )
     }
@@ -433,6 +443,7 @@ impl Speech {
                 output: false,
                 braille_only: true,
                 ssml: false,
+                trim: false,
             },
         )
     }
@@ -445,6 +456,13 @@ impl Speech {
             0,
             Kind::Gap(Duration::from_millis(ms as u64)),
         )
+    }
+
+    /// Play `PLAY_SAMPLES` speech through this intake and space instead of opening the default
+    /// output device. For harnesses and tests, which own (and, for a null device, pump) it.
+    #[cfg(feature = "audio")]
+    pub fn use_output(&self, intake: loadstar_audio::device::DeviceIntake, space: u32) {
+        let _ = self.tx.send(Msg::UseOutput { intake, space });
     }
 
     /// Positional speech: rendered on the worker, fired through the audio intake as one queued utterance.
@@ -989,5 +1007,93 @@ mod tests {
             "rendered through SAPI instead",
         );
         assert_eq!(s2.utterance(elsewhere).2, ids::voice_id("sapi", "david"));
+    }
+
+    #[cfg(feature = "audio")]
+    #[test]
+    fn play_samples_streams_into_the_own_output_and_a_cut_fades() {
+        use loadstar_audio::backend::NullBackend;
+        use loadstar_audio::device::{Device, DeviceConfig};
+        use loadstar_audio::space::SpaceMode;
+        let (s, rs, ss) = open(false);
+        let mut dev = Device::open_null(DeviceConfig::default(), NullBackend::new(48000, 256));
+        let space = dev.space_create(SpaceMode::Planar, 1.0, 1.0).unwrap();
+        s.use_output(dev.intake(), space);
+        let samples = Profile {
+            flags: profile_flags::PLAY_SAMPLES,
+            ..Profile::default()
+        };
+        let long = "a line long enough to still be playing when it is cut";
+        let a = s.speak(0, &samples, long, 0).unwrap();
+        wait_until(
+            || s.utterance(a).0 == UtteranceState::Speaking,
+            "streaming into the own output",
+        );
+        let rendered = |text: &str| {
+            ss.lock()
+                .unwrap()
+                .calls
+                .iter()
+                .any(|c| matches!(c, Call::Render { text: t, .. } if t == text))
+        };
+        wait_until(|| rendered(long), "rendered, not spoken");
+        assert!(
+            !speaks(&ss).contains(&long.to_string()),
+            "the OS voice stayed quiet"
+        );
+        // Play until it sounds (the stream starts once its prefill is in).
+        let mut out = vec![0.0f32; 512]; // 256 stereo frames
+        let t = Instant::now();
+        while !out.iter().any(|x| x.abs() > 0.1) {
+            assert!(t.elapsed() < Duration::from_secs(5), "never sounded");
+            dev.render(&mut out);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Centred at the voice's own level: sqrt(2) gain undoes the pan law's 1/sqrt(2) per side.
+        let peak_l = out.iter().step_by(2).fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(
+            (0.45..=0.55).contains(&peak_l),
+            "each channel peaks at the voice's 0.5: {peak_l}"
+        );
+        // Cut it: the next block ramps out instead of stopping dead, then silence.
+        s.stop(0);
+        wait_until(|| s.utterance(a).0 == UtteranceState::Cancelled, "cut");
+        dev.render(&mut out);
+        let left: Vec<f32> = out.iter().step_by(2).copied().collect();
+        let head = left[..32].iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let tail = left[left.len() - 8..]
+            .iter()
+            .fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(
+            head > 0.2 && tail < 0.05,
+            "faded across the block: head {head}, tail {tail}"
+        );
+        dev.render(&mut out);
+        assert!(out.iter().all(|x| x.abs() < 1e-4), "silent after the fade");
+        // A short line finishes on its own once its stream drains.
+        let b = s.speak(0, &samples, "hi", 0).unwrap();
+        let t = Instant::now();
+        while s.utterance(b).0 != UtteranceState::Done {
+            assert!(t.elapsed() < Duration::from_secs(5), "never drained");
+            dev.render(&mut out);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Without the flag the voice speaks through the OS as before.
+        let c = s.speak(0, &Profile::default(), "plain", 0).unwrap();
+        wait_until(
+            || speaks(&ss).contains(&"plain".to_string()),
+            "spoken by the OS voice",
+        );
+        assert!(!rendered("plain"));
+        let _ = c;
+        // A screen reader cannot render: the flag is ignored and the reader speaks.
+        let (s2, rs2, _) = open(true);
+        s2.use_output(dev.intake(), space);
+        let d = s2.speak(0, &samples, "via the reader", 0).unwrap();
+        wait_until(
+            || speaks(&rs2).contains(&"via the reader".to_string()),
+            "spoken by the reader",
+        );
+        let _ = (d, rs);
     }
 }

@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 use block2::RcBlock;
 use objc2::rc::{Retained, autoreleasepool};
 use objc2_avf_audio::{
-    AVAudioBuffer, AVAudioPCMBuffer, AVSpeechBoundary, AVSpeechSynthesisVoice,
-    AVSpeechSynthesizer, AVSpeechUtterance, AVSpeechUtteranceDefaultSpeechRate,
-    AVSpeechUtteranceMaximumSpeechRate, AVSpeechUtteranceMinimumSpeechRate,
+    AVAudioBuffer, AVAudioPCMBuffer, AVSpeechBoundary, AVSpeechSynthesisVoice, AVSpeechSynthesizer,
+    AVSpeechUtterance, AVSpeechUtteranceDefaultSpeechRate, AVSpeechUtteranceMaximumSpeechRate,
+    AVSpeechUtteranceMinimumSpeechRate,
 };
 use objc2_foundation::NSString;
 
@@ -112,10 +112,9 @@ fn utterance(
         .ok_or(BackendError::Unavailable)?;
     // SAFETY: plain property setters on an utterance we own.
     unsafe {
-        let voice = AVSpeechSynthesisVoice::voiceWithIdentifier(&NSString::from_str(
-            &info.identifier,
-        ))
-        .ok_or(BackendError::Unavailable)?;
+        let voice =
+            AVSpeechSynthesisVoice::voiceWithIdentifier(&NSString::from_str(&info.identifier))
+                .ok_or(BackendError::Unavailable)?;
         let u = AVSpeechUtterance::speechUtteranceWithString(&NSString::from_str(text));
         u.setVoice(Some(&voice));
         u.setRate(map_rate(params.rate));
@@ -237,7 +236,10 @@ impl Backend for AvSpeechBackend {
         for i in range {
             if let Some(inst) = self.instances.get_mut(i) {
                 // SAFETY: a synthesizer owned by this thread.
-                unsafe { inst.synth.stopSpeakingAtBoundary(AVSpeechBoundary::Immediate) };
+                unsafe {
+                    inst.synth
+                        .stopSpeakingAtBoundary(AVSpeechBoundary::Immediate)
+                };
                 inst.busy = false;
             }
         }
@@ -249,7 +251,10 @@ impl Backend for AvSpeechBackend {
             .get(slot as usize)
             .ok_or(BackendError::Unavailable)?;
         // SAFETY: a synthesizer owned by this thread.
-        if unsafe { inst.synth.pauseSpeakingAtBoundary(AVSpeechBoundary::Immediate) } {
+        if unsafe {
+            inst.synth
+                .pauseSpeakingAtBoundary(AVSpeechBoundary::Immediate)
+        } {
             Ok(())
         } else {
             Err(BackendError::Failed("pauseSpeakingAtBoundary".into()))
@@ -290,13 +295,15 @@ impl Backend for AvSpeechBackend {
     }
 }
 
-/// What the buffer callback has delivered so far, shared with the waiting render thread.
+/// What the buffer callback has delivered and the render thread has not yet taken. The callback
+/// runs on the host's main thread, so it only queues: every sink write (which may block on a full
+/// ring) happens on the render thread.
 #[derive(Default)]
 struct Collected {
-    pcm: Pcm,
+    /// Interleaved samples, channels, rate.
+    chunks: Vec<(Vec<f32>, u32, u32)>,
+    /// The zero-length end marker arrived, or the render gave up (late buffers are ignored).
     done: bool,
-    /// The sink said stop.
-    aborted: bool,
 }
 
 /// Interleaved f32 out of one AVAudioPCMBuffer (float or int16, interleaved or not).
@@ -312,7 +319,11 @@ fn samples_of(buf: &AVAudioPCMBuffer) -> (Vec<f32>, u32, u32) {
         let f = buf.floatChannelData();
         let i = buf.int16ChannelData();
         let read = |c: usize, n: usize| -> f32 {
-            let (plane, idx) = if interleaved { (0, n * channels + c) } else { (c, n) };
+            let (plane, idx) = if interleaved {
+                (0, n * channels + c)
+            } else {
+                (c, n)
+            };
             if !f.is_null() {
                 *(*f.add(plane)).as_ptr().add(idx)
             } else if !i.is_null() {
@@ -348,9 +359,9 @@ impl AvSpeechRender {
         }
     }
 
-    /// Synthesize `text` to buffers; each chunk goes to `sink` (if any) and into the result.
-    /// Waits at most a generous multiple of the text's spoken length for the main queue to
-    /// deliver (see the module note).
+    /// Synthesize `text` to buffers; each chunk goes to `sink` if there is one, else into the
+    /// returned PCM. Waits at most a generous multiple of the text's spoken length for the main
+    /// queue to deliver (see the module note), and gives up as soon as the sink is abandoned.
     fn write(
         &mut self,
         selector: u64,
@@ -386,42 +397,74 @@ impl AvSpeechRender {
                 // SAFETY: a live PCM buffer.
                 if unsafe { pcm.frameLength() } == 0 {
                     c.done = true; // the zero-length buffer marks the end
-                    cv.notify_all();
-                    return;
+                } else {
+                    c.chunks.push(samples_of(pcm));
                 }
-                let (samples, channels, rate) = samples_of(pcm);
-                if let Some(s) = &sink {
-                    if !s.write(&samples, channels, rate) {
-                        c.aborted = true;
-                        c.done = true;
-                        cv.notify_all();
-                        return;
-                    }
-                }
-                c.pcm.channels = channels;
-                c.pcm.rate = rate;
-                c.pcm.samples.extend_from_slice(&samples);
+                cv.notify_all();
             });
             // SAFETY: the synthesizer copies the block; `state` outlives every invocation by Arc.
             unsafe { synth.writeUtterance_toBufferCallback(&u, &*block as *const _ as *mut _) };
-            let budget = Duration::from_secs(5) + Duration::from_millis(150) * text.len() as u32;
+            let deadline = Instant::now()
+                + Duration::from_secs(5)
+                + Duration::from_millis(150) * text.len() as u32;
+            let mut out = Pcm::default();
             let (lock, cv) = &*state;
-            let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-            let (mut c, timeout) = cv
-                .wait_timeout_while(guard, budget, |c| !c.done)
-                .unwrap_or_else(|e| e.into_inner());
-            if timeout.timed_out() || c.aborted {
-                c.done = true; // late buffers are ignored
+            let gave_up = loop {
+                let (chunks, done) = {
+                    let mut c = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    loop {
+                        if !c.chunks.is_empty() || c.done {
+                            break;
+                        }
+                        let now = Instant::now();
+                        if now >= deadline || sink.as_ref().is_some_and(|s| s.abandoned()) {
+                            break;
+                        }
+                        // Short waits: a cut utterance is noticed within a few ms, not a chunk later.
+                        c = cv
+                            .wait_timeout(c, (deadline - now).min(Duration::from_millis(5)))
+                            .unwrap_or_else(|e| e.into_inner())
+                            .0;
+                    }
+                    (std::mem::take(&mut c.chunks), c.done)
+                };
+                let mut stop = false;
+                for (samples, channels, rate) in chunks {
+                    match &sink {
+                        Some(s) => {
+                            if !s.write(&samples, channels, rate) {
+                                stop = true;
+                                break;
+                            }
+                        }
+                        None => {
+                            out.channels = channels;
+                            out.rate = rate;
+                            out.samples.extend_from_slice(&samples);
+                        }
+                    }
+                }
+                if stop || sink.as_ref().is_some_and(|s| s.abandoned()) {
+                    break Some(false); // cut: not an error
+                }
+                if done {
+                    break None;
+                }
+                if Instant::now() >= deadline {
+                    break Some(true);
+                }
+            };
+            if let Some(timed_out) = gave_up {
+                lock.lock().unwrap_or_else(|e| e.into_inner()).done = true; // late buffers are ignored
                 // SAFETY: a synthesizer owned by this thread.
                 unsafe { synth.stopSpeakingAtBoundary(AVSpeechBoundary::Immediate) };
-                if timeout.timed_out() {
+                if timed_out {
                     return Err(BackendError::Failed(
-                        "AVSpeech render timed out (the host never serviced the main queue)"
-                            .into(),
+                        "AVSpeech render timed out (the host never serviced the main queue)".into(),
                     ));
                 }
             }
-            Ok(std::mem::take(&mut c.pcm))
+            Ok(out)
         })
     }
 }
@@ -456,6 +499,16 @@ impl RenderBackend for AvSpeechRender {
         sink: Arc<dyn StreamSink>,
     ) -> Result<(), BackendError> {
         self.write(selector, text, params, Some(sink)).map(|_| ())
+    }
+
+    /// Load the voice by synthesizing one short word silently: the first render of a voice in a
+    /// process otherwise takes ~400 ms (measured in Balatro) against ~30 ms after.
+    fn warm(&mut self, selector: u64) {
+        let params = Params {
+            volume: 0.0,
+            ..Params::default()
+        };
+        let _ = self.write(selector, "a", &params, None);
     }
 }
 
