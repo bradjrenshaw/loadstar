@@ -136,6 +136,39 @@ impl AudioStreamSink {
 }
 
 #[cfg(feature = "audio")]
+impl AudioSinkInner {
+    /// Send `scratch` (mono at the mixer rate) on, trimming silence if asked.
+    fn emit(&mut self) -> bool {
+        if !self.trim {
+            return self.writer.write_all(&self.scratch);
+        }
+        let mut out: &[f32] = &self.scratch;
+        if self.leading {
+            match out.iter().position(|s| s.abs() > TRIM_THRESHOLD) {
+                Some(i) => {
+                    out = &out[i..];
+                    self.leading = false;
+                }
+                None => return !self.writer.abandoned(),
+            }
+        }
+        // Everything after the last loud sample is held back; it goes out only if more sound follows.
+        match out.iter().rposition(|s| s.abs() > TRIM_THRESHOLD) {
+            Some(last) => {
+                let held = std::mem::take(&mut self.held);
+                let ok = self.writer.write_all(&held) && self.writer.write_all(&out[..=last]);
+                self.held.extend_from_slice(&out[last + 1..]);
+                ok
+            }
+            None => {
+                self.held.extend_from_slice(out);
+                !self.writer.abandoned()
+            }
+        }
+    }
+}
+
+#[cfg(feature = "audio")]
 impl StreamSink for AudioStreamSink {
     fn write(&self, samples: &[f32], channels: u32, rate: u32) -> bool {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -153,37 +186,18 @@ impl StreamSink for AudioStreamSink {
             .as_mut()
             .unwrap()
             .process(samples, &mut g.scratch);
-        if !g.trim {
-            return g.writer.write_all(&g.scratch);
-        }
-        let mut out: &[f32] = &g.scratch;
-        if g.leading {
-            match out.iter().position(|s| s.abs() > TRIM_THRESHOLD) {
-                Some(i) => {
-                    out = &out[i..];
-                    g.leading = false;
-                }
-                None => return !g.writer.abandoned(),
-            }
-        }
-        // Everything after the last loud sample is held back; it goes out only if more sound follows.
-        match out.iter().rposition(|s| s.abs() > TRIM_THRESHOLD) {
-            Some(last) => {
-                let held = std::mem::take(&mut g.held);
-                let ok = g.writer.write_all(&held) && g.writer.write_all(&out[..=last]);
-                g.held.extend_from_slice(&out[last + 1..]);
-                ok
-            }
-            None => {
-                g.held.extend_from_slice(out);
-                !g.writer.abandoned()
-            }
-        }
+        g.emit()
     }
 
     fn finish(&self) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let g = &mut *g;
+        // The resampler holds back the last fraction of a millisecond (its kernel looks ahead).
+        if let Some(r) = g.resampler.as_mut() {
+            g.scratch.clear();
+            r.finish(&mut g.scratch);
+            let _ = g.emit();
+        }
         if !g.held.is_empty() {
             let tail = (g.writer.rate() as usize * TRIM_TAIL_MS / 1000).min(g.held.len());
             let held = std::mem::take(&mut g.held);
