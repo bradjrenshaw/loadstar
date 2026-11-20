@@ -6,18 +6,22 @@
 //! Module map: [`tree`] (categories, leaves, autos, resolution), [`backend`] (what a speech source
 //! implements), [`backends`] (Prism loader, SAPI 5, clipboard, a deterministic fake for tests),
 //! [`worker`] (queues + the thread), [`state`] (the bounded utterance table), [`context`] (the
-//! game-thread handle the FFI wraps).
+//! game-thread handle the FFI wraps), [`ui`] (the tree arranged for a voice menu), [`locale`]
+//! (the system's names for languages).
 
 pub mod backend;
 pub mod backends;
 pub mod context;
 pub mod features;
 pub mod ids;
+pub mod locale;
 pub mod state;
 pub mod tree;
+pub mod ui;
 pub mod worker;
 
 pub use backend::{Params, Pcm};
 pub use context::{Config, Profile, QueueOptions, RenderState, Resolved, Speech, SpeechError};
 pub use state::{FLAT, UtteranceState};
 pub use tree::{Category, Leaf, Tree};
+pub use ui::{Node, NodeKind, UiTree};

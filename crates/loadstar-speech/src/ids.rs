@@ -24,6 +24,15 @@ pub fn category_auto(key: &str) -> u64 {
     hash(&format!("auto:{key}"))
 }
 
+/// The auto of a group inside a category: one language's voices (`language` a BCP-47 tag), or
+/// with `novelty` the novelty voices of that language (of the whole category when it has none).
+pub fn group_auto(category_key: &str, language: &str, novelty: bool) -> u64 {
+    hash(&format!(
+        "auto:{category_key}/{language}{}",
+        if novelty { "/novelty" } else { "" }
+    ))
+}
+
 /// A leaf's id: the backend that owns it plus the backend's own identifier for the voice (a SAPI
 /// token id, a Prism backend id), so the same voice reached through a different backend gets a
 /// different id and a reinstall that reorders the list changes nothing.

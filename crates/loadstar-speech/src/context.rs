@@ -14,6 +14,7 @@ use crate::features;
 use crate::ids;
 use crate::state::{UtteranceState, UtteranceTable};
 use crate::tree::Tree;
+use crate::ui::UiTree;
 use crate::worker::{self, Item, JobState, Kind, Msg, Shared, Worker};
 
 pub use crate::worker::QueueOptions;
@@ -160,6 +161,8 @@ pub struct Speech {
     worker: Option<JoinHandle<()>>,
     render: Option<JoinHandle<()>>,
     prism_loaded_from: Option<PathBuf>,
+    /// The menu tree's preferred language and the arrangement last built for it.
+    ui: Mutex<(String, Option<Arc<UiTree>>)>,
 }
 
 impl Speech {
@@ -262,6 +265,7 @@ impl Speech {
             worker: Some(worker),
             render,
             prism_loaded_from: None,
+            ui: Mutex::new((String::new(), None)),
         }
     }
 
@@ -282,6 +286,35 @@ impl Speech {
 
     pub fn generation(&self) -> u64 {
         self.shared.generation.load(Ordering::Acquire)
+    }
+
+    // --- the menu tree ---
+
+    /// The language a voice menu is shown in (BCP-47; any case, `_` accepted; empty for none):
+    /// its voices are listed first and language names are written in it where the system can.
+    pub fn set_ui_language(&self, language: &str) {
+        let mut ui = self.ui.lock().unwrap_or_else(|e| e.into_inner());
+        if ui.0 != language {
+            *ui = (language.to_string(), None);
+        }
+    }
+
+    /// The current snapshot arranged for a voice menu (speech-spec §2, "The menu tree").
+    /// Rebuilt when the snapshot or the language changed; node ids are stable across rebuilds.
+    pub fn ui_tree(&self) -> Arc<UiTree> {
+        let tree = self.tree();
+        let mut ui = self.ui.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(built) = &ui.1
+            && built.generation == tree.generation
+        {
+            return Arc::clone(built);
+        }
+        let language = ui.0.clone();
+        let built = Arc::new(UiTree::build(&tree, &language, &|tag| {
+            crate::locale::language_name(tag, &language)
+        }));
+        ui.1 = Some(Arc::clone(&built));
+        built
     }
 
     /// Ask the worker to re-probe; returns whether the tree's shape changed since the last call
@@ -1113,5 +1146,65 @@ mod tests {
             "spoken by the reader",
         );
         let _ = (d, rs);
+    }
+
+    #[test]
+    fn the_menu_tree_follows_the_snapshot_and_the_language() {
+        use crate::ui::NodeKind;
+        let synth = FakeBackend::synth_in(
+            "sapi",
+            &[
+                ("David", "en-US", false),
+                ("Hortense", "fr-FR", false),
+                ("Zira", "en-US", false),
+                ("Robot", "en-US", true),
+            ],
+        );
+        let s = Speech::with_backends(
+            Config {
+                load_prism: false,
+                ..Config::default()
+            },
+            vec![Box::new(synth)],
+            HashMap::new(),
+        );
+        assert!(s.wait_ready(Duration::from_secs(5)));
+        let ui = s.ui_tree();
+        assert!(Arc::ptr_eq(&ui, &s.ui_tree()), "built once per snapshot");
+        let labels = |ui: &crate::ui::UiTree, i: usize| -> Vec<String> {
+            ui.nodes[i]
+                .children
+                .iter()
+                .map(|&c| ui.nodes[c].label.clone())
+                .collect()
+        };
+        let sapi = ui.nodes[0].children[1];
+        assert_eq!(ui.nodes[sapi].kind, NodeKind::Category);
+        let english = ui.nodes[sapi].children[1];
+        assert_eq!(
+            ui.nodes[english].key, "en-US",
+            "no preference: by display name"
+        );
+        assert_eq!(labels(&ui, english), ["Auto", "David", "Zira", "Novelty"]);
+        // The language's auto can be spoken through like a voice.
+        let auto = ui.nodes[ui.nodes[english].children[0]].voice;
+        let p = Profile {
+            voice: auto,
+            ..Profile::default()
+        };
+        assert_eq!(
+            s.resolve(&p, features::SPEAK).voice,
+            ids::voice_id("sapi", "david")
+        );
+        // A French menu lists French first; the nodes keep their ids.
+        s.set_ui_language("fr_FR");
+        let fr = s.ui_tree();
+        let sapi_fr = fr.nodes[0].children[1];
+        assert_eq!(fr.nodes[fr.nodes[sapi_fr].children[1]].key, "fr-FR");
+        assert_eq!(fr.nodes[sapi_fr].id, ui.nodes[sapi].id);
+        assert_eq!(
+            fr.find_voice(auto).map(|n| n.id),
+            Some(ui.nodes[ui.nodes[english].children[0]].id)
+        );
     }
 }

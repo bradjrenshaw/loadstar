@@ -129,6 +129,12 @@ pub struct LeafSpec {
     pub selector: u64,
     pub is_default: bool,
     pub available: bool,
+    /// A novelty voice (sound effects, joke voices): the menu tree lists these in a group of
+    /// their own, after the regular voices, and autos prefer anything else.
+    pub novelty: bool,
+    /// The system's default voice for this leaf's own language (not just for the user's):
+    /// what that language's auto picks.
+    pub language_default: bool,
 }
 
 /// A source of live speech. Lives on the worker thread.

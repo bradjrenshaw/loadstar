@@ -116,6 +116,52 @@ internal struct NativeSpeechConfig
     public uint UtteranceHistory;
 }
 
+/// <summary>What a node of the menu tree is (speech-spec §2, "The menu tree").</summary>
+public enum SpeechMenuNodeKind : uint
+{
+    Root = 0,
+    /// <summary>"This group's best voice": <see cref="SpeechMenuNode.Voice"/> is the auto's id (0 for the root auto).</summary>
+    Auto = 1,
+    /// <summary>A category: Key is what a mod localizes, Label the English name.</summary>
+    Category = 2,
+    /// <summary>One language's voices: Key is the BCP-47 tag, Label the language's display name.</summary>
+    Language = 3,
+    /// <summary>The novelty voices of the enclosing group.</summary>
+    Novelty = 4,
+    /// <summary>A voice: <see cref="SpeechMenuNode.Voice"/> is its id.</summary>
+    Voice = 5,
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct NativeSpeechUiNode
+{
+    public ulong Id;
+    public ulong Parent;
+    public ulong Voice;
+    public ulong Category;
+    public uint Kind;
+    public uint ChildCount;
+}
+
+/// <summary>A node of the menu tree: the voice tree arranged for a "pick a voice" menu. Show a node's
+/// children and descend; every group opens with an Auto whose <see cref="Voice"/> resolves to the group's best.</summary>
+public sealed class SpeechMenuNode
+{
+    /// <summary>Stable across refreshes and sessions; never 0.</summary>
+    public ulong Id { get; internal set; }
+    public SpeechMenuNodeKind Kind { get; internal set; }
+    /// <summary>Auto and Voice nodes: the id to put in a profile. Otherwise 0.</summary>
+    public ulong Voice { get; internal set; }
+    /// <summary>The category the node is, or sits under; 0 for the root and the root auto.</summary>
+    public ulong Category { get; internal set; }
+    /// <summary>A category's key, a language's BCP-47 tag, "auto", "novelty", a voice's language tag.</summary>
+    public string Key { get; internal set; } = "";
+    /// <summary>What a menu shows: a name, a language's display name, English "Auto" / "Novelty".</summary>
+    public string Label { get; internal set; } = "";
+    public SpeechMenuNode? Parent { get; internal set; }
+    public List<SpeechMenuNode> Children { get; } = new();
+}
+
 /// <summary>A category of the voice tree: a fixed key the mod localizes, a default English name, a rank.</summary>
 public sealed class SpeechCategory
 {
@@ -175,6 +221,14 @@ internal static class NativeSpeech
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status lv_voice_features(SpeechHandle ctx, ulong id, out ulong bits);
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status lv_voice_available(SpeechHandle ctx, ulong id, [MarshalAs(UnmanagedType.U1)] out bool available);
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status lv_resolve(SpeechHandle ctx, in Profile profile, ulong required, out ulong voice, [MarshalAs(UnmanagedType.U1)] out bool fellBack, out ulong missing);
+
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status lv_ui_language(SpeechHandle ctx, [MarshalAs(Utf8)] string? language);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status lv_ui_root(SpeechHandle ctx, out ulong node);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status lv_ui_node(SpeechHandle ctx, ulong node, out NativeSpeechUiNode info);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status lv_ui_child(SpeechHandle ctx, ulong node, UIntPtr index, out ulong child);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status lv_ui_label(SpeechHandle ctx, ulong node, [Out] byte[]? buf, UIntPtr cap, out UIntPtr written);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status lv_ui_key(SpeechHandle ctx, ulong node, [Out] byte[]? buf, UIntPtr cap, out UIntPtr written);
+    [DllImport(Lib, CallingConvention = Cc)] public static extern Status lv_ui_find(SpeechHandle ctx, ulong voice, out ulong node);
 
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status lv_queue_create(SpeechHandle ctx, in QueueOptions options, out uint queue);
     [DllImport(Lib, CallingConvention = Cc)] public static extern Status lv_queue_set(SpeechHandle ctx, uint queue, in QueueOptions options);
@@ -304,6 +358,49 @@ public sealed class SpeechContext : IDisposable
         missing = (SpeechFeature)m;
         return st;
     }
+
+    // --- the menu tree ---
+
+    /// <summary>The language a voice menu is shown in (BCP-47, e.g. "fr" or "en-US"; null for none): the menu
+    /// tree lists its voices first and names languages in it where the system can.</summary>
+    public void SetMenuLanguage(string? language) =>
+        NativeSpeech.lv_ui_language(_h, language).ThrowIfError(nameof(NativeSpeech.lv_ui_language));
+
+    /// <summary>The menu tree (speech-spec §2): the voice tree arranged for a "pick a voice" menu — an Auto,
+    /// then categories; a category's voices grouped by language where they have one, novelty voices last.
+    /// The nodes are generic, so the arrangement can change without the mod changing.</summary>
+    public SpeechMenuNode GetMenu()
+    {
+        NativeSpeech.lv_ui_root(_h, out var root).ThrowIfError(nameof(NativeSpeech.lv_ui_root));
+        return ReadMenuNode(root, null);
+    }
+
+    private SpeechMenuNode ReadMenuNode(ulong id, SpeechMenuNode? parent)
+    {
+        NativeSpeech.lv_ui_node(_h, id, out var info).ThrowIfError(nameof(NativeSpeech.lv_ui_node));
+        var node = new SpeechMenuNode
+        {
+            Id = info.Id,
+            Kind = (SpeechMenuNodeKind)info.Kind,
+            Voice = info.Voice,
+            Category = info.Category,
+            Key = ReadString((buf, cap, out n) => NativeSpeech.lv_ui_key(_h, id, buf, cap, out n)),
+            Label = ReadString((buf, cap, out n) => NativeSpeech.lv_ui_label(_h, id, buf, cap, out n)),
+            Parent = parent,
+        };
+        for (ulong i = 0; i < info.ChildCount; i++)
+        {
+            // A refresh between calls can shorten the list; stop rather than throw.
+            if (NativeSpeech.lv_ui_child(_h, id, (UIntPtr)i, out var child) != Status.Ok) break;
+            node.Children.Add(ReadMenuNode(child, node));
+        }
+        return node;
+    }
+
+    /// <summary>The id of the menu node that stands for a voice id (a voice or an auto), so a menu can open on
+    /// the saved choice; 0 when the tree does not list it (a reader that is not running, a removed voice).</summary>
+    public ulong FindMenuNode(ulong voice) =>
+        NativeSpeech.lv_ui_find(_h, voice, out var node) == Status.Ok ? node : 0;
 
     // --- queues ---
 

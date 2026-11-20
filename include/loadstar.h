@@ -450,6 +450,35 @@ typedef struct LsSpeechProfile {
 #endif
 
 #if defined(LOADSTAR_SPEECH)
+/**
+ * One node of the menu tree, as `lv_ui_node` fills it.
+ */
+typedef struct LsSpeechUiNode {
+  /**
+   * Stable across refreshes and sessions; never 0.
+   */
+  uint64_t id;
+  /**
+   * The enclosing node; 0 for the root.
+   */
+  uint64_t parent;
+  /**
+   * Auto and Voice nodes: the id to put in a profile. Otherwise 0.
+   */
+  uint64_t voice;
+  /**
+   * The category the node is, or sits under; 0 for the root and the root auto.
+   */
+  uint64_t category;
+  /**
+   * `SpeechUiNodeKind`.
+   */
+  uint32_t kind;
+  uint32_t child_count;
+} LsSpeechUiNode;
+#endif
+
+#if defined(LOADSTAR_SPEECH)
 typedef struct LsSpeechQueueOptions {
   /**
    * 1 = sequential; 0 = unlimited overlap.
@@ -1694,6 +1723,102 @@ enum LsStatus lv_resolve(struct LsSpeech_ *ctx,
                          uint64_t *voice,
                          bool *fell_back,
                          uint64_t *missing);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * The language a voice menu is shown in (NUL-terminated BCP-47; any case, `_` accepted; null
+ * or empty for none). The menu tree lists that language's voices first and names languages in
+ * it where the system can. Takes effect on the next `lv_ui_*` call.
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `language` must be null or point to a NUL-terminated string.
+ */
+enum LsStatus lv_ui_language(struct LsSpeech_ *ctx, const char *language);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * The menu tree's root (speech-spec §2, "The menu tree"): the voice tree arranged for a
+ * "pick a voice" menu. A mod shows a node's children and descends; the nodes are generic, so
+ * the arrangement can change without the mod changing. Before the first probe the root has no
+ * children.
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `node` must be null or valid for writing one `u64`.
+ */
+enum LsStatus lv_ui_root(struct LsSpeech_ *ctx, uint64_t *node);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * A node's record. `InvalidArgument` for an id the current tree does not hold.
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `info` must be null or valid for writing one `SpeechUiNode`.
+ */
+enum LsStatus lv_ui_node(struct LsSpeech_ *ctx, uint64_t node, struct LsSpeechUiNode *info);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * The `index`-th child of a node, in menu order.
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `child` must be null or valid for writing one `u64`.
+ */
+enum LsStatus lv_ui_child(struct LsSpeech_ *ctx, uint64_t node, uintptr_t index, uint64_t *child);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * What a menu shows for a node: a voice's or category's name, a language's display name,
+ * English "Auto" and "Novelty" (a mod substitutes its own words for those two kinds).
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `buf` must be null or valid for writing `cap` bytes.
+ * - `written` must be null or valid for writing one `usize`.
+ */
+enum LsStatus lv_ui_label(struct LsSpeech_ *ctx,
+                          uint64_t node,
+                          char *buf,
+                          uintptr_t cap,
+                          uintptr_t *written);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * A node's fixed key: a category's key, a language's BCP-47 tag, `auto`, `novelty`, a voice's
+ * language tag (may be empty), empty for the root.
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `buf` must be null or valid for writing `cap` bytes.
+ * - `written` must be null or valid for writing one `usize`.
+ */
+enum LsStatus lv_ui_key(struct LsSpeech_ *ctx,
+                        uint64_t node,
+                        char *buf,
+                        uintptr_t cap,
+                        uintptr_t *written);
+#endif
+
+#if defined(LOADSTAR_SPEECH)
+/**
+ * The node that stands for a voice id — a voice, or an auto — so a menu can open on the saved
+ * choice (walk `parent` up for the path). `VoiceUnavailable` when the tree does not list it:
+ * a reader that is not running, a voice that was removed.
+ *
+ * # Safety
+ * - `ctx` must be null or a live speech context handle from `lv_create`.
+ * - `node` must be null or valid for writing one `u64`.
+ */
+enum LsStatus lv_ui_find(struct LsSpeech_ *ctx, uint64_t voice, uint64_t *node);
 #endif
 
 #if defined(LOADSTAR_SPEECH)

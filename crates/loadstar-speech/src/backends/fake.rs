@@ -74,21 +74,32 @@ impl FakeBackend {
             selector: 1,
             is_default: false,
             available: running,
+            novelty: false,
+            language_default: false,
         });
         f.shared.lock().unwrap().available = running;
         f
     }
 
-    /// A synthesizer-like backend: many instances, reports state, renders.
+    /// A synthesizer-like backend: many instances, reports state, renders. All en-US.
     pub fn synth(name: &'static str, voices: &[&str]) -> FakeBackend {
+        let voices: Vec<(&str, &str, bool)> = voices.iter().map(|v| (*v, "en-US", false)).collect();
+        FakeBackend::synth_in(name, &voices)
+    }
+
+    /// `synth` with each voice's `(name, language, novelty)`. The first voice is the system
+    /// default, and the first regular voice of each language is that language's default.
+    pub fn synth_in(name: &'static str, voices: &[(&str, &str, bool)]) -> FakeBackend {
         let mut f = FakeBackend::new(name, true, true);
-        for (i, v) in voices.iter().enumerate() {
+        for (i, (v, language, novelty)) in voices.iter().enumerate() {
+            let language_default =
+                !novelty && voices.iter().position(|(_, l, n)| l == language && !n) == Some(i);
             f.leaves.push(LeafSpec {
                 category: tree::SAPI5.into(),
                 category_name: None,
                 category_rank: None,
                 name: v.to_string(),
-                language: "en-US".into(),
+                language: language.to_string(),
                 native_id: v.to_lowercase(),
                 dedupe: None,
                 features: features::SPEAK
@@ -101,6 +112,8 @@ impl FakeBackend {
                 selector: i as u64 + 1,
                 is_default: i == 0,
                 available: true,
+                novelty: *novelty,
+                language_default,
             });
         }
         f.shared.lock().unwrap().available = true;

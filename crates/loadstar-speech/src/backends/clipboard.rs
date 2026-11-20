@@ -34,6 +34,8 @@ impl Backend for ClipboardBackend {
             selector: 0,
             is_default: true,
             available: true,
+            novelty: false,
+            language_default: false,
         }]
     }
 

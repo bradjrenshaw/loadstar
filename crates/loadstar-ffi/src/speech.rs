@@ -123,6 +123,40 @@ pub enum RenderJobState {
     Unknown = 3,
 }
 
+/// `SpeechUiNode.kind` values (speech-spec §2, "The menu tree").
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpeechUiNodeKind {
+    Root = 0,
+    /// "This group's best voice": `voice` is the auto's id (0 for the root auto).
+    Auto = 1,
+    /// A category: its key is what a mod localizes, its label the English name.
+    Category = 2,
+    /// One language's voices: its key is the BCP-47 tag, its label the language's display name.
+    Language = 3,
+    /// The novelty voices of the enclosing group.
+    Novelty = 4,
+    /// A voice: `voice` is its id.
+    Voice = 5,
+}
+
+/// One node of the menu tree, as `lv_ui_node` fills it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SpeechUiNode {
+    /// Stable across refreshes and sessions; never 0.
+    pub id: u64,
+    /// The enclosing node; 0 for the root.
+    pub parent: u64,
+    /// Auto and Voice nodes: the id to put in a profile. Otherwise 0.
+    pub voice: u64,
+    /// The category the node is, or sits under; 0 for the root and the root auto.
+    pub category: u64,
+    /// `SpeechUiNodeKind`.
+    pub kind: u32,
+    pub child_count: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct SpeechQueueOptions {
@@ -612,6 +646,173 @@ pub unsafe extern "C" fn lv_resolve(
             Status::NotSupported
         } else {
             Status::Ok
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The menu tree
+// ---------------------------------------------------------------------------
+
+/// The language a voice menu is shown in (NUL-terminated BCP-47; any case, `_` accepted; null
+/// or empty for none). The menu tree lists that language's voices first and names languages in
+/// it where the system can. Takes effect on the next `lv_ui_*` call.
+///
+/// # Safety
+/// - `ctx` must be null or a live speech context handle from `lv_create`.
+/// - `language` must be null or point to a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lv_ui_language(ctx: *mut Speech_, language: *const c_char) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with(unsafe { ctx.as_ref() }, |s| {
+        let tag = if language.is_null() {
+            ""
+        } else {
+            // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+            match unsafe { text_in(language) } {
+                Ok(t) => t,
+                Err(st) => return st,
+            }
+        };
+        s.set_ui_language(tag);
+        Status::Ok
+    })
+}
+
+/// The menu tree's root (speech-spec §2, "The menu tree"): the voice tree arranged for a
+/// "pick a voice" menu. A mod shows a node's children and descends; the nodes are generic, so
+/// the arrangement can change without the mod changing. Before the first probe the root has no
+/// children.
+///
+/// # Safety
+/// - `ctx` must be null or a live speech context handle from `lv_create`.
+/// - `node` must be null or valid for writing one `u64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lv_ui_root(ctx: *mut Speech_, node: *mut u64) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with(unsafe { ctx.as_ref() }, |s| match s.ui_tree().root() {
+        // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+        Some(r) => unsafe { out(node, r.id) },
+        None => Status::InvalidArgument,
+    })
+}
+
+/// A node's record. `InvalidArgument` for an id the current tree does not hold.
+///
+/// # Safety
+/// - `ctx` must be null or a live speech context handle from `lv_create`.
+/// - `info` must be null or valid for writing one `SpeechUiNode`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lv_ui_node(
+    ctx: *mut Speech_,
+    node: u64,
+    info: *mut SpeechUiNode,
+) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with(unsafe { ctx.as_ref() }, |s| {
+        let ui = s.ui_tree();
+        match ui.node(node) {
+            Some(n) => {
+                let record = SpeechUiNode {
+                    id: n.id,
+                    parent: n.parent.map_or(0, |p| ui.nodes[p].id),
+                    voice: n.voice,
+                    category: n.category,
+                    kind: n.kind as u32,
+                    child_count: n.children.len() as u32,
+                };
+                // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+                unsafe { out(info, record) }
+            }
+            None => Status::InvalidArgument,
+        }
+    })
+}
+
+/// The `index`-th child of a node, in menu order.
+///
+/// # Safety
+/// - `ctx` must be null or a live speech context handle from `lv_create`.
+/// - `child` must be null or valid for writing one `u64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lv_ui_child(
+    ctx: *mut Speech_,
+    node: u64,
+    index: usize,
+    child: *mut u64,
+) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with(unsafe { ctx.as_ref() }, |s| {
+        let ui = s.ui_tree();
+        match ui.node(node).and_then(|n| n.children.get(index)) {
+            // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+            Some(&c) => unsafe { out(child, ui.nodes[c].id) },
+            None => Status::InvalidArgument,
+        }
+    })
+}
+
+/// What a menu shows for a node: a voice's or category's name, a language's display name,
+/// English "Auto" and "Novelty" (a mod substitutes its own words for those two kinds).
+///
+/// # Safety
+/// - `ctx` must be null or a live speech context handle from `lv_create`.
+/// - `buf` must be null or valid for writing `cap` bytes.
+/// - `written` must be null or valid for writing one `usize`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lv_ui_label(
+    ctx: *mut Speech_,
+    node: u64,
+    buf: *mut c_char,
+    cap: usize,
+    written: *mut usize,
+) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with(unsafe { ctx.as_ref() }, |s| match s.ui_tree().node(node) {
+        // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+        Some(n) => unsafe { text_out(&n.label, buf, cap, written) },
+        None => Status::InvalidArgument,
+    })
+}
+
+/// A node's fixed key: a category's key, a language's BCP-47 tag, `auto`, `novelty`, a voice's
+/// language tag (may be empty), empty for the root.
+///
+/// # Safety
+/// - `ctx` must be null or a live speech context handle from `lv_create`.
+/// - `buf` must be null or valid for writing `cap` bytes.
+/// - `written` must be null or valid for writing one `usize`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lv_ui_key(
+    ctx: *mut Speech_,
+    node: u64,
+    buf: *mut c_char,
+    cap: usize,
+    written: *mut usize,
+) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with(unsafe { ctx.as_ref() }, |s| match s.ui_tree().node(node) {
+        // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+        Some(n) => unsafe { text_out(&n.key, buf, cap, written) },
+        None => Status::InvalidArgument,
+    })
+}
+
+/// The node that stands for a voice id — a voice, or an auto — so a menu can open on the saved
+/// choice (walk `parent` up for the path). `VoiceUnavailable` when the tree does not list it:
+/// a reader that is not running, a voice that was removed.
+///
+/// # Safety
+/// - `ctx` must be null or a live speech context handle from `lv_create`.
+/// - `node` must be null or valid for writing one `u64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lv_ui_find(ctx: *mut Speech_, voice: u64, node: *mut u64) -> Status {
+    // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+    with(unsafe { ctx.as_ref() }, |s| {
+        match s.ui_tree().find_voice(voice) {
+            // SAFETY: the pointers come from this export's caller, under its `# Safety` contract.
+            Some(n) => unsafe { out(node, n.id) },
+            None => Status::VoiceUnavailable,
         }
     })
 }

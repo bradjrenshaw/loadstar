@@ -268,6 +268,8 @@ impl Backend for SapiBackend {
                 selector: t.selector,
                 is_default: t.is_default,
                 available: true,
+                novelty: false,
+                language_default: false,
             })
             .collect()
     }

@@ -10,17 +10,21 @@
 
 #![allow(unsafe_code)]
 
+use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use objc2::rc::{Retained, autoreleasepool};
+use objc2::sel;
 use objc2_avf_audio::{
-    AVAudioBuffer, AVAudioPCMBuffer, AVSpeechBoundary, AVSpeechSynthesisVoice, AVSpeechSynthesizer,
-    AVSpeechUtterance, AVSpeechUtteranceDefaultSpeechRate, AVSpeechUtteranceMaximumSpeechRate,
+    AVAudioBuffer, AVAudioPCMBuffer, AVSpeechBoundary, AVSpeechSynthesisVoice,
+    AVSpeechSynthesisVoiceTraits, AVSpeechSynthesizer, AVSpeechUtterance,
+    AVSpeechUtteranceDefaultSpeechRate, AVSpeechUtteranceMaximumSpeechRate,
     AVSpeechUtteranceMinimumSpeechRate,
 };
+use objc2_foundation::NSObjectProtocol;
 use objc2_foundation::NSString;
 
 use crate::backend::{
@@ -50,6 +54,8 @@ struct VoiceInfo {
     name: String,
     language: String,
     is_default: bool,
+    novelty: bool,
+    language_default: bool,
 }
 
 fn enumerate() -> Vec<VoiceInfo> {
@@ -60,16 +66,35 @@ fn enumerate() -> Vec<VoiceInfo> {
                 &AVSpeechSynthesisVoice::currentLanguageCode(),
             ))
             .map(|v| v.identifier().to_string());
+            // Each language's own default voice (what `voiceWithLanguage` hands back for it).
+            let mut language_defaults: HashMap<String, Option<String>> = HashMap::new();
             AVSpeechSynthesisVoice::speechVoices()
                 .iter()
                 .map(|v| {
                     let identifier = v.identifier().to_string();
+                    let language = v.language().to_string();
+                    let language_default = language_defaults
+                        .entry(language.clone())
+                        .or_insert_with(|| {
+                            AVSpeechSynthesisVoice::voiceWithLanguage(Some(&NSString::from_str(
+                                &language,
+                            )))
+                            .map(|d| d.identifier().to_string())
+                        })
+                        .as_deref()
+                        == Some(identifier.as_str());
+                    // voiceTraits is macOS 14+; older systems have no way to tell.
+                    let novelty = v.respondsToSelector(sel!(voiceTraits))
+                        && v.voiceTraits()
+                            .contains(AVSpeechSynthesisVoiceTraits::IsNoveltyVoice);
                     VoiceInfo {
                         selector: ids::hash(&identifier),
                         is_default: default.as_deref() == Some(identifier.as_str()),
                         name: v.name().to_string(),
-                        language: v.language().to_string(),
+                        language,
                         identifier,
+                        novelty,
+                        language_default,
                     }
                 })
                 .collect()
@@ -198,6 +223,8 @@ impl Backend for AvSpeechBackend {
                 selector: v.selector,
                 is_default: v.is_default,
                 available: true,
+                novelty: v.novelty,
+                language_default: v.language_default,
             })
             .collect()
     }

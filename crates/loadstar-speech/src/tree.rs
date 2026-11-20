@@ -15,6 +15,8 @@ pub struct CategoryDef {
     pub key: &'static str,
     pub name: &'static str,
     pub rank: i32,
+    /// Holds one voice by nature: the menu tree shows that voice in the category's place.
+    pub single: bool,
 }
 
 pub const SCREEN_READERS: &str = "screen_readers";
@@ -30,36 +32,43 @@ pub const BUILTIN: &[CategoryDef] = &[
         key: SCREEN_READERS,
         name: "Screen readers",
         rank: 0,
+        single: false,
     },
     CategoryDef {
         key: SAPI5,
         name: "SAPI 5",
         rank: 100,
+        single: false,
     },
     CategoryDef {
         key: ONECORE,
         name: "OneCore",
         rank: 200,
+        single: false,
     },
     CategoryDef {
         key: SAPI4,
         name: "SAPI 4",
         rank: 300,
+        single: false,
     },
     CategoryDef {
         key: AVSPEECH,
         name: "AVSpeech",
         rank: 400,
+        single: false,
     },
     CategoryDef {
         key: SPEECH_DISPATCHER,
         name: "Speech Dispatcher",
         rank: 500,
+        single: false,
     },
     CategoryDef {
         key: CLIPBOARD,
         name: "Clipboard",
         rank: 1000,
+        single: true,
     },
 ];
 
@@ -71,6 +80,22 @@ pub struct Category {
     pub rank: i32,
     /// The voice id that means "this category's best".
     pub auto: u64,
+    /// Holds one voice by nature (the clipboard): the menu tree shows that voice in its place.
+    pub single: bool,
+}
+
+/// Voices of one category that share an auto of their own (speech-spec §2, "The menu tree"):
+/// one language's voices, or the novelty voices of a language. Membership is by the leaves'
+/// own `language` and `novelty`, so a group needs no list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Group {
+    /// The voice id that means "this group's best".
+    pub auto: u64,
+    pub category: u64,
+    /// BCP-47 as the backend gave it; empty for the novelty voices of a category without languages.
+    pub language: String,
+    /// The novelty voices of `language`, rather than all of its voices.
+    pub novelty: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -85,6 +110,8 @@ pub struct Leaf {
     pub selector: u64,
     pub is_default: bool,
     pub available: bool,
+    pub novelty: bool,
+    pub language_default: bool,
 }
 
 /// One immutable snapshot of everything that can speak.
@@ -96,8 +123,11 @@ pub struct Tree {
     pub categories: Vec<Category>,
     /// Grouped by category in `categories` order, then probe order.
     pub leaves: Vec<Leaf>,
+    /// Every language (and novelty set) the leaves form, in leaf order.
+    pub groups: Vec<Group>,
     by_id: HashMap<u64, usize>,
     cat_by_id: HashMap<u64, usize>,
+    group_by_auto: HashMap<u64, usize>,
 }
 
 /// What a profile resolved to.
@@ -120,6 +150,7 @@ impl Tree {
                 name: d.name.to_string(),
                 rank: d.rank,
                 auto: ids::category_auto(d.key),
+                single: d.single,
             })
             .collect();
         let mut seen = std::collections::HashSet::new();
@@ -143,6 +174,7 @@ impl Tree {
                         .unwrap_or_else(|| spec.category.clone()),
                     rank: spec.category_rank.unwrap_or(900),
                     auto: ids::category_auto(&spec.category),
+                    single: false,
                 });
             }
             pending.push(Leaf {
@@ -155,6 +187,8 @@ impl Tree {
                 selector: spec.selector,
                 is_default: spec.is_default,
                 available: spec.available,
+                novelty: spec.novelty,
+                language_default: spec.language_default,
             });
         }
         categories.sort_by_key(|c| c.rank);
@@ -170,12 +204,40 @@ impl Tree {
             .enumerate()
             .map(|(i, c)| (c.id, i))
             .collect();
+        let mut groups: Vec<Group> = Vec::new();
+        for l in &leaves {
+            let key = &categories[cat_by_id_of(&categories, l.category)].key;
+            let mut add = |novelty: bool| {
+                let auto = ids::group_auto(key, &l.language, novelty);
+                if !groups.iter().any(|g| g.auto == auto) {
+                    groups.push(Group {
+                        auto,
+                        category: l.category,
+                        language: l.language.clone(),
+                        novelty,
+                    });
+                }
+            };
+            if !l.language.is_empty() {
+                add(false);
+            }
+            if l.novelty {
+                add(true);
+            }
+        }
+        let group_by_auto = groups
+            .iter()
+            .enumerate()
+            .map(|(i, g)| (g.auto, i))
+            .collect();
         Tree {
             generation,
             categories,
             leaves,
+            groups,
             by_id,
             cat_by_id,
+            group_by_auto,
         }
     }
 
@@ -210,19 +272,53 @@ impl Tree {
         self.categories.iter().find(|c| c.auto == voice)
     }
 
-    /// A category's best available leaf: the one its backend marks default, else the first.
+    /// A category's best available leaf: the one its backend marks default, else the first
+    /// regular voice, else the first novelty one.
     pub fn category_auto_leaf(&self, category: u64) -> Option<usize> {
-        let mut first = None;
-        for (i, l) in self.leaves.iter().enumerate() {
-            if l.category != category || !l.available {
-                continue;
+        self.best(|l| l.category == category, |l| l.is_default)
+    }
+
+    /// The group whose auto id this is.
+    pub fn group_of_auto(&self, voice: u64) -> Option<&Group> {
+        self.group_by_auto.get(&voice).map(|&i| &self.groups[i])
+    }
+
+    /// A group's best available leaf. A language: that language's own default voice, else the
+    /// system default if it is in the group, else the first regular voice, else a novelty one.
+    /// A novelty group: its first voice.
+    pub fn group_auto_leaf(&self, group: &Group) -> Option<usize> {
+        self.best(
+            |l| {
+                l.category == group.category
+                    && l.language == group.language
+                    && (!group.novelty || l.novelty)
+            },
+            |l| l.language_default || l.is_default,
+        )
+    }
+
+    /// The first available leaf passing `member`, by preference: one the backend marks
+    /// (`marked`, the language's default before the system's), a regular voice, a novelty voice.
+    fn best(
+        &self,
+        member: impl Fn(&Leaf) -> bool,
+        marked: impl Fn(&Leaf) -> bool,
+    ) -> Option<usize> {
+        let rank = |l: &Leaf| -> u8 {
+            if marked(l) && !l.novelty {
+                if l.language_default { 0 } else { 1 }
+            } else if !l.novelty {
+                2
+            } else {
+                3
             }
-            if l.is_default {
-                return Some(i);
-            }
-            first.get_or_insert(i);
-        }
-        first
+        };
+        self.leaves
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.available && member(l))
+            .min_by_key(|(i, l)| (rank(l), *i))
+            .map(|(i, _)| i)
     }
 
     /// Root auto: the first category (by rank) with anything available — screen readers first,
@@ -240,6 +336,9 @@ impl Tree {
         }
         if let Some(c) = self.category_of_auto(voice) {
             return self.category_auto_leaf(c.id);
+        }
+        if let Some(g) = self.group_of_auto(voice) {
+            return self.group_auto_leaf(g);
         }
         self.leaf_index(voice).filter(|&i| self.leaves[i].available)
     }
@@ -262,7 +361,8 @@ impl Tree {
         let category = self
             .leaf(voice)
             .map(|l| l.category)
-            .or_else(|| self.category_of_auto(voice).map(|c| c.id));
+            .or_else(|| self.category_of_auto(voice).map(|c| c.id))
+            .or_else(|| self.group_of_auto(voice).map(|g| g.category));
         let leaf = category
             .and_then(|c| self.category_auto_leaf(c))
             .or_else(|| self.root_auto_leaf())
@@ -285,6 +385,10 @@ impl Tree {
     pub fn same_shape(&self, other: &Tree) -> bool {
         self.categories == other.categories && self.leaves == other.leaves
     }
+}
+
+fn cat_by_id_of(categories: &[Category], id: u64) -> usize {
+    categories.iter().position(|c| c.id == id).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -314,6 +418,8 @@ mod tests {
             selector: 1,
             is_default,
             available,
+            novelty: false,
+            language_default: false,
         }
     }
 

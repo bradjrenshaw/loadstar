@@ -447,6 +447,8 @@ impl Backend for PrismBackend {
                     selector: id,
                     is_default: false,
                     available: raw & pf::IS_SUPPORTED_AT_RUNTIME != 0,
+                    novelty: false,
+                    language_default: false,
                 });
             }
         }

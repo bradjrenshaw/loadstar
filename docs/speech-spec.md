@@ -73,7 +73,7 @@ macOS adds `avspeech`, Linux `speech_dispatcher`. Built-in ranks are spaced (scr
 
 **Voices** are the leaves. A leaf has a stable 64-bit **id** (hash of the backend's own identifier — the SAPI token id, the OneCore voice id, a reader's name), a display name, a language tag where the backend knows one, its category, and a **feature** bitset (below). Under `screen_readers` a leaf is a reader — NVDA, JAWS, Narrator — because the user picks their actual voice inside the reader; under a synthesizer category a leaf is one installed voice. Both are "voices" to the ABI and to the user. Ids are never positional, so a saved profile survives a reinstall that reorders a list, a reader that is not running today, or a tree refresh. **Enumeration lists only what is available** (`lv_voice_count`/`lv_voice_at` skip a reader that is not running); an absent leaf stays addressable by id (`lv_voice_name`, `lv_voice_available`), so a mod can still name a saved pick and the fallback walk decides what speaks.
 
-**Autos** are leaves too, with fixed ids. Voice id **0** is the **root auto**: the running screen reader if there is one, else the default voice of the first synthesizer category. Each category has a **category auto** (`lv_category_auto(category)`): the running reader, the system default SAPI voice, and so on. A zeroed profile therefore speaks sensibly.
+**Autos** are leaves too, with fixed ids. Voice id **0** is the **root auto**: the running screen reader if there is one, else the default voice of the first synthesizer category. Each category has a **category auto** (`lv_category_auto(category)`): the running reader, the system default SAPI voice, and so on. A zeroed profile therefore speaks sensibly. Inside a category, each language its voices cover has a **group auto** — "any English (United States) voice": that language's own default voice, else the system default if it is one of them, else the first regular voice — and so does each set of novelty voices. Group autos are voice ids like any other (a hash of the category key, the language tag and `novelty`), so one can be saved in a profile, and when its voices are gone it falls back up the tree as a voice does. An auto never picks a novelty voice while a regular one is available.
 
 **How the tree is populated**, in priority order:
 
@@ -87,6 +87,40 @@ This encodes the mods' experience as list policy: Prism contributes breadth of *
 **The tree is a snapshot.** Readers start and stop after boot. `lv_tree_refresh(ctx, out changed)` re-probes and rebuilds; `changed` tells the mod to redraw its view. Ids are stable across refreshes. **Resolution reads the snapshot and never probes**: asking whether NVDA is running is a remote procedure call, and Prism's runtime-support check can be one too, so `auto` and every leaf's availability are answered from the last probe. The worker re-probes on `lv_tree_refresh`, on a backend's failure to speak, and on a slow cadence of its own (seconds), so a reader started mid-session appears without the game thread ever paying for the question.
 
 **Open set.** Because categories are keyed strings with ranks rather than an enum, and leaves carry their own features, a backend added later — compiled in behind a cargo feature, or eventually loaded as a plugin — appears in the tree without an ABI change. For the mod's localization rule this means: built-in keys are fixed and documented, so a mod maps them to its own locale entries; an unknown key falls back to the display name the backend supplied, exactly as OS voice names already pass through untranslated.
+
+### The menu tree
+
+The voice tree is the truth; a menu needs an *arrangement* of it. A Mac has 180 voices in one category — 39 languages, sixteen of the US English ones sound effects — and a flat list of them is unusable by ear. So the library also publishes the same snapshot arranged for a "pick a voice" menu, as **generic nodes**: a node has a stable id, a kind, a label, a key, children, and (for a voice or an auto) the voice id to put in a profile. A mod shows a node's children and descends; it never needs to know what a level means, so the arrangement below can change — per backend, or as machines grow more voices — without an ABI change or a change to any mod.
+
+```
+lv_ui_language(ctx, "en-US")                       // whose voices come first, and the language names are written in
+lv_ui_root(ctx, out node)
+lv_ui_node(ctx, node, out {id, parent, voice, category, kind, child_count})
+lv_ui_child(ctx, node, index, out child)
+lv_ui_label(ctx, node, buf, cap, out len)          // what a menu shows
+lv_ui_key(ctx, node, buf, cap, out len)            // what a mod localizes by
+lv_ui_find(ctx, voice, out node)                   // the node of a saved voice or auto; VoiceUnavailable if not listed
+```
+
+The arrangement, built from the snapshot's **available** leaves:
+
+- **Root**: an **Auto** (voice 0), then one node per category in rank order.
+- **A category** is a group: its **Auto** (the category auto) first, then its contents. A category that holds one voice by nature (`single` in its definition — the clipboard) is not a group: that voice stands in its place.
+- **Voices with a language** are grouped under one node per language tag — "English (United States)", "English (United Kingdom)" — each opening with its group auto. The tag the mod prefers comes first, then the rest of that language, then every other language by display name. Voices without a language (screen readers) sit directly in the category.
+- **Within any group**: the Auto, then the regular voices by name, then — last — a **Novelty** group holding the novelty voices behind an Auto of its own.
+
+| kind | `voice` | `key` | `label` |
+|---|---|---|---|
+| `Root` 0 | 0 | empty | empty |
+| `Auto` 1 | the auto's id (0 at the root) | `auto` | "Auto" — a mod says it in its own words, usually with what it resolves to (`lv_resolve`) |
+| `Category` 2 | 0 | the category key | its English name |
+| `Language` 3 | 0 | the BCP-47 tag | the system's name for it, in the menu's language where the system can (macOS: any; Windows: English, or the user's UI language), else English, else the tag |
+| `Novelty` 4 | 0 | `novelty` | "Novelty" |
+| `Voice` 5 | the leaf id | its language tag | its name |
+
+Node ids are hashes of what the node *is* (never positional, never 0), the same across refreshes, sessions and preferred languages, so a menu can remember where it was. A voice that is not available has no node; `lv_ui_find` says so, and the mod still names it through `lv_voice_name` as before. The flat enumeration (`lv_category_*`, `lv_voice_*`) is unchanged and remains the way to ask for everything.
+
+A backend marks a leaf `novelty` and `language_default` when it knows (AVSpeech: the voice's novelty trait, `voiceWithLanguage`); leaves that say nothing are regular voices and their group's auto is the first of them.
 
 ### Features
 
@@ -224,7 +258,7 @@ Copies the text. Exists so "something happens" when nothing else can; the fallba
 
 ### 5.5 AVSpeech (macOS) — category `avspeech`
 
-`AVSpeechSynthesizer` via `objc2-avf-audio`, one leaf per installed voice (`speechVoices`, the identifier as native id, the system default for `currentLanguageCode` marked default), so the root auto on a Mac is the user's system voice. One synthesizer per concurrent utterance, reused per voice. Rate maps piecewise around `AVSpeechUtteranceDefaultSpeechRate`; pitch maps 0..1 onto the 0.5–2.0 multiplier, an octave each way.
+`AVSpeechSynthesizer` via `objc2-avf-audio`, one leaf per installed voice (`speechVoices`, the identifier as native id, the system default for `currentLanguageCode` marked default), so the root auto on a Mac is the user's system voice. Each leaf also says whether it is its own language's default (`voiceWithLanguage` for its tag) and whether it is a novelty voice (`voiceTraits`, macOS 14+), which is what the menu tree (§2) groups by. One synthesizer per concurrent utterance, reused per voice. Rate maps piecewise around `AVSpeechUtteranceDefaultSpeechRate`; pitch maps 0..1 onto the 0.5–2.0 multiplier, an octave each way.
 
 It replaces Prism's AVSpeech backend, which `dispatch_sync`s every call onto the main thread: from the worker that stalls speech behind the host's main loop and deadlocks it outright in a host that never runs one. Measured (`examples/avspeech_probe.rs`):
 
@@ -298,6 +332,7 @@ Prefix `lv_` (voice). `LsStatus` return codes, extended with `VoiceUnavailable` 
 | Lifecycle | `lv_create`, `lv_destroy`, `lv_prism_version`, `lv_abi_version` (shared with `ls_abi_version`) |
 | Tree | `lv_tree_refresh(out changed)`, `lv_category_count`, `lv_category_at(i, out id)`, `lv_category_key(id, buf, cap, out len)`, `lv_category_name(id, buf, cap, out len)`, `lv_category_rank(id, out rank)`, `lv_category_auto(id, out voice)` |
 | Voices | `lv_voice_count(category)`, `lv_voice_at(category, i, out id)`, `lv_voice_name(id, buf, cap, out len)`, `lv_voice_language(id, buf, cap, out len)`, `lv_voice_category(id, out category)`, `lv_voice_features(id, out u64)` |
+| Menu tree | `lv_ui_language(tag)`, `lv_ui_root(out node)`, `lv_ui_node(node, out record)`, `lv_ui_child(node, i, out child)`, `lv_ui_label(node, buf, cap, out len)`, `lv_ui_key(node, buf, cap, out len)`, `lv_ui_find(voice, out node)` |
 | Profiles | `lv_resolve(profile*, required_features, out voice, out status)` — the struct itself needs no functions |
 | Queues | `lv_queue_create(options*)`, `lv_queue_destroy`, `lv_queue_set(queue, option, value)`, `lv_queue_depth(queue, out pending, out speaking)` |
 | Speaking | `lv_speak`, `lv_output`, `lv_braille`, `lv_gap`, `lv_stop`, `lv_flush`, `lv_pause`, `lv_resume`, `lv_cancel`, `lv_stop_all` |
@@ -342,7 +377,8 @@ Two lines in `spec.md` move:
 5. **OneCore**, SSML passthrough.
 6. ~~Streaming positional speech~~ **Shipped 2026-10-11**: `Stream`-kind sources in the audio crate (`la_stream_create/write/progress/finish/free`, the speech worker uses the in-process intake), SAPI renders into a forwarding COM stream, 2.7 ms to first sound warm. Finding on the way: SAPI synthesizes a two-second line in ~3 ms; the latency people hear from "SAPI" is its leading silence, hence `TRIM_SILENCE` live.
 7. ~~Played samples~~ **Shipped 2026-11-01**: `PLAY_SAMPLES` (§6) — rendering voices stream into the worker's own output, so interrupts fade instead of clicking and the device never idles. Found by ear in Blindfold on macOS (AVSpeech crackled on every menu move).
-8. Later: `lv_submit` batches if a mod hits the ordering race; the plugin ABI for third-party backends (the tree already has room); speech-dispatcher natively (AVSpeech shipped, §5.5); priorities only if two mods converge on the same scheme.
+8. ~~The menu tree~~ **Shipped 2026-11-20**: `lv_ui_*` (§2) — generic nodes arranging the snapshot by category, language and novelty, an auto at the head of every group. Blindfold's voice picker on macOS was a 180-item list.
+9. Later: `lv_submit` batches if a mod hits the ordering race; the plugin ABI for third-party backends (the tree already has room); speech-dispatcher natively (AVSpeech shipped, §5.5); priorities only if two mods converge on the same scheme.
 
 ## 12. Open questions
 
