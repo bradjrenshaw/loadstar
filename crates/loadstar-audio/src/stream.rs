@@ -14,6 +14,8 @@ pub struct StreamProgress {
     pub written: AtomicU64,
     pub played: AtomicU64,
     pub done: AtomicBool,
+    /// Times the voice ran out of samples while the producer was still going.
+    pub underruns: AtomicU64,
 }
 
 impl StreamProgress {
@@ -25,6 +27,9 @@ impl StreamProgress {
     }
     pub fn is_done(&self) -> bool {
         self.done.load(Ordering::Acquire)
+    }
+    pub fn underruns(&self) -> u64 {
+        self.underruns.load(Ordering::Acquire)
     }
     /// The producer finished and the consumer has played everything it wrote.
     pub fn drained(&self) -> bool {
@@ -39,7 +44,17 @@ pub struct StreamSource {
     /// Frames to accumulate before the first sample plays (absorbs producer jitter).
     prefill: usize,
     started: bool,
+    /// The ring ran dry mid-stream: silent until `rebuffer` frames are in again.
+    starved: bool,
+    /// Frames to accumulate after an underrun before resuming. More than `prefill`: a producer
+    /// that fell behind once (a host whose main thread stalled) is likely still catching up,
+    /// and resuming on a trickle would underrun again at once — a stutter instead of one gap.
+    rebuffer: usize,
 }
+
+/// Frames an underrun's two edges are ramped over (about 2 ms): running dry stops the waveform
+/// wherever it is, and resuming starts it wherever it is, and both click unless faded.
+const EDGE: usize = 96;
 
 pub enum Pull {
     /// `n` frames written into the output (the rest, if any, is silence held for the producer).
@@ -68,6 +83,9 @@ impl StreamSource {
                 Pull::Produced(0) // starving: hold silence, the producer is behind
             };
         }
+        if self.starved && available < self.rebuffer && !done {
+            return Pull::Produced(0); // rebuffering after an underrun
+        }
         let n = available.min(out.len());
         if let Ok(chunk) = self.consumer.read_chunk(n) {
             let (a, b) = chunk.as_slices();
@@ -76,6 +94,24 @@ impl StreamSource {
             chunk.commit_all();
         }
         self.progress.played.fetch_add(n as u64, Ordering::AcqRel);
+        if self.starved {
+            // Resuming after an underrun: ramp in.
+            self.starved = false;
+            let edge = n.min(EDGE);
+            for (i, s) in out[..edge].iter_mut().enumerate() {
+                *s *= i as f32 / edge as f32;
+            }
+        }
+        if n < out.len() && !done {
+            // The ring is empty and more is coming: an underrun. Ramp what there was down to
+            // silence instead of stopping dead.
+            self.starved = true;
+            self.progress.underruns.fetch_add(1, Ordering::AcqRel);
+            let edge = n.min(EDGE);
+            for (i, s) in out[n - edge..n].iter_mut().enumerate() {
+                *s *= 1.0 - (i + 1) as f32 / edge as f32;
+            }
+        }
         Pull::Produced(n)
     }
 }
@@ -151,6 +187,8 @@ pub fn stream_pair(capacity: usize, prefill: usize, rate: u32) -> (StreamSource,
             progress: Arc::clone(&progress),
             prefill: prefill.min(capacity / 2),
             started: false,
+            starved: false,
+            rebuffer: (prefill * 5).min(capacity / 2),
         },
         StreamWriter {
             producer,
@@ -201,5 +239,57 @@ mod tests {
             !w.write_all(&[0.0; 64]),
             "ring full and nobody reading: gives up"
         );
+    }
+
+    #[test]
+    fn an_underrun_fades_out_rebuffers_and_fades_back_in() {
+        // Prefill 100, so the rebuffer after an underrun is 500.
+        let (mut src, mut w) = stream_pair(8192, 100, 48000);
+        let mut out = [0.0f32; 256];
+        assert_eq!(w.write(&[1.0; 356]), 356);
+        assert!(matches!(src.pull(&mut out), Pull::Produced(256)));
+        assert_eq!(out, [1.0; 256], "a full block passes untouched");
+        // 100 left for a 256 block and the producer is not done: an underrun.
+        assert!(matches!(src.pull(&mut out), Pull::Produced(100)));
+        assert_eq!(out[0], 1.0);
+        assert!(
+            out[98] < 0.05 && out[99] == 0.0,
+            "ramped to silence: {} {}",
+            out[98],
+            out[99]
+        );
+        assert!(
+            out[..100].windows(2).all(|p| p[1] <= p[0]),
+            "monotonic fade"
+        );
+        assert_eq!(w.progress().underruns(), 1);
+        // A trickle is not enough to resume on.
+        assert_eq!(w.write(&[1.0; 300]), 300);
+        assert!(
+            matches!(src.pull(&mut out), Pull::Produced(0)),
+            "rebuffering"
+        );
+        assert_eq!(w.write(&[1.0; 300]), 300);
+        assert!(matches!(src.pull(&mut out), Pull::Produced(256)));
+        assert_eq!(out[0], 0.0, "ramps back in from silence");
+        assert!(out[..96].windows(2).all(|p| p[1] >= p[0]));
+        assert_eq!(out[96..], [1.0; 160]);
+        assert_eq!(w.progress().underruns(), 1, "one gap, counted once");
+        // The end of the stream is not an underrun: what is left plays as it is.
+        w.finish();
+        assert!(matches!(src.pull(&mut out), Pull::Produced(256)));
+        assert!(matches!(src.pull(&mut out), Pull::Produced(88)));
+        assert_eq!(out[..88], [1.0; 88], "no fade at a real end");
+        assert!(matches!(src.pull(&mut out), Pull::Finished));
+        assert_eq!(w.progress().underruns(), 1);
+        // A producer that finishes while the voice is rebuffering still plays out.
+        let (mut src, mut w) = stream_pair(8192, 100, 48000);
+        w.write(&[1.0; 120]);
+        assert!(matches!(src.pull(&mut out), Pull::Produced(120)));
+        w.write(&[1.0; 10]);
+        assert!(matches!(src.pull(&mut out), Pull::Produced(0)));
+        w.finish();
+        assert!(matches!(src.pull(&mut out), Pull::Produced(10)));
+        assert!(matches!(src.pull(&mut out), Pull::Finished));
     }
 }

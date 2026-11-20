@@ -39,7 +39,8 @@ unsafe extern "C" {
 pub struct MiniaudioConfig {
     /// 0 = the device's native rate.
     pub sample_rate: u32,
-    /// 0 = the smallest sensible period (about 3 ms; the driver may clamp it up).
+    /// 0 = the smallest sensible period (about 3 ms; the driver may clamp it up) — except on
+    /// macOS, where 0 keeps the buffer size the host process already runs at (see `open`).
     pub period_frames: usize,
     pub master_gain: f32,
     pub voice_cap: usize,
@@ -116,6 +117,59 @@ unsafe extern "C" fn data_callback(user: *mut c_void, out: *mut f32, frames: u32
     engine.drain_garbage(|g| garbage.push(g).map_err(|rtrb::PushError::Full(g)| g));
 }
 
+/// The default output device's IO buffer size as this process currently has it (macOS: what the
+/// host's own audio runs at; 512 unless the host asked for something else). `None` elsewhere.
+#[cfg(target_os = "macos")]
+fn host_buffer_frames() -> Option<u32> {
+    #[repr(C)]
+    struct Address {
+        selector: u32,
+        scope: u32,
+        element: u32,
+    }
+    #[link(name = "CoreAudio", kind = "framework")]
+    unsafe extern "C" {
+        fn AudioObjectGetPropertyData(
+            object: u32,
+            address: *const Address,
+            qualifier_size: u32,
+            qualifier: *const c_void,
+            size: *mut u32,
+            data: *mut c_void,
+        ) -> i32;
+    }
+    const SYSTEM_OBJECT: u32 = 1;
+    const GLOBAL: u32 = u32::from_be_bytes(*b"glob");
+    let get = |object: u32, selector: &[u8; 4]| -> Option<u32> {
+        let address = Address {
+            selector: u32::from_be_bytes(*selector),
+            scope: GLOBAL,
+            element: 0,
+        };
+        let (mut value, mut size) = (0u32, 4u32);
+        // SAFETY: a valid address record and a 4-byte out value of the stated size.
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                object,
+                &address,
+                0,
+                std::ptr::null(),
+                &mut size,
+                &mut value as *mut u32 as *mut c_void,
+            )
+        };
+        (status == 0).then_some(value)
+    };
+    // kAudioHardwarePropertyDefaultOutputDevice, then kAudioDevicePropertyBufferFrameSize.
+    let device = get(SYSTEM_OBJECT, b"dOut")?;
+    get(device, b"fsiz").filter(|&f| (64..=8192).contains(&f))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_buffer_frames() -> Option<u32> {
+    None
+}
+
 /// MMCSS "Pro Audio" for miniaudio's thread — the same scheduling the direct backend uses.
 fn schedule_realtime() {
     #[cfg(windows)]
@@ -148,10 +202,16 @@ pub fn open(
     // miniaudio only takes the IAudioClient3 low-latency path when a specific period is
     // requested (0 means its 10 ms default), so ask for ~3 ms; the driver clamps it up if needed.
     // Likewise `sample_rate` should stay 0: an application-set rate disables that path.
-    let requested_period = if cfg.period_frames == 0 {
-        128
-    } else {
+    //
+    // Not on macOS. There the IO buffer size belongs to the PROCESS (one value per process and
+    // device), so asking for 128 frames also put the host game's own audio — its music and
+    // effects, through a different library — on 3 ms deadlines, and all of it crackled whenever
+    // the machine was briefly busy (Balatro, on every switch back into its window). Keep what
+    // the host already runs at.
+    let requested_period = if cfg.period_frames != 0 {
         cfg.period_frames as u32
+    } else {
+        host_buffer_frames().unwrap_or(128)
     };
     let (mut rate, mut period, mut backend, mut result) =
         (0u32, 0u32, std::ptr::null::<c_char>(), 0i32);
